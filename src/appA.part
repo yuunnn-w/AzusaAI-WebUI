@@ -64,9 +64,9 @@ var LS_KEY = "chatgpt-webui-v1";
 var DEFAULT_BASE = "http://127.0.0.1:8080/v1";
 /* 用户可见版本号的**唯一权威**(改值 = 改这一处):环境面板 / 环境信息 / 导出备份 version 字段 /
    MCP clientInfo.version / 关于弹窗都读它;启动时把 <meta name="version"> 也同步成它。
-   口径 = README 头 + CHANGELOG [0.1.0] + 发布 tag v0.1.0(旧值 "2.1" 是历史遗留,已统一)。
+   口径 = README 头 + CHANGELOG [0.1.1] + 发布 tag v0.1.1(0.1.0 是首个公开版本,旧值 "2.1" 是历史遗留)。
    注意:它不是存储 schema(那是 SCHEMA,另算),也不是 MCP 协议版本(MCP_PROTOCOL,另算) */
-var APP_VERSION = "0.1.0";
+var APP_VERSION = "0.1.1";
 /* 作者显示名与项目主页(唯一权威):关于弹窗的 hero 由 JS 从这里填充,
    HTML / CSS / 其它 JS 里不得再出现这两个字面量(日后改一行) */
 var APP_AUTHOR = "yuunnn-w";
@@ -102,8 +102,12 @@ var CX_MIN_MSGS = 4;            // 少于这么多条消息时拒绝压缩(可�
 /* 最大输出滑块上限 384K;Anthropic 协议必须带 max_tokens,未设置时用 256K */
 var MAX_TOK_LIMIT = 393216;
 var ANTHROPIC_DEFAULT_MAXTOK = 262144;
-/* 模型上下文窗口的兜底值:服务端没给出时用 256K */
+/* 模型上下文窗口的兜底值:服务端没给出时用它(默认 K 值见 ctxWinK)
+   范围常量是滑块 / 输入框 / 归一化(clamp)三条路径的**唯一口径**,别处不得另写一份 */
 var DEFAULT_CTX_WINDOW = 262144;
+var CTX_WIN_K_MIN = 8;      // 手动设定下限 8K
+var CTX_WIN_K_MAX = 1024;   // 手动设定上限 1024K(1M)
+var CTX_WIN_K_STEP = 8;     // 滑块步进 8K
 
 var DEFAULT_SETTINGS = {
   schema: SCHEMA,
@@ -130,6 +134,9 @@ var DEFAULT_SETTINGS = {
   freqPenalty: 0,
   presencePenalty: 0,
   ctxMsgs: 0,
+  /* 手动设定的上下文窗口(K):服务端没给出该模型的窗口长度时按它估算(默认 256K)
+     —— 服务端一旦返回该模型的窗口长度,一律以服务端为准,这里的值不参与计算 */
+  ctxWinK: DEFAULT_CTX_WINDOW / 1024,
   tokCalib: {},
   modelCtx: {},
   /* --- MCP 工具(由对话中的模型调用,默认关闭) --- */
@@ -338,6 +345,8 @@ function mergeSettings(st) {
   if (typeof out.ctxMsgs !== "number" || out.ctxMsgs < 0 || out.ctxMsgs > 200) {
     out.ctxMsgs = DEFAULT_SETTINGS.ctxMsgs;
   }
+  /* 手动设定的上下文窗口(K):缺字段 / 非数字 / 越界一律归一(默认 256K,区间见常量) */
+  out.ctxWinK = clampNum(out.ctxWinK, CTX_WIN_K_MIN, CTX_WIN_K_MAX, DEFAULT_SETTINGS.ctxWinK);
   out.tokCalib = (st.tokCalib && typeof st.tokCalib === "object" && !Array.isArray(st.tokCalib)) ? st.tokCalib : {};
   /* 每个模型由服务端告知的上下文窗口(设置里展示、用量环按它算百分比) */
   out.modelCtx = (st.modelCtx && typeof st.modelCtx === "object" && !Array.isArray(st.modelCtx)) ? st.modelCtx : {};

@@ -820,25 +820,67 @@ function makeAskQ(m, q, i, d) {
 function makeAskFoot() {
   var foot = document.createElement("div");
   foot.className = "tc-ask-foot";
-  var sub = document.createElement("button");
-  sub.type = "button";
-  sub.className = "primary";
-  sub.setAttribute("data-ask-act", "submit");
-  sub.textContent = "提交回答";
+  /* 主按钮贴右下角 ⇒ 「跳过」在前、「提交回答」在后,配合 .tc-ask-foot 的右对齐 */
   var sk = document.createElement("button");
   sk.type = "button";
   sk.setAttribute("data-ask-act", "skip");
   sk.textContent = "跳过";
   sk.title = "不回答这次提问,让模型直接继续(它会收到一个空回答)";
-  foot.appendChild(sub);
+  var sub = document.createElement("button");
+  sub.type = "button";
+  sub.className = "primary";
+  sub.setAttribute("data-ask-act", "submit");
+  sub.textContent = "提交回答";
   foot.appendChild(sk);
+  foot.appendChild(sub);
   return foot;
+}
+/* 多题轮播:一屏只渲染当前一题(卡片高度 = 单题高度),←/→ 切题;
+   作答草稿(选中 + 自定义输入)都在 ASK_DRAFT,切题只换 DOM,切回来原样 */
+function askUserCurOf(d, n) {
+  var c = (d && typeof d.cur === "number") ? d.cur : 0;
+  return (c >= 0 && c < n) ? c : 0;
+}
+function askUserFillQ(wrap, m, qs, d) {
+  while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+  var n = qs.length, cur = askUserCurOf(d, n);
+  if (n > 1) {
+    var nav = document.createElement("div");
+    nav.className = "ask-nav";
+    var prev = document.createElement("button");
+    prev.type = "button";
+    prev.className = "ask-arrow";
+    prev.setAttribute("data-ask-act", "prev");
+    prev.setAttribute("aria-label", "上一题");
+    prev.title = "上一题";
+    prev.innerHTML = icon("left", "sm");
+    prev.disabled = cur <= 0;
+    var idx = document.createElement("span");
+    idx.className = "ask-idx";
+    idx.textContent = "第 " + (cur + 1) + " / " + n + " 题";
+    var next = document.createElement("button");
+    next.type = "button";
+    next.className = "ask-arrow";
+    next.setAttribute("data-ask-act", "next");
+    next.setAttribute("aria-label", "下一题");
+    next.title = "下一题";
+    next.innerHTML = icon("right", "sm");
+    next.disabled = cur >= n - 1;
+    nav.appendChild(prev);
+    nav.appendChild(idx);
+    nav.appendChild(next);
+    wrap.appendChild(nav);
+  }
+  wrap.appendChild(makeAskQ(m, qs[cur], cur, d));
 }
 function appendAskBody(body, m) {
   var i, list;
   if (askUserPending(m)) {
     var qs = askUserQsOf(m), d = askUserDraftOf(m.id);
-    for (i = 0; i < qs.length; i++) body.appendChild(makeAskQ(m, qs[i], i, d));
+    var wrap = document.createElement("div");
+    wrap.className = "ask-qwrap";
+    body.appendChild(wrap);
+    askUserFillQ(wrap, m, qs, d);
     var hint = document.createElement("div");
     hint.className = "ask-hint";
     body.appendChild(hint);

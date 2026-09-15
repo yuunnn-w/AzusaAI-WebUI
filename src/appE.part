@@ -1186,7 +1186,7 @@ function askUserQsOf(m) {
 }
 function askUserDraftOf(msgId) {
   var d = ASK_DRAFT[msgId];
-  if (!d) { d = { sel: {}, text: {}, other: {} }; ASK_DRAFT[msgId] = d; }
+  if (!d) { d = { sel: {}, text: {}, other: {}, cur: 0 }; ASK_DRAFT[msgId] = d; }
   return d;
 }
 /* 单题答案:自定义回答优先 —— 单选时覆盖所选项,多选时与所选项并列(逗号分隔) */
@@ -1221,12 +1221,14 @@ function askUserResolve(msgId, act) {
       answers[qs[i].question] = a;
       list.push({ q: qs[i].question, answer: a });
     }
-    if (m) { m.askAnswers = list; m.toolOpen = true; }
+    /* 结算即收起详情:头部状态行与「已回答」摘要已足够回执,表单/回显不再默认占屏
+       (toolOpen=false 随消息落盘 ⇒ 历史重绘与刷新后的默认态同样是收起) */
+    if (m) { m.askAnswers = list; m.toolOpen = false; }
     r({ ok: true, text: JSON.stringify({ answers: answers }) });
     return;
   }
   if (act === "skip") {
-    if (m) { m.askAnswers = []; m.toolOpen = true; }
+    if (m) { m.askAnswers = []; m.toolOpen = false; }
     r({ ok: true, text: JSON.stringify({ answers: {}, note: ASK_SKIP_NOTE }) });
     return;
   }
@@ -1241,12 +1243,15 @@ function askUserRun(args, ctx) {
   }
   if (!msg) return Promise.resolve({ ok: false, error: "提问失败:没有可用的消息上下文" });
   var msgId = msg.id;
-  ASK_DRAFT[msgId] = { sel: {}, text: {}, other: {} };
+  ASK_DRAFT[msgId] = { sel: {}, text: {}, other: {}, cur: 0 };   /* cur = 多题轮播的当前题号 */
   msg.askQs = n.qs;                 /* 卡片题面;结算时清掉(临时字段) */
   msg.askAnswers = null;            /* 重跑同一张卡片时不留上一次的回显 */
   msg.toolOpen = true;              /* 待答卡片必须展开 */
   msg.status = "wait";              /* 此路径下 needsApproval 必为 false(toolRun 放行后已清) */
   redrawToolCard(msg);
+  /* 卡片刚加上逐题表单(变高):立刻粘底,否则整张卡可能落在可视区之下,用户要手动滚才看得到问题。
+     走既有 scrollToBottom(非 force)——它尊重聊天区的粘底语义,用户手动上滚时不抢 */
+  if (ctxConv(ctx) === conv) scrollToBottom();
   /* 提问发生在别的会话里(用户切走了):一次性提示,别让它在后台静默等 */
   if (ctxConv(ctx) !== conv) toast("另一条会话在等你回答一个问题", "info", 4200);
   return new Promise(function (resolve) {
@@ -1341,6 +1346,17 @@ function askUserHintInto(card, m) {
   for (i = 0; i < qs.length; i++) if (!askUserAnswerOf(qs[i], d, i)) miss.push(i + 1);
   hint.textContent = miss.length ? ("还有 " + miss.length + " 题未作答:第 " + miss.join("、") + " 题") : "";
 }
+/* 轮播切到指定题(「←/→」与「单选自动前进」共用;只动 d.cur 与题面 DOM,
+   草稿(选中 + 自定义输入)不碰 ⇒ 切回来原样保留) */
+function askUserGoto(card, m, nxt) {
+  var qs = askUserQsOf(m), n = qs.length, d = askUserDraftOf(m.id);
+  if (nxt < 0 || nxt >= n) return false;          /* 端点:按钮已禁用,这里再兜一道 */
+  d.cur = nxt;
+  var wrap = card ? card.querySelector(".ask-qwrap") : null;
+  if (wrap) askUserFillQ(wrap, m, qs, d);
+  askUserHintInto(card, m);
+  return true;
+}
 function askUserClickOpt(btn) {
   var card = askUserCardOf(btn);
   if (!card) return;
@@ -1349,11 +1365,12 @@ function askUserClickOpt(btn) {
   if (!m || !askUserPending(m)) return;
   var parts = String(btn.getAttribute("data-ask-opt") || "").split(":");
   var i = Number(parts[0]), key = parts[1];
-  var q = askUserQsOf(m)[i];
+  var qs = askUserQsOf(m), q = qs[i];
   if (!q) return;
   var d = askUserDraftOf(id);
+  var picked = false;
   if (key === "other") {
-    d.other[i] = !d.other[i];
+    d.other[i] = !d.other[i];                     /* 「其他」要等自定义输入,不自动前进 */
   } else {
     var j = Number(key);
     if (q.multi) {
@@ -1361,12 +1378,17 @@ function askUserClickOpt(btn) {
       var k = arr.indexOf(j);
       if (k > -1) arr.splice(k, 1);
       else { arr.push(j); arr.sort(function (a, b) { return a - b; }); }
-      d.sel[i] = arr;
+      d.sel[i] = arr;                             /* 多选不自动前进(还要继续勾) */
     } else {
-      d.sel[i] = (d.sel[i] === j) ? null : j;      /* 再点一次 = 取消这道题的作答 */
+      d.sel[i] = (d.sel[i] === j) ? null : j;     /* 再点一次 = 取消这道题的作答 */
+      picked = d.sel[i] === j;                    /* 只有"这次点成了选中"才前进 */
     }
   }
   askUserSyncQ(card, m, i, d, key === "other" && !!d.other[i]);
+  /* 多题轮播 + 单选题(非最后一题):点选即自动跳下一题,省掉一次「→」点击。
+     不自动前进的四种情形:多选(还要继续勾)、最后一题(无处可跳)、
+     「其他」(要等自定义输入)、「再点一次取消」(答案被清空,留在原题) */
+  if (picked && i < qs.length - 1) askUserGoto(card, m, i + 1);
 }
 function askUserTextInput(ta) {
   var card = askUserCardOf(ta);
@@ -1384,8 +1406,18 @@ function askUserTextInput(ta) {
 function askUserAct(id, act) {
   var m = findMsg(id);
   if (!m || !askUserPending(m)) return;
+  var qs = askUserQsOf(m), d = askUserDraftOf(id), i;
+  /* 多题轮播:←/→ 只换当前题(草稿都在 ASK_DRAFT,切回来已答状态与自定义输入原样) */
+  if (act === "prev" || act === "next") {
+    var n = qs.length;
+    if (n < 2) return;
+    var cur = askUserCurOf(d, n);
+    askUserGoto(document.querySelector('#chat-inner .tool-card[data-id="' + cssEscape(id) + '"]'),
+      m, act === "prev" ? cur - 1 : cur + 1);
+    return;
+  }
   if (act === "submit") {
-    var qs = askUserQsOf(m), d = askUserDraftOf(id), miss = [], i;
+    var miss = [];
     for (i = 0; i < qs.length; i++) if (!askUserAnswerOf(qs[i], d, i)) miss.push(i + 1);
     if (miss.length) {
       var card = document.querySelector('#chat-inner .tool-card[data-id="' + cssEscape(id) + '"]');

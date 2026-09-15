@@ -1504,6 +1504,56 @@ function syncParamInputs() {
     if (out) out.textContent = d.fmt(Number(state.settings[d.key]));
   });
   syncEffortInputs();
+  syncCtxWinInputs();
+}
+/* 上下文长度(手动设定)的两个控件:输入区浮层 + 设置面板各一组,显示态与取值同源。
+   forceEl = 刚提交完的那个输入框(它可能仍持有焦点,必须回写 clamp 后的值) */
+function syncCtxWinInputs(forceEl) {
+  var on = ctxWinManualOn();
+  var v = ctxWinKNow();
+  [["p-ctxwin-field", "p-ctxwin", "p-ctxwin-n"], ["set-ctxwin-field", "set-ctxwin", "set-ctxwin-n"]].forEach(function (ids) {
+    var box = $(ids[0]);
+    if (box) box.style.display = on ? "" : "none";
+    var r = $(ids[1]);
+    if (r && Number(r.value) !== v) r.value = v;
+    var n = $(ids[2]);
+    if (n && (n === forceEl || (Number(n.value) !== v && document.activeElement !== n))) n.value = v;
+  });
+}
+/* 手调上下文长度的**唯一写入口**:clamp → 写设置 → 两处控件同步 → 用量环 / 来源文案即时刷新。
+   服务端给了窗口长度时计算路径根本不看这个值(ctxWindowFor 先判 server),控件也已隐藏 */
+function setCtxWinK(v, src) {
+  var k = clampNum(v, CTX_WIN_K_MIN, CTX_WIN_K_MAX, DEFAULT_SETTINGS.ctxWinK);
+  state.settings.ctxWinK = k;
+  saveSoon();
+  syncCtxWinInputs(src);
+  updateModelsHint();
+  updateCtxMonitor();
+  return k;
+}
+/* K 输入框的取值(与设置面板数字输入 numBindValue 同一口径):
+   `input[type=number]` 会把非数字串消毒成 ""(清空、输入 'abc' 都是这个结果),而 Number("")=0
+   是"合法数字" ⇒ 直接 clamp 会把清空动作钉到**最小值** 8K。所以空串与非数字都回默认值,
+   只有真数字才按区间夹(4→8、2048→1024) */
+function ctxWinKFromInput(el) {
+  var raw = el ? String(el.value == null ? "" : el.value).trim() : "";
+  if (raw === "" || !isFinite(Number(raw))) return DEFAULT_SETTINGS.ctxWinK;
+  return clampNum(Number(raw), CTX_WIN_K_MIN, CTX_WIN_K_MAX, DEFAULT_SETTINGS.ctxWinK);
+}
+/* 四个输入框(两组 × 滑块 + K 输入框):滑块即时生效;输入框失焦 / 回车(change)生效。
+   范围与步进取自常量,HTML 里的 min/max/step 只是初始值 */
+function initCtxWinInputs() {
+  [["p-ctxwin", "p-ctxwin-n"], ["set-ctxwin", "set-ctxwin-n"]].forEach(function (ids) {
+    var r = $(ids[0]), n = $(ids[1]);
+    if (r) {
+      r.min = String(CTX_WIN_K_MIN); r.max = String(CTX_WIN_K_MAX); r.step = String(CTX_WIN_K_STEP);
+      r.addEventListener("input", function () { setCtxWinK(Number(r.value)); });
+    }
+    if (n) {
+      n.min = String(CTX_WIN_K_MIN); n.max = String(CTX_WIN_K_MAX); n.step = String(CTX_WIN_K_STEP);
+      n.addEventListener("change", function () { setCtxWinK(ctxWinKFromInput(n), n); });
+    }
+  });
 }
 function initParamInputs() {
   PARAM_DEFS.forEach(function (d) {
@@ -1517,9 +1567,11 @@ function initParamInputs() {
       saveSoon();
     });
   });
+  initCtxWinInputs();
   $("p-reset").addEventListener("click", function () {
     PARAM_DEFS.forEach(function (d) { state.settings[d.key] = DEFAULT_SETTINGS[d.key]; });
     state.settings.reasoningEffort = DEFAULT_SETTINGS.reasoningEffort;
+    state.settings.ctxWinK = DEFAULT_SETTINGS.ctxWinK;
     syncParamInputs(); syncSettingsForm(); saveSoon();
     toast("已恢复默认生成参数", "success", 1600);
   });
@@ -3823,6 +3875,7 @@ function syncSettingsForm() {
   renderModelsInline();
   renderAttachPanel();
   syncFaviconUI();
+  syncCtxWinInputs();
   if (window.__mcpRefresh) window.__mcpRefresh();
 }
 function openSettings(tab) {
@@ -3931,12 +3984,30 @@ function placeDropdown(el, anchor) {
   el.style.left = Math.round(Math.max(8, Math.min(r.left, window.innerWidth - Math.max(180, w) - 8))) + "px";
   el.style.top = Math.round(y) + "px";
 }
-/* 上下文窗口的来源:server = 服务端报告过这个模型(实测值);
-   default = 服务端列表里有它,但没报窗口长度;
+/* 上下文窗口的来源:server = 服务端报告过这个模型(实测值,手动设定不参与);
+   manual = 服务端没给窗口长度,但用户手动设过(≠ 默认值时);
+   default = 服务端列表里有它,也没手动调过,按默认 256K;
    unlisted = 服务端根本没有这个模型名(比如手填的自定义名),只能按默认 256K 估算 */
 function ctxWindowSrcLevel(model) {
   if (ctxWindowSrc(model) === "server") return "server";
+  if (ctxWinKNow() !== DEFAULT_SETTINGS.ctxWinK) return "manual";
   return isListedModel(model) ? "default" : "unlisted";
+}
+/* 窗口来源的文案(浮窗来源行 / 设置面板提示行 / 提示 toast 共用这一处,避免各写一份漂移) */
+function ctxWinSrcLabel(lvl, model) {
+  if (lvl === "server") return "服务端返回";
+  if (lvl === "manual") {
+    return "手动设定(" + ctxWinKNow() + "K" +
+      (isListedModel(model) ? " · 服务端没给窗口长度" : " · 服务端没有这个模型") + ")";
+  }
+  if (lvl === "unlisted") return "默认 " + DEFAULT_SETTINGS.ctxWinK + "K(未确认)";
+  return "默认 " + DEFAULT_SETTINGS.ctxWinK + "K";
+}
+function ctxWinSrcTitle(lvl) {
+  if (lvl === "server") return "上下文窗口来自服务端返回的模型信息";
+  if (lvl === "manual") return "服务端没有给出该模型的窗口长度,按「上下文长度」的手动设定(" + ctxWinKNow() + "K)估算";
+  if (lvl === "unlisted") return "服务端没有这个模型的信息,只能按默认 " + DEFAULT_SETTINGS.ctxWinK + "K 估算";
+  return "服务端没有给出该模型的窗口长度,按默认 " + DEFAULT_SETTINGS.ctxWinK + "K 估算";
 }
 function refreshModelCtx(model) {
   updateModelsHint();
@@ -3965,10 +4036,7 @@ function updateModelsHint() {
     var m = (($("set-model") && $("set-model").value) || effectiveModel() || "").trim();
     var win = ctxWindowFor(m);
     var lvl = m ? ctxWindowSrcLevel(m) : "none";
-    var srcTxt = lvl === "server" ? "来源:服务端返回"
-      : lvl === "default" ? "来源:默认 256K(该模型在服务端列表里,但服务端没给窗口长度)"
-        : lvl === "unlisted" ? "来源:默认 256K(服务端没有这个模型,无法确认)"
-          : "";
+    var srcTxt = lvl === "none" ? "" : ("来源:" + ctxWinSrcLabel(lvl, m));
     ch.innerHTML = (m ? "当前模型 <b>" + escapeHtml(m) + "</b> 的上下文窗口:" : "尚未选择模型。默认窗口:") +
       "<b>" + num(win) + "</b> tokens(" + fmtCtxNum(win) + ")" +
       (srcTxt ? "·" + srcTxt : "") +
@@ -3981,13 +4049,15 @@ function updateModelsHint() {
         updateModelsHint(); updateCtxMonitor();
         if (v) toast("已读取到上下文长度:" + num(v), "success", 2600);
         else if (!isListedModel(target) && !ctxMetaFor(target)) {
-          toast("服务端没有「" + target + "」这个模型的信息,继续按默认 256K 估算", "warn", 3600);
+          toast("服务端没有「" + target + "」这个模型的信息,继续按当前设定 " + ctxWinKNow() + "K 估算", "warn", 3600);
         } else {
-          toast("服务端未提供该模型的上下文长度,继续按默认 256K 估算", "info", 3000);
+          toast("服务端未提供该模型的上下文长度,继续按当前设定 " + ctxWinKNow() + "K 估算", "info", 3000);
         }
       });
     });
   }
+  /* 模型名 / 模型清单 / 服务端窗口一变,「上下文长度」控件的显示条件可能就变了 */
+  syncCtxWinInputs();
 }
 function allModelOptions() {
   var map = {}, out = [];
@@ -4056,9 +4126,13 @@ function openModelPicker() {
   if (!(state.fetchedModels && state.fetchedModels.length)) fetchModels(false, true);
 }
 /* 从服务端返回的模型条目里挖上下文长度
-   llama.cpp → data[].meta.n_ctx(实测 262144);其它服务端字段名五花八门,都试一遍 */
+   llama.cpp → data[].meta.n_ctx(实测 262144);其它服务端字段名五花八门,都试一遍。
+   `n_ctx` / `n_ctx_train` 也直接认:llama.cpp 的 /props 把窗口放在
+   default_generation_settings.n_ctx(顶层也可能有),旧候选表只认 meta.n_ctx ⇒ /props 那条
+   读取链在「服务端不回 total_slots」时静默拿不到值 */
 function extractCtxLen(m) {
   var cands = [
+    m.n_ctx, m.n_ctx_train,
     m.meta && m.meta.n_ctx, m.meta && m.meta.n_ctx_train,
     m.context_length, m.context_window, m.max_context_length, m.max_context_tokens,
     m.max_input_tokens, m.details && m.details.context_length,
@@ -5129,7 +5203,7 @@ function updateCtxMeter() {
    · 数字来自协议真实返回:OpenAI 的 usage.prompt_tokens / Anthropic 的 usage.input_tokens
    · 模型窗口来自服务端返回:llama.cpp 的 /v1/models → data[].meta.n_ctx,
      兼容 context_length / max_context_length / details.context_length / /props,
-     都拿不到时按 256K 计
+     都拿不到时按「上下文长度」的手动设定计(默认 256K,范围 8–1024K)
 --------------------------------------------------------------------------- */
 var CTX_POP_OPEN = false;
 function ctxUsageOf(c) {
@@ -5150,14 +5224,25 @@ function ctxMetaFor(model) {
   var m = (model && bag) ? bag[model] : null;
   return m && typeof m === "object" ? m : null;
 }
+/* 手动设定的窗口(K):滑块 / 输入框 / 计算路径共用同一个 clamp 口径 */
+function ctxWinKNow() {
+  return clampNum(state.settings.ctxWinK, CTX_WIN_K_MIN, CTX_WIN_K_MAX, DEFAULT_SETTINGS.ctxWinK);
+}
 function ctxWindowFor(model) {
   var m = ctxMetaFor(model);
   var v = m ? Number(m.ctx) : 0;
-  return (v > 0) ? Math.round(v) : DEFAULT_CTX_WINDOW;
+  /* 服务端报过这个模型的窗口长度 → 永远以它为准(手动设定不覆盖它) */
+  if (v > 0 && (m.src || "server") === "server") return Math.round(v);
+  return ctxWinKNow() * 1024;
 }
 function ctxWindowSrc(model) {
   var m = ctxMetaFor(model);
-  return (m && Number(m.ctx) > 0) ? (m.src || "server") : "default";
+  return (m && Number(m.ctx) > 0 && (m.src || "server") === "server") ? "server" : "manual";
+}
+/* 「上下文长度」控件是否可用:服务端给了窗口长度就隐藏(两处同源) */
+function ctxWinManualOn(model) {
+  var m = String(model == null ? effectiveModel() : model).trim();
+  return ctxWindowSrc(m) !== "server";
 }
 function setModelCtx(model, ctx, src) {
   if (!model || !(Number(ctx) > 0)) return false;
@@ -5311,13 +5396,8 @@ function renderCtxPop(s) {
   body.innerHTML = h;
   var srcEl = $("ctx-pop-src");
   if (srcEl) {
-    srcEl.textContent = s.srcLevel === "server" ? "窗口:服务端"
-      : s.srcLevel === "unlisted" ? "窗口:默认 256K(未确认)" : "窗口:默认 256K";
-    srcEl.title = s.srcLevel === "server"
-      ? "上下文窗口来自服务端返回的模型信息"
-      : s.srcLevel === "unlisted"
-        ? "服务端没有这个模型的信息,只能按默认 256K 估算"
-        : "服务端没有给出该模型的窗口长度,按默认 256K 估算";
+    srcEl.textContent = "窗口:" + ctxWinSrcLabel(s.srcLevel, s.model);
+    srcEl.title = ctxWinSrcTitle(s.srcLevel);
   }
 }
 function toggleCtxPop(force) {
@@ -6248,7 +6328,7 @@ function bindUI() {
     fetchCtxFromProps(false).then(function (v) {
       btn.textContent = "读取模型信息";
       updateCtxMonitor(); updateModelsHint();
-      toast(v ? "已读取到上下文长度:" + num(v) + " token" : "服务端未返回上下文长度,仍按默认 256K 计",
+      toast(v ? "已读取到上下文长度:" + num(v) + " token" : "服务端未返回上下文长度,仍按当前设定 " + ctxWinKNow() + "K 计",
         v ? "success" : "info", 2800);
     });
   });
@@ -7281,8 +7361,12 @@ function bindWsRail() {
       e.preventDefault();
       var row = (e.target && e.target.closest) ? e.target.closest(".wsr-row.dir") : null;
       var dir = row ? (row.getAttribute("data-wsp") || WS_CWD) : WS_CWD;
+      /* DataTransfer 在事件回调结束后即失效 ⇒ 这里先同步快照平铺文件列表,
+         供 entry 链(webkitGetAsEntry)整体读不出来时回退 */
+      var snap = [], fs = e.dataTransfer && e.dataTransfer.files;
+      if (fs) { for (var i = 0; i < fs.length; i++) snap.push(fs[i]); }
       wsRailDragClear();
-      wsUploadFromDrop(e.dataTransfer, dir);
+      wsUploadFromDrop(e.dataTransfer, dir, snap);
     });
   }
   var cb = $("btn-wsr-close");
@@ -7947,26 +8031,26 @@ function wsNormalizeUpload(file, relPath) {
   if (wsJoinPath("/", joined).length > WS_PATH_MAX) return { ok: false, error: "路径过长(超过 " + WS_PATH_MAX + " 字符)" };
   return { ok: true, rel: joined, name: out[out.length - 1] };
 }
-/* webkitGetAsEntry() 递归取文件,按相对路径保留目录结构;不支持则平铺 */
+/* webkitGetAsEntry() 递归取文件,按相对路径保留目录结构;不支持则平铺。
+   返回 { list: [{file, rel}], failed: 读不出来的条目数 } —— failed 让调用方能给**可操作**的
+   错误提示,而不是把「一个都没解析出来」混同于「拖了个空」(旧实现是静默 resolve 空数组)。
+   robust:isFile / isDirectory 两个标记都缺失、但带 .file() 的 entry 也当文件试读一次
+   (旧实现只认 en.isFile === true,形状不认识的条目被静默丢掉) */
 function wsCollectEntries(entries) {
-  var out = [], queue = [], i;
+  var out = [], queue = [], i, failed = 0;
   for (i = 0; i < entries.length; i++) {
     var en = entries[i];
-    if (!en) continue;
+    if (!en) { failed++; continue; }
     if (en.__file) { out.push({ file: en.__file, rel: en.__file.webkitRelativePath || en.__file.name }); continue; }
     queue.push({ entry: en, prefix: "" });
   }
   function pump() {
-    if (!queue.length) return Promise.resolve(out);
+    if (!queue.length) return Promise.resolve({ list: out, failed: failed });
     var job = queue.shift();
     var en = job.entry;
-    var rel = job.prefix ? (job.prefix + "/" + en.name) : en.name;
-    if (en.isFile && typeof en.file === "function") {
-      return new Promise(function (res) {
-        en.file(function (f) { out.push({ file: f, rel: rel }); res(); }, function () { res(); });
-      }).then(pump);
-    }
-    if (en.isDirectory && typeof en.createReader === "function") {
+    var rel = (job.prefix ? (job.prefix + "/" + en.name) : en.name) || "未命名项";
+    if (en.isDirectory === true) {
+      if (typeof en.createReader !== "function") { failed++; return pump(); }
       return new Promise(function (res) {
         var reader = en.createReader(), kids = [];
         (function more() {
@@ -7974,26 +8058,40 @@ function wsCollectEntries(entries) {
             if (!batch || !batch.length) { res(kids); return; }
             for (var j = 0; j < batch.length; j++) kids.push(batch[j]);
             more();       /* readEntries 一次只给一批,要读到空数组为止 */
-          }, function () { res(kids); });
+          }, function () { failed++; res(kids); });
         })();
       }).then(function (kids) {
         for (var j = 0; j < kids.length; j++) queue.push({ entry: kids[j], prefix: rel });
         return pump();
       });
     }
+    if (typeof en.file === "function") {
+      return new Promise(function (res) {
+        en.file(function (f) {
+          if (f) out.push({ file: f, rel: rel }); else failed++;
+          res();
+        }, function () { failed++; res(); });
+      }).then(pump);
+    }
+    failed++;
     return pump();
   }
   return pump();
 }
-function wsUploadFromDrop(dt, dir) {
+/* 拖入的落点。dt 只在事件回调里有效 ⇒ 调用方应把平铺文件列表**同步快照**后经 flatSnap 传进来;
+   没有快照时退回 dt.files(本函数也是同步调用的,读得到)。 */
+function wsUploadFromDrop(dt, dir, flatSnap) {
   if (!dt) return;
   if (!WS_RAIL_SEL) { toast("请先创建并选择一个工作区,再拖入文件", "warn", 4200); return; }
-  var entries = [], flat = false, i;
+  var entries = [], flat = false, fileItems = 0, i;
+  var flatFiles = (flatSnap && flatSnap.length) ? flatSnap
+    : ((dt.files && dt.files.length) ? Array.prototype.slice.call(dt.files) : []);
   var items = dt.items;
   if (items && items.length) {
     for (i = 0; i < items.length; i++) {
       var it = items[i];
       if (!it || it.kind !== "file") continue;
+      fileItems++;
       var en = null;
       if (typeof it.webkitGetAsEntry === "function") {
         try { en = it.webkitGetAsEntry(); } catch (e) { en = null; }
@@ -8004,23 +8102,43 @@ function wsUploadFromDrop(dt, dir) {
       if (f) entries.push({ __file: f });
     }
   }
-  if (!entries.length && dt.files && dt.files.length) {
+  if (!entries.length && flatFiles.length) {
     flat = true;
-    for (i = 0; i < dt.files.length; i++) entries.push({ __file: dt.files[i] });
+    for (i = 0; i < flatFiles.length; i++) entries.push({ __file: flatFiles[i] });
   }
-  if (!entries.length) return;
+  if (!entries.length) {
+    /* 明明拖来了文件项,却一个都没拿到(来源受限 / 内置浏览器):给可操作提示,不再静默 */
+    if (fileItems) toast("拖入的文件没能读出来(浏览器或来源限制),请改用「上传」按钮选择文件", "warn", 5200);
+    return;
+  }
   if (flat) toast("当前浏览器不支持整目录拖入,已按文件名平铺上传", "info", 4600);
-  wsUploadStart(entries, dir || WS_CWD);
+  wsUploadStart(entries, dir || WS_CWD, flatFiles);
 }
-function wsUploadStart(entries, dir) {
+function wsUploadStart(entries, dir, flatFiles) {
   if (!wsReady()) { toast("工作区存储不可用(设置 → 数据 里查看原因)", "warn", 3600); return; }
   if (!WS_RAIL_SEL) { toast("请先创建并选择一个工作区", "warn"); return; }
   if (WS_UPLOAD.running) { toast("还有一批上传正在进行(可先点「取消」)", "warn", 3600); return; }
   var wsId = WS_RAIL_SEL;
+  var snap = (flatFiles && flatFiles.length) ? flatFiles : [];
   wsSetReport(null);
   wsSetProg("正在读取待上传的文件…");
-  wsCollectEntries(entries).then(function (list) {
-    if (!list.length) { wsSetProg(""); toast("没有可上传的文件", "warn"); return; }
+  wsCollectEntries(entries).then(function (res) {
+    var list = (res && res.list) || [], failed = (res && res.failed) || 0;
+    if (!list.length && snap.length) {
+      /* entry 链一条都读不出来(浏览器 / 来源限制):回退 drop 时的平铺快照,照旧传上去 */
+      toast("已按文件名平铺上传(拖入的目录结构读不出来)", "info", 4600);
+      list = [];
+      for (var i = 0; i < snap.length; i++) list.push({ file: snap[i], rel: snap[i].name });
+      failed = 0;
+    }
+    if (!list.length) {
+      wsSetProg("");
+      toast(failed
+        ? "拖入的 " + failed + " 个条目没能读出来(浏览器或来源限制),请改用「上传」按钮选择文件"
+        : "没有检测到可上传的文件", "warn", 5200);
+      return;
+    }
+    if (failed) toast("有 " + failed + " 个条目读不出来,已跳过", "warn", 4200);
     wsUploadRun(wsId, list, dir || WS_CWD);
   }, function () { wsSetProg(""); toast("读取待上传文件失败", "error", 4200); });
 }
