@@ -156,6 +156,9 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
   `PDFKit.available === false`、`why === "缺少 pdfjsLib"`,调用返回 `{ok:false,error}`,不产生未捕获错误。
 - **未验证**:Chrome 125 之前、Safari、Firefox、移动端**都没有实测**;`PDFKit.available` 门控必须由上层实现
   (低于门槛的浏览器仍能正常用应用其它功能,只是 PDF 功能不可用)。
+- **补充(2026-09-15,见 §9)**:缺 `ReadableStream` 异步迭代的宿主(Chromium<124,如用户真机 122)上的
+  取文本崩溃已修并**实测可用(垫片 + 手动 reader 泵)**;**基线档位不变** —— 122 **不**升格为官方支持基线,
+  仍归上面这条"未验证"档(上面的实测是**能力注入模拟**,不等于真机跑过)。
 
 ## 7. 已知限制 / 坑
 
@@ -175,9 +178,124 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 | 文件 | 说明 |
 |---|---|
 | `vendor/pdfjs-src/` | `pdfjs-dist-6.3.289.tgz`、`legacy/build/{pdf.min.mjs,pdf.worker.min.mjs}`、LICENSE、package.json.orig、测试 PDF 及源 HTML（不进版本库） |
-| `src/pdfjs.part` | **最终内嵌片段（1,853,151 B）** |
+| `src/pdfjs.part` | **最终内嵌片段（1,863,174 B；含 §9 的流异步迭代垫片 + 手动 reader 泵）** |
 | `scripts/make-pdfjs-part.js` | ESM→classic 机械化改写 + 自检 + 转义，幂等 |
 
 - **`Read` 工具也复用本引擎**：`Read` 对 PDF 先 `extractText`（**文本优先，不吃 `pdfMode()` 设置** —— Read 的契约是"读内容"），只在确实没有文字层（分页标记 `----- 第 N 页 -----` 不算文字）时才 `renderPages`（页数 = `min(pdfMaxPages(), READ_PDF_IMG_MAX_PAGES=4)`，参数与附件图片模式同参）→ 支持视觉就附页图、否则逐页 OCR；渲染与文本抽取都直接调 `PDFKit`，不走 `resolvePdf` 包装。
 
 能力探针（实测 module/classic worker、blob、动态 import、`new Function` 在 http/file 下的差异，§3 的设计依据）与一次性测试件（`mk-test-pdf.js` / `mk-libtest-page.js` / `libtest-pdfjs.js` / `pdfjs-cdp.js` / `libtest-pdfjs.html` / `pdfjs-test-log.txt`）及旧 `.build/` 目录均已删除；§5 的数字是当时的原始结论（仓库不保留回归脚本，理由见 `CONTRIBUTING.md`「验证」）。
+
+## 9. 流异步迭代兼容（Chromium<124 / 旧 Safari；含实测口径）
+
+**症状**：宿主缺 `ReadableStream.prototype[Symbol.asyncIterator]`（Chrome 124 才有）时，`PDFKit.extractText()` 必抛
+`TypeError: e is not async iterable` —— pdf.js 6 的 display `getTextContent()` 内部是
+`for await (const t of this.streamTextContent())`。用户真机 Thorium Legacy `M122.0.6261.171`（Chromium 122 / Windows 7）
+2026-09-15 报出该错，PDF 附件与 `Read` 的文本抽取全部不可用。
+
+**修法（两处，都在 `make-pdfjs-part.js` 的模板里；`src/pdfjs.part` 只经脚本重生成）**
+1. **手动 reader 泵**（热路径，`PDFKIT_JS`）：`extractText` 不再调 `getTextContent()`，改走 `pageTextViaReader()`
+   → `page.streamTextContent()` + `drainStream()`（逐个 `reader.read()` 拉完流）。合并语义与 pdf.js 原文逐条等价
+   （`items` 顺序 push、`styles` 逐键拷贝、`lang` 对齐 `i.lang ??= t.lang`）；失败/中止先 `reader.cancel()` 再 `releaseLock()`。
+2. **原型垫片**（兜底，`DISPLAY_PRELUDE` 与 `WORKER_PRELUDE` 各一份）：宿主缺该能力时给
+   `ReadableStream.prototype[Symbol.asyncIterator]` 补一个符合规范的实现（`next`/`return`；有则不动、整段 `try` 包裹）；
+   打补丁**前**的原生能力快照写全局 `__pdfStreamIterNative`，供 `PDFKit.diag()` 判定。
+3. **两处口径细节**（批 B-Ⅰ 收口）：① 能力快照是**首次写入语义**（`typeof … === "undefined"` 才写）——主线程降级时
+   worker 载荷会被二次执行，不守卫就会把「已垫片」谎报成「原生」；② 垫片迭代器已**对齐原生**
+   （`[Symbol.asyncIterator]` 自引用可迭代、`return()` 在 `cancel()` 落定后释放读锁）。
+
+**实测口径（2026-09-15，无头 Chrome + 能力注入；注入 = `delete ReadableStream.prototype[Symbol.asyncIterator]`）**
+
+| 场景 | `typeof RS.prototype[Symbol.asyncIterator]` | `extractText(vendor/pdfjs-src/test.pdf)` | `PDFKit.diag().streamIter` |
+|---|---|---|---|
+| 注入 + **修前**产物 | `"undefined"` | **`ok:false`** · `TypeError: e is not async iterable` | —（当时无 `diag()`） |
+| 注入 + **修后**产物 | `"function"`（垫片补上） | **`ok:true`** · 323 字符 / 2 页 / 91 ms | `{native:false, shimmed:true, worker:"static-inferred"}` |
+| 不注入 + 修前产物（对照） | `"function"` | `ok:true` · 323 字符 / 2 页 / 98 ms | — |
+| 不注入 + 修后产物（对照） | `"function"` | `ok:true` · 323 字符 / 2 页 / 99 ms | `{native:true, shimmed:false, worker:"static-inferred"}` |
+
+- **取文本逐字节不变**：`vendor` 测试 PDF（323 字符）/ 手工「文本+图」PDF（85 字符）/ Word 导出 PDF（130 字符）三份夹具，
+  修前与修后（注入与不注入两态）抽出的**整段文本逐字节相同**（FNV-1a：`9272822b` / `e3bc2762` / `c564579a`）。
+- **渲染路径**：同一注入环境下 `renderPages()` 与 `page.getOperatorList()` 均 `ok:true`（`vendor` 测试 PDF 页 1 无图像 op）。
+- **结论口径**：本引擎在缺该 API 的宿主上**实测可用（含垫片 + 手动 reader 泵）**。**这不等于把 Chromium 122 列为官方
+  支持基线** —— pdf.js 6 官方目标仍是 Chrome ≥125 / Safari ≥18 / Firefox ESR（§6），122 上仍可能存在其它未实测差异（见下）。
+
+**覆盖边界（不得当已验证）**
+- 垫片覆盖 **pdf.js display realm + pdf.js worker realm**，且作用点是 **realm 的 `ReadableStream.prototype`** 而非某个库 ——
+  主 realm 内**任何**库只要碰同一原型就一并被覆盖。因此 `src/office.part` 内 docstream 自带的那份 pdf.js
+  **只在 office worker realm 不在覆盖内**（那份跑在自己的 worker 里）；一旦 office 解析降级到主线程
+  （无 `Worker` 时），它就在主 realm 里跑，**同受垫片覆盖** —— 别据此推断「主线程降级的 office pdf 路径一定挂」。
+  它的唯一同类调用点 `static async decompressSignature` 属注释编辑器/签名墨迹路径，本应用不可达。
+- worker realm **注入不到**（CDP `Page.addScriptToEvaluateOnNewDocument` 只作用于主文档）⇒ worker 侧结论是**静态推导**
+  （`WORKER_PRELUDE` 与 worker 体同 IIFE ⇒ 同 realm）。`diag().streamIter.worker` 恒为 `"static-inferred"`，面板与文档文案只说
+  「宿主（主线程）」，不声称 worker 已实测。
+- `Util.applyTransform(p, m)` 在 6.3.289 legacy 里是**原地改写入参并返回 `undefined`**（不是「返回新点」）—— 取四角算几何时
+  要传副本、读回传出的数组（写几何实现时踩过一次，报 `Cannot read properties of undefined (reading '0')`）。
+- `pageTextViaReader` 旁路了原文首句 `if (this._transport._htmlForXfa) …`；本应用 `openDoc` 不启用 XFA ⇒ 影响可忽略。
+- 垫片**未实现 `throw()`**（`for await` 正常路径只用 `next()`/`return()`，有意简化）。
+- **实测（真机）**：**Thorium `M122.0.6261.171`（Chromium 122）上可用** —— 启动 / 诊断面板 / `PDFKit.extractText`（`{ok:true,pages:2,chars:323}`）/
+  `pageImages`（`mode:"rect"`）/ `renderCrops` / 流式对话 / 附件侧 OCR 融合（请求体含两个暗号、块头与 §10 逐字相符）都在 122 上跑通
+  （原始读数 `shared/progress/thorium-122-verify-done.md`）。口径同 `README.md`：**「实测可用（含垫片 + 手动 reader 泵）」，不等于把
+  Chromium 122 升格为官方支持基线**（官方目标仍是 Chrome ≥125 / Safari ≥18）。
+- **仍未实测**：**Windows 7 本体**（本机 = Win11 + Chromium 122 内核）；Safari / Firefox / 移动端；worker realm 内的实测（仍是静态推导）；
+  `normal` / `full` 档的浏览器行为（122 真机上只抽验过 `minimal` 档；`full` 档那次读数取自更早一路留下的快照，且该读数在
+  并发事故中作废、事后未复跑 —— 见 `shared/progress/thorium-122-verify-done.md` §15）。
+
+`PDFKit.diag()` 的读数同时出现在 设置 → 环境 的「诊断」面板（`· PDF 引擎:pdf.js 6.3.289 · worker · 取文本:reader ·
+流迭代:原生/已垫片 · 取图:可用/不可用 · 图文融合:<`fuseStateText()` 的返回值>`）；「图文融合」的取值逐字来自 `src/appD.part` 的
+`fuseStateText()`，共五种：`不可用(取图能力缺失)` / `已启用(当前模型不支持图像输入)` / `不可用(本机 OCR 引擎不可用)` /
+`未启用(当前模型支持图像输入)` / `未启用(图像能力未知,还没探测到该模型;可在 设置 → 模型 把该模型的图像能力设为「不支持」后启用 OCR 融合)`。
+`PDFKit.notes` 给出「仅提示、不拦」的环境备注（宿主缺失时会写明已垫片）。
+「取图」与「图文融合」是两件事：前者只是 `PDFKit.renderCrops` 的能力在位，后者才表示**现在真的会做** OCR 融合
+（判据 = 取图能力 + 本机 OCR 引擎可用 + 当前模型不支持图像输入，见 §10）。
+
+## 10. 图文按序融合（非视觉模型：图 → 本机 OCR → 按文档顺序插进文本）
+
+**需求**：模型不支持图像输入时，文档里的图片内容也要进上下文——既不能只发文字，也不能把图丢掉。
+
+**链路**：`PDFKit.pageImages()` 扫页图位置（Route C 几何：CTM 下的单位方，见 §2.1c 契约与 `shared/progress/netdocs-B1-done.md`）
+→ `PDFKit.renderCrops()` 按区取图（失败单调降级到整页 `renderPages`，**必须注记**，不静默）→ 应用层用内嵌 OCRKit 逐张识别
+→ 按页插进 PDF 文本。Read 侧（`Read("/x.pdf")`）与附件侧（选文件 → `resolvePdf`）**同一套助手、同一套块格式**：
+`ocrSeqCands`（逐张 `wsImgFitForModel` → `wsOcrTextOf` + 预算/中止 + 计数，**不做任何文案**）、
+`ocrBlockText`（块头唯一来源，空 / 纯空白 ⇒ `""`，不写空块）、`docFusePages`（按页插块；无块 ⇒ 原样返回）——
+三个都在 `src/appD.part`，`appE.part` 的 `wsOcrCands`（旧的「整页无文字层 ⇒ OCR」路径）内部改调 `ocrSeqCands`，
+**对外文案逐字保留**（旧注记 `【第 N 页】` 与融合注记 `【第 N 页 · 图 k · 本机 OCR】` 双轨有意保留，别顺手统一）。
+
+**块格式（唯一口径）**
+
+```
+----- 第 1 页 -----
+<该页文本>
+
+【第 1 页 · 图 1 · 本机 OCR】
+<识别文本>
+```
+- 整页兜底（`mode:"full"` 的页，或 `renderCrops` 失败）：`【第 N 页 · 整页图像 OCR(含文字层重复,可能有误差)】`——
+  这条**不带**「· 本机 OCR」（label 里已写明），实现上是 `kind:"full"` 的唯一区别。
+- 识别为空：不写空块，只累计「N 图 OCR 未识别到文字」。
+- 匹配不到页号的块：追加文末并注明 `(原页未在文本中找到)` + 记一条注记（不静默丢弃）。
+
+**预算（单一来源）**
+
+| 常量 | 值 | 语义 |
+|---|---|---|
+| `READ_DOC_OCR_MAX_IMAGES` | 12 | Read 侧单次最多 OCR 张数 |
+| `READ_DOC_OCR_MAX_PAGES` | 8 | Read 侧只扫描前 8 页的图片（文本仍按 `extractText` 的 `maxPages` 取） |
+| `READ_OCR_TIMEOUT_MS` | 120 s | **整次 Read** 共享的 OCR 总预算 |
+| `ATT_OCR_MAX_IMAGES` | 6 | **附件侧**单次最多 OCR 张数 |
+| `ATT_OCR_TIMEOUT_MS` | 60 s | **附件侧 OCR 阶段**总预算——**整次附件解析共享**，不是每图；**不是整条解析链的墙钟上限**（取图调用 `pageImages` / `renderCrops` / `renderPages` 各另带一次 60 s 超时） |
+
+字符预算两边都 = `max(512, toolLimit("maxOut") - 512)`；附件侧融合后超 `ATTACH_TEXT_MAX`(131072) 截断并标 `clipped`。
+达到任一预算**立即停**并如实注记（另有 N 图未处理 / 本机 OCR 时间预算用尽 / 结果文本已达单次长度上限）。
+`OCRKit.recognize` 单次调用不可中断（只能 `terminate`）⇒ 超时 / 中止的生效点只在**两张之间**。
+
+**落点**
+- **Read 侧**：融合文本进工具结果（`wsFuseOcrText`），状态行加字段「图片 N 张已本机 OCR 并按页插入(当前模型不支持图像输入,OCR 可能有误差)」。
+- **附件侧**：进附件对象——`att.text`（融合后正文，`textChars` 同步）、`att.ocrImgs`（**写入过非空块的张数**；未识别的另计；
+  旧数据无此键 = 0，不做迁移）、`att.degraded`（上面那些注记）。气泡卡片与附件 chip 显示「N 图已 OCR」。
+
+**不变量（有负例断言守着）**：视觉模型路径一字不变（不探页图、不做 OCR，请求体既不含「本机 OCR」也不含夹具暗号）；
+无图 / 纯文本文档输出逐字节不变；附件 PDF 的融合条件 = 「非视觉**且有图**」（**不是**「文本为空」）。
+另有一条既有坑要写在这里：附件侧「文本为空 ⇒ 扫描件」那条分支**实际不会命中**——`PDFKit.extractText` 对任何 ≥1 页 PDF
+都写页分隔标记，`text.trim()` 永不为空（实测：批前扫描件 PDF 的附件正文只有 17 字节的 `----- 第 1 页 -----`，没有正文）。
+本轮**不改那条分支**：非视觉 + 有图 ⇒ 融合生效，扫描件在文本模式下改由「页图 OCR 进 `att.text`」兜住
+（同一夹具实测：从只有页分隔标记 → 含整页图像的识别文本）；视觉模型下仍是既有的「只有页分隔标记」行为
+（要按图发就在 设置 → 附件 把 PDF 切成「图片模式」）。

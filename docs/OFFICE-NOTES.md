@@ -119,3 +119,29 @@ worker 路径(真实 `OfficeKit`)与主线程参照(注入库体 + 胶水直接�
 - **`file://` 下 classic blob worker 可用**(与 Tesseract 的 worker 是同一类路径);worker 里 `importScripts(blob:)` / `fetch(blob:)` 会被浏览器拒绝,所以载荷一律**随 worker 源一起塞进去**,不用 `importScripts`。
 - **`Read` 工具也复用本引擎**：`Read` 遇 doc / docx / ppt / pptx / xls / xlsx 时直接调 `OfficeKit.parse`（与工作区预览同一调用式，不走 `resolveOffice` 的 File+vision+toast 包装）；抽取文本走共享分页内核 `wsLinePageResult`（"文件:…"信息并入末尾状态行、不占行号），文档图片按模型视觉能力附带（单次 ≤4 张、累计 ≤1 MiB）或非视觉（文本为空时）走 OCR。
 - 只在 **Chrome/Edge** 实测;**Safari / Firefox 未实测**(与项目其它内嵌库同一条边界)。
+
+## 7. 非视觉模型的图片处理（图文按序融合，批 B）
+
+**行为**：模型不支持图像输入（`visionState().vision === false`）时，`docx / xlsx / pptx` 抽出来的图片**不再丢弃**——
+用与 `Read` 侧同一套助手（`appD.part` 的 `ocrSeqCands` / `ocrBlockText`）逐张本机 OCR，按文档顺序接在正文之后，
+块格式 `【图 k · 本机 OCR】`（`k` 与 `label` 就是解析层给的那个，原样沿用；按第 6 节，pptx 目前也是「图 k」）。
+附件对象上同步三个字段：`att.text`（融合后正文）、`att.textChars`、`att.ocrImgs` = **写入过非空块的张数**
+（未识别出文字的另计，不计入 `ocrImgs`）；`att.degraded` 写明「图片 N 张已本机 OCR 并按序插入(当前模型不支持图像输入,OCR 可能有误差)」
+与预算注记（另有 N 图未处理 / 时间预算用尽 / 未识别 / 引擎不可用）。气泡卡片与附件 chip 显示「N 图已 OCR」。
+每会话只提示一次「正在用本机 OCR 识别…」（复用既有 `officeVisionToastShown` 机制），解析进度仍走 `OfficeKit.parse` 的 `onProgress`。
+
+**行为边界**：
+- **纯图文档**（没有正文）在非视觉下仍是既有拒收（「没有提取到可发送的内容」）——融合只对「有正文 + 有图」生效；
+- 老格式 `doc / ppt` 本来就不抽图，不受影响；
+- **视觉模型路径一字不变**：图片照旧作为 image part 发出（`att.mode === "both"`、`imgCount` = 发出张数、无 `ocrImgs`）；
+- `skippedImgs` 只数解析层跳过的（图表 / EMF / WMF / TIFF / 超限），**不**把融合的图算进去；融合的图也不进 `att.images`。
+
+**预算（唯一来源 = `appD.part` 的常量）**：单次附件解析最多 `ATT_OCR_MAX_IMAGES`(6) 张、**OCR 阶段**总预算 `ATT_OCR_TIMEOUT_MS`(60 s，
+**整次解析共享**、不是每图)；注意它只覆盖 **OCR 阶段** —— 取图调用 `pageImages` / `renderCrops` / `renderPages` 各自另有一次 60 s 超时，
+取图极慢时整条解析的墙钟会超过 60 s。融合后正文超 `ATTACH_TEXT_MAX`(131072 字符) 截断并标 `clipped`。
+达到任一预算**立即停**并如实注记（不等满 60 s 再丢图）；`OCRKit.recognize` 单次调用不可中断（只能 `terminate`）⇒ 超时 / 中止的生效点只在两张之间。
+
+**实测（无头 Chrome 152 + 真实夹具，批 B-Ⅱb）**：`code.docx / code.pptx / code.xlsx` 在 `visionForce="no"` 下
+`att.text` 命中图片暗号（`AZUSA-IMG-7Q`）、块头与计数正确、请求体里没有 image part；`visionForce="yes"` 下图片按现状以 image part 发出、
+请求体不含「本机 OCR」字样；无图文件（`test.xlsx` / `plain.docx`）与视觉格请求体与批前**逐字节相同**。
+逐条读数与证据路径见 `shared/progress/netdocs-B2b-done.md`。

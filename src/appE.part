@@ -440,7 +440,7 @@ var AGENT_TOOLS = [
         "",
         "**边界**",
         "- 只能访问本会话挂载的工作区(虚拟盘,根目录 `/`),看不到你的磁盘,也不能执行宿主程序;读写工作区文件用 Read / Write / Edit / Glob / Grep / FileOps。",
-        "- 需要二进制文件(图片/压缩包/办公文档等)的字节时,直接用 `open(\"/workspace/...\",\"rb\").read()` 读取并处理;这类文件不要用 Read(Read 只读文本,二进制会被拒)。",
+        "- 需要二进制文件(图片/压缩包/办公文档等)的字节时,直接用 `open(\"/workspace/...\",\"rb\").read()` 读取并处理;这类文件不要用 Read(它把图片/办公文档/PDF 按各自的内核解析成文本或图像交付,**不交付原始字节**)。",
         "- 当前浏览器没有 JSPI 时,`asyncio.run` / `loop.run_until_complete` 这类栈切换路径不可用(普通同步代码不受影响,可用 asyncio 的其它写法)。",
         "- 关网时(设置 → MCP 工具 里关闭「允许联网」)Python 侧的网络调用会失败并给出提示;开网时的请求也受浏览器 CORS 约束。",
         "",
@@ -515,7 +515,7 @@ var AGENT_TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, requiresNetwork: false },
     run: function (args, ctx) { return pyPackagesTool(args, ctx); }
   },
-  /* ---- Python 任务类(5 个;全部 cap 不设、defaultPerm 全 allow) ----
+  /* ---- Python 任务类(4 个;全部 cap 不设、defaultPerm 全 allow) ----
      可见性走 PY_TOOL_NAMES(与 ExecutePython 同一道运行期门)。
      modelDesc 的公共尾段 PV_TASK_COMMON 六个要点是"必含项",写一次、四处引用
      (广播枢纽:改一处即四处同步) */
@@ -2071,6 +2071,8 @@ var READ_MEDIA_MAX_IMAGES = 4;                   /* 单次调用交付张数上�
 var READ_MEDIA_TOTAL_BYTES = 1024 * 1024;        /* 单次调用交付总字节(== 单张硬顶) */
 var READ_PDF_IMG_MAX_PAGES = 4;                  /* 无文字层 PDF 的渲染页数上限(与 pdfMaxPages() 取小) */
 var READ_OCR_TIMEOUT_MS = 120000;                /* **整次 Read** 的 OCR 总预算(多页共享,不再是每页独立) */
+var READ_DOC_OCR_MAX_IMAGES = 12;                /* 图文按序融合:单次最多 OCR 张数(超出按序丢弃 + 注记) */
+var READ_DOC_OCR_MAX_PAGES = 8;                  /* 图文按序融合:只扫描前 8 页的图片(文本仍按 extractText 的 maxPages 取) */
 var TOOL_MEDIA_CHAT_KEEP_ITEMS = 8;              /* 聊天轮软护栏:最近 N 条带媒体工具项 */
 var TOOL_MEDIA_CHAT_MAX_BYTES = 8 * 1024 * 1024; /* 聊天轮软护栏:累计 data 字符量上限(≈8 MiB) */
 var EDIT_READ_MAX = 2 * 1024 * 1024;            // Edit 可编辑文件上限
@@ -3716,55 +3718,203 @@ function wsFitCands(cands) {
   }
   return step().then(function () { return { media: out, bytes: total, skipped: cands.length - out.length }; });
 }
-/* 逐张 OCR(共享一个总预算 deadline;页间查 ctx.signal.aborted;文本累加到工具结果预算即停) */
+/* 逐张 OCR(共享一个总预算 deadline;页间查 ctx.signal.aborted;文本累加到工具结果预算即停)
+   内核已抽到 appD 的 ocrSeqCands(§2.3);本函数只负责**它自己的文案口径**——
+   【label】前缀(仅 multi 时)、parts.join("\\n\\n")、三条注记与两族 wsErr,**逐字不变**(M10 回归) */
 function wsOcrCands(cands, args, ctx, r, text, info) {
-  var sig = ctx && ctx.signal;
-  var deadline = Date.now() + Math.min(READ_OCR_TIMEOUT_MS, toolLimit("timeoutMs"));
-  var budgetChars = Math.max(512, toolLimit("maxOut") - 512);
-  var parts = [], acc = 0, done = 0, stopped = 0, aborted = false;
+  var multi = (cands.length > 1);
   var base = String(text == null ? "" : text).trim();
-  if (base) { parts.push(base); acc += base.length; }
-  function step() {
-    if (done >= cands.length) return Promise.resolve();
-    if (sig && sig.aborted) { aborted = true; return Promise.resolve(); }
-    if (Date.now() >= deadline) { stopped = cands.length - done; return Promise.resolve(); }
-    if (acc >= budgetChars) { stopped = cands.length - done; return Promise.resolve(); }
-    var c = cands[done] || {};
-    var remain = Math.max(1000, deadline - Date.now());
-    var blob = wsBase64Blob(c.data, c.mime);
-    if (!blob) { done++; return step(); }
-    return wsImgFitForModel(blob, c.mime, {}).then(function (f) {
-      if (!f.ok) { done++; return step(); }
-      return wsOcrTextOf("data:" + f.mime + ";base64," + f.data, { remainingMs: remain }).then(function (o) {
-        done++;
-        if (o.ok && o.text) {
-          var seg = (cands.length > 1 ? ("【" + (c.label || ("第 " + done + " 页")) + "】\n") : "") + o.text;
-          parts.push(seg);
-          acc += seg.length;
-        } else if (!o.ok && /超时/.test(String(o.error || ""))) {
-          stopped = cands.length - done;
-          return Promise.resolve();
-        }
-        return step();
-      });
-    });
-  }
-  return step().then(function () {
+  function labelOf(label, seq) { return String(label || "") || ("第 " + seq + " 页"); }
+  return ocrSeqCands(cands, {
+    signal: ctx && ctx.signal,
+    deadline: Date.now() + Math.min(READ_OCR_TIMEOUT_MS, toolLimit("timeoutMs")),
+    maxChars: Math.max(512, toolLimit("maxOut") - 512),
+    baseChars: base ? base.length : 0,
+    prefixOf: function (c, seq) { return multi ? ("【" + labelOf(c.label, seq) + "】\n") : ""; }
+  }).then(function (res) {
+    var parts = [], i;
+    if (base) parts.push(base);
+    for (i = 0; i < res.blocks.length; i++) {
+      var b = res.blocks[i];
+      parts.push((multi ? ("【" + labelOf(b.label, b.seq) + "】\n") : "") + b.text);
+    }
     if (!parts.length) {
-      if (aborted) return wsErr("EBINARY", "生成已中止,本次读取没有完成", r.path);
+      if (res.aborted) return wsErr("EBINARY", "生成已中止,本次读取没有完成", r.path);
       return wsErr("EBINARY", "「" + r.path + "」里的图片在本机 OCR 里没有识别到文字,而当前模型不支持图像输入 —— " +
         "内容无法读取(可换支持视觉的模型,或用 ExecutePython 处理)", r.path);
     }
     var info2 = (info || []).slice();
     if (info2.indexOf("没有可读文本,已改用 OCR") < 0 && !base) info2.push("本机 OCR 识别(可能有误差)");
-    if (stopped > 0) info2.push("还有 " + stopped + " 页未识别");
-    if (aborted) info2.push("生成已中止,结果不完整");
+    if (res.stopped > 0) info2.push("还有 " + res.stopped + " 页未识别");
+    if (res.aborted) info2.push("生成已中止,结果不完整");
     return wsLinePageResult(parts.join("\n\n"), args, {
       lead: info2.join(" · ") + " · OCR", stats: false, size: r.size, mtime: r.at
     });
   });
 }
-/* 文档(office)结果收尾:text 走分页内核;图片按视觉能力附带或丢弃(§3.7.2/§3.6 混合场景) */
+/* 非视觉模型的「图文按序融合」收尾(§2.2/§2.4):把候选图 OCR 成块插进文本——
+   layout:"pages" = PDF(按页插,格式见 §2.2);layout:"flat" = office(正文之后按序接)。
+   四态注记齐:张数超限 / 时间预算 / 字符预算 / OCR 不可用;中止另记。**绝不伪造文本**
+   (OCR 不可用 ⇒ 原文照给 + 注记;一张都没识别出来 ⇒ 只有「未识别」注记,不编内容)。
+   o = { path, args, ctx, r, text, info, cands, layout, leftover, notesTail }
+   cands[] = { mime, data, label, page, kind:"rect"|"full"|"" };label 的页号口径由调用方定 */
+function wsFuseOcrText(o) {
+  var info = (o.info || []).slice();
+  var tail = (o.notesTail || []).slice();
+  var text = String(o.text == null ? "" : o.text);
+  var ctx = o.ctx, sig = ctx && ctx.signal;
+  function plain() {
+    return wsLinePageResult(text, o.args, { lead: info.concat(tail).join(" · "), size: o.r.size, mtime: o.r.at });
+  }
+  var all = o.cands || [];
+  var over = Math.max(0, Number(o.leftover) || 0) + Math.max(0, all.length - READ_DOC_OCR_MAX_IMAGES);
+  var use = all.slice(0, READ_DOC_OCR_MAX_IMAGES);
+  if (!use.length) return Promise.resolve(plain());
+  if (sig && sig.aborted) { info.push("生成已中止,结果不完整"); return Promise.resolve(plain()); }
+  if (!ocrReady()) {
+    info.push("本机 OCR 引擎不可用(" + ((window.OCRKit && window.OCRKit.why) || "缺少 Web Worker / WebAssembly") +
+      "),图片内容无法读取(可换支持视觉的模型)");
+    return Promise.resolve(plain());
+  }
+  return ocrSeqCands(use, {
+    signal: sig,
+    deadline: Date.now() + Math.min(READ_OCR_TIMEOUT_MS, toolLimit("timeoutMs")),
+    maxChars: Math.max(512, toolLimit("maxOut") - 512),
+    baseChars: text.length,
+    /* 预算核算用的块前缀:整页兜底那条不带「· 本机 OCR」(§2.2 两种块头的唯一区别) */
+    prefixOf: function (c) { return (c.kind === "full") ? ("【" + c.label + "】\n") : ocrBlockHead(c.label); }
+  }).then(function (res) {
+    var blocks = res.blocks, rendered = [], i, k;
+    for (i = 0; i < blocks.length; i++) {
+      var b = blocks[i];
+      rendered.push((b.kind === "full") ? ("【" + b.label + "】\n" + b.text) : ocrBlockText(b.label, b.text));
+    }
+    if (o.layout === "pages") {
+      var byPage = {}, order = [];
+      for (i = 0; i < blocks.length; i++) {
+        k = blocks[i].page || 0;
+        if (!byPage[k]) { byPage[k] = []; order.push(k); }
+        byPage[k].push(rendered[i]);
+      }
+      text = docFusePages(text, byPage, info);
+    } else if (rendered.length) {
+      text = text ? (text + "\n\n" + rendered.join("\n\n")) : rendered.join("\n\n");
+    }
+    var fullPages = {}, nFull = 0;
+    for (i = 0; i < blocks.length; i++) {
+      if (blocks[i].kind !== "full") continue;
+      k = blocks[i].page || 0;
+      if (!fullPages[k]) { fullPages[k] = 1; nFull++; }
+    }
+    if (rendered.length) {
+      info.push("图片 " + rendered.length + " 张已本机 OCR 并" + (o.layout === "pages" ? "按页" : "按序") +
+        "插入(当前模型不支持图像输入,OCR 可能有误差)");
+    }
+    if (nFull) info.push("其中 " + nFull + " 页为整页图像 OCR(含文字层重复,可能有误差)");
+    if (over > 0) info.push("另有 " + over + " 图未处理(超出单次上限,可用 ExecutePython 逐张拆出来再 Read)");
+    if (res.stopped > 0) {
+      info.push(res.stop === "chars"
+        ? ("另有 " + res.stopped + " 图未处理(结果文本已达单次长度上限,可用 ExecutePython 逐张拆出来再 Read)")
+        : ("另有 " + res.stopped + " 图未处理(本机 OCR 时间预算用尽,可缩小范围或先裁剪后再 Read)"));
+    }
+    if (res.empty > 0) info.push(res.empty + " 图 OCR 未识别到文字");
+    if (res.aborted) info.push("生成已中止,结果不完整");
+    return plain();
+  });
+}
+/* 非视觉 PDF 的取图计划(§2.1c/§5.8):pageImages 报含图 ⇒ 每图一个取区;mode:"full" 的页用
+   面积护栏走整页兜底;整条 renderCrops 失败 ⇒ renderPages 整页渲染(P2-14 的降级必须有注记)。
+   返回 { list:[候选图…], leftover:因张数上限没做的张数, pages:扫描页数, unscanned:未扫描页数, hasImgs } */
+function wsPdfImgCands(buf, info) {
+  var tmoMs = Math.min(60000, toolLimit("timeoutMs"));
+  function fail(why) {
+    info.push((why ? ("精确取区与整页渲染都失败(" + why + ")") : "图片检测失败") + ",未做图文 OCR");
+    return { list: [], leftover: 0, pages: 0, unscanned: 0, hasImgs: false };
+  }
+  return window.PDFKit.pageImages(buf, {
+    maxPages: READ_DOC_OCR_MAX_PAGES, dpi: pdfDpi(), region: "rect", timeout: tmoMs
+  }).then(function (pr) {
+    if (!pr || !pr.ok) {
+      info.push("图片检测失败(" + ((pr && pr.error) || "未知") + "),未做图文 OCR");
+      return { list: [], leftover: 0, pages: 0, unscanned: 0, hasImgs: false };
+    }
+    var pages = pr.pages || [], imgPages = [], i, j;
+    for (i = 0; i < pages.length; i++) if (pages[i] && pages[i].hasImages) imgPages.push(pages[i]);
+    var out = {
+      list: [], leftover: 0, pages: pages.length,
+      unscanned: Math.max(0, (pr.pageCount || pages.length) - pages.length),
+      hasImgs: imgPages.length > 0
+    };
+    if (!imgPages.length) return out;                    /* 纯文本/无图 ⇒ 输出逐字节不变 */
+    if (out.unscanned > 0) info.push("仅处理前 " + READ_DOC_OCR_MAX_PAGES + " 页的图片(共 " + out.unscanned + " 页未扫描图片)");
+    var groups = [], meta = [];
+    for (i = 0; i < imgPages.length; i++) {
+      var pg = imgPages[i];
+      if (pg.mode === "rect" && pg.rects && pg.rects.length) {
+        for (j = 0; j < pg.rects.length; j++) {
+          groups.push({ page: pg.page, rect: pg.rects[j] });
+          meta.push({ page: pg.page, kind: "rect", seq: j + 1 });
+        }
+      } else {
+        /* mode:"full" 的页(整页兜底;rects 仅供诊断,不参与取区):用远超整页的面积触发
+           renderCrops 的上限护栏 ⇒ 该页退整页渲染(与 renderPages 同一张整页图) */
+        groups.push({ page: pg.page, rect: { x: 0, y: 0, w: 1e7, h: 1e7 } });
+        meta.push({ page: pg.page, kind: "full", seq: 1 });
+      }
+    }
+    if (groups.length > READ_DOC_OCR_MAX_IMAGES) {
+      out.leftover = groups.length - READ_DOC_OCR_MAX_IMAGES;
+      groups = groups.slice(0, READ_DOC_OCR_MAX_IMAGES);
+      meta = meta.slice(0, READ_DOC_OCR_MAX_IMAGES);
+    }
+    function mimeOf(u) { return (String(u || "").match(/^data:([^;,]+)/) || [])[1] || "image/jpeg"; }
+    function candOf(im, m) {
+      var full = (m.kind === "full");
+      return {
+        mime: mimeOf(im.dataUrl), data: dataUrlPayload(im.dataUrl || ""),
+        label: full ? ("第 " + m.page + " 页 · 整页图像 OCR(含文字层重复,可能有误差)") : ("第 " + m.page + " 页 · 图 " + m.seq),
+        page: m.page, kind: full ? "full" : "rect"
+      };
+    }
+    function pagesFallback(why) {
+      var need = {}, maxPage = 0, list = [], k;
+      for (k = 0; k < meta.length; k++) { need[meta[k].page] = true; if (meta[k].page > maxPage) maxPage = meta[k].page; }
+      return window.PDFKit.renderPages(buf, {
+        dpi: pdfDpi(), maxPages: maxPage, format: "image/jpeg", quality: 0.86, timeout: tmoMs
+      }).then(function (rr) {
+        if (!rr || !rr.ok || !rr.images || !rr.images.length) { info.push("精确取区与整页渲染都失败(" + why + "),图片内容无法读取"); return out; }
+        info.push("精确取区失败(" + why + "),已改用整页图像 OCR");
+        for (k = 0; k < rr.images.length; k++) {
+          var im = rr.images[k];
+          if (!im || !need[im.page]) continue;
+          list.push({ page: im.page, dataUrl: im.dataUrl, width: im.width, height: im.height });
+        }
+        list.sort(function (a, b) { return a.page - b.page; });
+        for (k = 0; k < list.length; k++) {
+          out.list.push({
+            mime: mimeOf(list[k].dataUrl), data: dataUrlPayload(list[k].dataUrl || ""),
+            label: "第 " + list[k].page + " 页 · 整页图像 OCR(含文字层重复,可能有误差)",
+            page: list[k].page, kind: "full"
+          });
+        }
+        return out;
+      });
+    }
+    return window.PDFKit.renderCrops(buf, {
+      groups: groups, dpi: pdfDpi(), format: "image/jpeg", quality: 0.86, timeout: tmoMs
+    }).then(function (cr) {
+      var imgs = (cr && cr.ok) ? cr.images : null, ok = !!imgs && imgs.length === groups.length;
+      if (ok) for (i = 0; i < groups.length; i++) { if (!imgs[i] || !imgs[i].dataUrl) { ok = false; break; } }
+      if (ok) {
+        for (i = 0; i < meta.length; i++) out.list.push(candOf(imgs[i], meta[i]));
+        return out;
+      }
+      return pagesFallback((cr && cr.error) || "未知");
+    }, function (e) { return pagesFallback(wsMsg(e)); });
+  }, function (e) { return fail(""); });
+}
+/* 文档(office)结果收尾:text 走分页内核;图片按视觉能力附带 / OCR 融合 / 丢弃
+   (§3.7.2/§3.6 混合场景;B4 的融合走独立标志 o.fuseImgs,o.ocr 保持「无文本层才 OCR」原义) */
 function wsDocumentPack(o) {
   var text = String(o.text == null ? "" : o.text);
   var cands = (o.cands || []).slice();
@@ -3774,8 +3924,17 @@ function wsDocumentPack(o) {
     return Promise.resolve(wsLinePageResult(text, o.args, { lead: info.join(" · "), size: o.r.size, mtime: o.r.at }));
   }
   if (o.ocr) return wsOcrCands(cands.slice(0, READ_MEDIA_MAX_IMAGES), o.args, o.ctx, o.r, text, info);
+  if (!vision && o.fuseImgs) {
+    /* 非视觉 + 有文本 + 有图 ⇒ 本机 OCR 按序插到正文之后(office 段内不分区,故 layout = "flat";
+       pptx 的真实页号要另走 docstream AST —— 属后续批次,不阻塞) */
+    return wsFuseOcrText({
+      path: o.r.path, args: o.args, ctx: o.ctx, r: o.r, text: text, cands: cands,
+      info: info, layout: "flat", notesTail: o.notesTail || []
+    });
+  }
   if (!vision) {
-    /* 与附件 resolveOffice 的 dropImages 同语义:非视觉丢图,文本照给 */
+    /* 与附件 resolveOffice 的 dropImages 同语义:非视觉丢图,文本照给
+       (只剩 o.ocr 未覆盖的路径:无候选图时上面已提前返回 ⇒ 实际只在 o.fuseImgs 未置位时到达) */
     if (text.trim()) info.push(cands.length + " 图已跳过(当前模型不支持图像输入)");
     return Promise.resolve(wsLinePageResult(text, o.args, { lead: info.join(" · "), size: o.r.size, mtime: o.r.at }));
   }
@@ -3820,15 +3979,18 @@ function wsReadOfficeResult(wsId, r, args, ctx) {
                    from: "office-image", path: path });
     });
     var haveText = !!text.trim();
+    var vision = toolVisionCanImage(ctxConv(ctx));
     if (haveText && !cands.length) return wsDocumentPack({ text: text, cands: [], info: info, args: args, ctx: ctx, r: r });
     if (!haveText && !cands.length) {
       return wsErr("EBINARY", "「" + path + "」没有可读的文本内容(可能是纯图片文档,且没有可提取的图片)", path);
     }
-    if (!haveText) info.push(toolVisionCanImage(ctxConv(ctx))
+    if (!haveText) info.push(vision
       ? "没有可读文本,改附图片" : "没有可读文本,已改用 OCR(当前模型不支持图像输入)");
     return wsDocumentPack({
       text: text, cands: cands, info: info, args: args, ctx: ctx, r: r,
-      ocr: !haveText && !toolVisionCanImage(ctxConv(ctx))
+      ocr: !haveText && !vision,
+      /* B4:有文本 + 非视觉 ⇒ 图片不再丢弃,改本机 OCR 后按序插到正文之后(独立标志,不动 o.ocr 原义) */
+      fuseImgs: haveText && !vision
     });
   });
 }
@@ -3849,8 +4011,20 @@ function wsReadPdfResult(wsId, r, args, ctx) {
       if (realText) {
         var info = ["file " + path, "PDF", "共 " + (o.pages || 1) + " 页",
                     "文本 " + num(o.chars != null ? o.chars : text.length) + " 字符"];
-        if (o.truncated) info.push("已截断");
-        return wsLinePageResult(text, args, { lead: info.join(" · "), size: r.size, mtime: r.at });
+        if (toolVisionCanImage(ctxConv(ctx))) {
+          /* 视觉模型路径:一字不变(不探页图、不做 OCR) */
+          if (o.truncated) info.push("已截断");
+          return wsLinePageResult(text, args, { lead: info.join(" · "), size: r.size, mtime: r.at });
+        }
+        /* 非视觉 + 有图 ⇒ 按页融合(§2.2);无图 ⇒ 与批前逐字节一致 */
+        var notesTail = [];
+        if (o.truncated) notesTail.push("已截断");
+        return wsPdfImgCands(buf, info).then(function (plan) {
+          return wsFuseOcrText({
+            path: path, args: args, ctx: ctx, r: r, text: text, info: info,
+            cands: plan.list, leftover: plan.leftover, layout: "pages", notesTail: notesTail
+          });
+        });
       }
       var maxPages = Math.min(pdfMaxPages(), READ_PDF_IMG_MAX_PAGES);
       return window.PDFKit.renderPages(buf, { dpi: pdfDpi(), maxPages: maxPages, format: "image/jpeg", quality: 0.86 })
@@ -8824,10 +8998,12 @@ function cxToolVisible(c) {
   return false;
 }
 /* 近极限系统提醒(进 buildBody 的 sys 拼接链;与 pvTaskBlock / wsContextBlock 同范式:
-   **只读、无副作用、每轮现算**,不引入"注入了要记账"的状态)。返回空串 = 不需要提醒 */
-function cxContextBlock(c) {
+   **只读、无副作用、每轮现算**,不引入"注入了要记账"的状态)。返回空串 = 不需要提醒。
+   snap 可选 = 调用方已算好的 ctxSnapshot(updateCtxMeter 挂在输入框 input 事件上,复用同一次全量估算;
+   必须与 c 同一条会话,否则阈值判定会读到另一条会话的读数)。 */
+function cxContextBlock(c, snap) {
   if (!cxEnabled() && !cxToolVisible(c)) return "";
-  var s = ctxSnapshot(c);
+  var s = snap || ctxSnapshot(c);
   var pct = s.win > 0 ? (s.used / s.win * 100) : 0;
   if (pct < cxWarnPct()) return "";
   var t = cxTriggerPct();

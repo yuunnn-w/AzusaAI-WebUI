@@ -275,6 +275,7 @@ function fileCardEl(meta, payload) {
   var sub;
   if (meta.kind === "pdf") {
     sub = "PDF · " + (meta.pages || 1) + " 页 · " + (meta.mode === "image" ? "图片模式" : "文本模式") +
+      (meta.ocrImgs ? " · " + meta.ocrImgs + " 图已 OCR" : "") +
       (meta.clipped ? " · 已截断" : "");
   } else if (meta.kind === "office") {
     sub = officeBrief(meta) + (meta.degraded ? " · " + meta.degraded : "");

@@ -396,6 +396,14 @@ var WS_PREVIEW_PDF_PAGES = 8;                  /* PDF 预览最多渲染前 8 �
 var ATTACH_MAX_BYTES = 50 * 1024 * 1024;      // 单个文件上限 50MB
 var MAX_DRAFT_FILES = 10;                     // 一条消息最多 10 个附件
 var ATTACH_TEXT_MAX = 131072;                 // 单个文本文件读取上限(128K 字符)
+/* 附件侧「图文按序融合」的预算(非视觉模型;口径见 docs/PDFJS-NOTES.md / docs/OFFICE-NOTES.md):
+   单次附件解析最多 OCR 这么多张;`ATT_OCR_TIMEOUT_MS` 是**OCR 阶段**的总预算 —— 整次解析共享、
+   不是每图一个,与 Read 侧既有的 READ_OCR_TIMEOUT_MS(120 s)同口径,只是附件侧在选文件时要等,收紧到 60 s。
+   注意它**不是整条解析链的墙钟上限**:取图调用(pageImages / renderCrops / renderPages)各还另带一次
+   60 s 超时(同一常量)⇒ 取图极慢时附件解析的墙钟会超过 60 s,而「60 s」只说 OCR 这一段。
+   达到任一预算立即停并如实注记(见 attOcrFuse),不等满预算再丢图。 */
+var ATT_OCR_MAX_IMAGES = 6;
+var ATT_OCR_TIMEOUT_MS = 60000;
 /* 图片最长边上限 / 重采样算法 / 单条消息附件上限都改成设置项了(见 imgMaxSide() 等) */
 var LEGACY_PDF_MIME = "application/pdf";      // 旧数据里的 pdf 部件(不再整文件内联)
 function extOf(name) {
@@ -779,6 +787,10 @@ function syncFaviconUI() {
 
 /* ---- 模型视觉能力:服务端清单自报 → 探测 → 手动覆盖 ---- */
 var VISION_PROBE_IMG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+/* 探测受阻(HTTP 层 / 被跨域拦)的模型 → {why, at}:只存内存、不落盘 —— 它不是能力结论,
+   不能写进 state.settings.modelVision(那里是「支持 / 不支持图像」的判据,会驱动 OCR 融合)。
+   用途:① 状态文案如实写「未知(探测受阻:…)」;② 探测去重照旧(1 小时内不重复发请求)。 */
+var VISION_PROBE_BLOCKED = {};
 function visionState(model) {
   var force = state.settings.visionForce;
   if (force === "yes") return { vision: true, src: "manual" };
@@ -792,6 +804,7 @@ function visionState(model) {
 function setVision(model, vision, src) {
   var m = String(model || "").trim();
   if (!m) return;
+  delete VISION_PROBE_BLOCKED[m];   /* 有了能力结论(清单 / 探测 / 手动)就不再是「探测受阻」态 */
   if (!state.settings.modelVision) state.settings.modelVision = {};
   state.settings.modelVision[m] = { vision: !!vision, src: src || "probe", at: Date.now() };
   saveSoon();
@@ -801,7 +814,27 @@ function visionLabel(model) {
   if (v.src === "manual") return v.vision ? "已手动指定:支持图像" : "已手动指定:不支持图像";
   if (v.vision === true) return v.src === "models" ? "支持图像(服务端清单声明)" : "支持图像(探测通过)";
   if (v.vision === false) return v.src === "models" ? "不支持图像(服务端清单声明)" : "不支持图像(探测未通过)";
+  var blk = VISION_PROBE_BLOCKED[String(model == null ? effectiveModel() : model).trim()];
+  if (blk) return "未知(探测受阻:" + blk.why + ")";
   return "未知(尚未探测,图片按原图发送)";
+}
+/* 非 2xx 是否算「模型明确说吃不下图片」(只有它才允许落 setVision(false))。
+   依据(C 批审查 P3-6):兼容模式下这个探测体的 Content-Type 是 text/plain,服务端可能以 415/400
+   这类「请求形状不收」拒绝,或因 CORS 被浏览器拦成不可读 —— 把它读成「不支持图像输入」是假结论。
+   四条全过才算能力判据:
+   ① 4xx(5xx = 服务端自身出错,与能力无关;被 CORS 拦掉时压根到不了这里);
+   ② 响应体非空(空体没有任何能力判据);
+   ③ 体里没有「请求形状 / 解析」类字样(text/plain、unsupported media、parse error、无法解析 …)
+      —— 判据**不能**宽到「出现 content-type 就算形状问题」:真实的能力错误长这样
+      「Invalid content type. image_url is only supported by certain models.」,放宽会把真结论也挡掉;
+   ④ 体里点名图像(image / vision / multimodal / 图片 / 图像)。
+   不过判据 ⇒ 调用方按「未知(探测受阻:…)」处理,不写否定结论。 */
+function visionProbeSaysUnsupported(status, txt) {
+  if (!(status >= 400 && status < 500)) return false;
+  var t = String(txt || "");
+  if (!t) return false;
+  if (/text\/plain|unsupported media|invalid json|malformed json|parse error|failed to parse|无法解析|解析失败|不支持的请求体/i.test(t)) return false;
+  return /image|vision|multimodal|图片|图像/i.test(t);
 }
 /* 探测:发一张 1×1 的图 + 最多 1 token,不报错就认为服务端吃得下图片 */
 async function probeModelVision(model, quiet) {
@@ -839,8 +872,15 @@ async function probeModelVision(model, quiet) {
       setVision(m, true, "probe");
       out = { ok: true, vision: true };
     } else {
-      setVision(m, false, "probe");
-      out = { ok: true, vision: false, error: "HTTP " + res.status + (txt ? ":" + safeJson(txt, 150) : "") };
+      var why = "HTTP " + res.status + (txt ? ":" + safeJson(txt, 150) : "");
+      if (visionProbeSaysUnsupported(res.status, txt)) {
+        setVision(m, false, "probe");
+        out = { ok: true, vision: false, error: why };
+      } else {
+        /* 探测受阻(HTTP 层 / 形状不收):**不**写 vision=false,改记「未知」并保留去重时戳 */
+        VISION_PROBE_BLOCKED[m] = { why: why, at: Date.now() };
+        out = { ok: false, blocked: true, error: why };
+      }
     }
   } catch (e) {
     out = { ok: false, error: friendlyError(e, url).split("\n")[0] };
@@ -850,6 +890,7 @@ async function probeModelVision(model, quiet) {
   if (!quiet) {
     if (out.ok && out.vision) toast("「" + m + "」支持图像输入,已打标", "success", 2600);
     else if (out.ok) toast("「" + m + "」不支持图像输入,图片将改用 OCR 提取文字" + (out.error ? "(" + out.error + ")" : ""), "warn", 4800);
+    else if (out.blocked) toast("「" + m + "」图像能力未知(探测受阻:" + out.error + "),图片将按原图发送", "warn", 5200);
     else toast("图像输入探测失败:" + out.error, "warn", 3600);
   }
   renderVisionHint();
@@ -863,6 +904,8 @@ function ensureModelVision(model, force) {
   var st = visionState(m);
   if (st.src === "manual" || st.src === "models") return;
   if (!force && st.src === "probe" && Date.now() - (st.at || 0) < 3600 * 1000) return;
+  var blk = VISION_PROBE_BLOCKED[m];
+  if (!force && blk && Date.now() - (blk.at || 0) < 3600 * 1000) return;   /* 受阻态同样 1 小时内不重复发请求 */
   if (!apiUrl("")) return;
   probeModelVision(m, !force);
 }
@@ -920,10 +963,31 @@ function resolvePdf(file) {
       if (!t) {
         throw new Error(file.name + ":这份 PDF 里没有可提取的文字(可能是扫描件),可在 设置 → 附件 中改用「图片模式」");
       }
-      return {
+      var att = {
         id: uid(), kind: "pdf", name: file.name, size: file.size, mode: "text",
         pages: r.pages || 1, text: t, clipped: !!r.truncated
       };
+      /* 图文按序融合(非视觉模型):条件 = 非视觉 **且有图** —— 与「文本是否为空」无关
+         (extractText 对任何 ≥1 页 PDF 都写页分隔标记 ⇒ 文本模式下扫描件也不会走上面那条"没有文字";
+         有图才融合,无图/纯文本 ⇒ 原样返回 = 输出逐字节不变)。视觉路径在 mode 分流处已一字不改。 */
+      if (visionState().vision !== false) return att;
+      var notes = [];
+      return attPdfImgCands(buf, notes).then(function (plan) {
+        if (!plan.list.length) {
+          if (notes.length) att.degraded = notes.join(" · ");
+          return att;
+        }
+        if (plan.leftover > 0) notes.push("另有 " + plan.leftover + " 图未处理(超出单次上限)");
+        return attOcrFuse(t, plan.list, "pages").then(function (fz) {
+          att.text = fz.text;
+          att.textChars = fz.text.length;
+          att.ocrImgs = fz.ocrImgs;
+          if (fz.clipped) att.clipped = true;
+          var all = notes.concat(fz.notes);
+          if (all.length) att.degraded = all.join(" · ");
+          return att;
+        });
+      });
     });
   });
 }
@@ -956,6 +1020,328 @@ function maybeOcrImage(att) {
   });
 }
 
+/* ---- 图文按序融合的共享助手(appD;appE 的 Read 侧与附件侧同 IIFE 可见)----
+   非视觉模型读文档时,把图片按文档顺序本机 OCR 并插进文本。四个函数只做
+   「逐张 OCR + 预算/中止」「块格式」「切页」「插块」,不做任何调用方文案
+   (状态行与注记仍归调用方;旧 `【第 N 页】` 注记口径在 wsOcrCands 里逐字保留)。
+   READ_* 常量在 appE(本段之后)⇒ 同 appD 既有约定,只在函数体内取。 */
+
+/* OCR 块头(唯一来源):【<label> · 本机 OCR】+ 换行 */
+function ocrBlockHead(label) {
+  return "【" + String(label == null ? "" : label) + " · 本机 OCR】\n";
+}
+/* OCR 块正文(唯一来源):空/纯空白 ⇒ ""(不写空块;调用方据此累计「未识别」计数) */
+function ocrBlockText(label, text) {
+  var t = String(text == null ? "" : text);
+  return t.trim() ? (ocrBlockHead(label) + t) : "";
+}
+/* 逐张 OCR(OCRKit 本身串行;单次 recognize 不可中断 ⇒ 中止生效点在两张之间)。
+   cands = [{mime,data,label,page,kind}] —— label/page/kind 原样带回 blocks
+   opts  = { signal(可中止对象,逐张检查), deadline(绝对时间戳), maxChars(字符预算),
+             baseChars(调用方已占用的字符数,如页文本长度), prefixOf(cand,seq)→块前缀(只用于预算核算) }
+   -> { blocks:[{label,text,ms,seq,page,kind}], done, empty, stopped, stop, aborted, ms }
+      · blocks 只收「OCR 成功且有文字」的张(与 wsOcrCands 既有 if (o.ok && o.text) 同口径)
+      · empty = fit 失败 / OCR 无文字(只计数,不入 blocks);命中 OCR 超时而停的那张不计 empty
+      · stopped = 因时间或字符预算没做的张数;stop = "time" | "chars" | "" */
+function ocrSeqCands(cands, opts) {
+  opts = opts || {};
+  var sig = opts.signal;
+  var deadline = opts.deadline || (Date.now() + READ_OCR_TIMEOUT_MS);
+  var maxChars = (opts.maxChars > 0) ? opts.maxChars : 0;          /* 0 / 未给 ⇒ 不限 */
+  var acc = Math.max(0, Number(opts.baseChars) || 0);
+  var prefixOf = (typeof opts.prefixOf === "function") ? opts.prefixOf : null;
+  var blocks = [], done = 0, empty = 0, stopped = 0, stop = "", aborted = false, t0 = Date.now();
+  var list = (cands && typeof cands.length === "number") ? cands : [];
+  function prefixFor(c, seq) {
+    if (!prefixOf) return "";
+    try { return String(prefixOf(c, seq) == null ? "" : prefixOf(c, seq)); } catch (e) { return ""; }
+  }
+  function step() {
+    if (done >= list.length) return Promise.resolve();
+    if (sig && sig.aborted) { aborted = true; return Promise.resolve(); }
+    if (Date.now() >= deadline) { stopped = list.length - done; stop = "time"; return Promise.resolve(); }
+    if (maxChars > 0 && acc >= maxChars) { stopped = list.length - done; stop = "chars"; return Promise.resolve(); }
+    var c = list[done] || {};
+    var seq = done + 1;                                  /* 1-based 序号(与 wsOcrCands 的 done 同刻) */
+    var remain = Math.max(1000, deadline - Date.now());
+    var blob = wsBase64Blob(c.data, c.mime);
+    if (!blob) { done++; empty++; return step(); }
+    return wsImgFitForModel(blob, c.mime, {}).then(function (f) {
+      if (!f.ok) { done++; empty++; return step(); }
+      return wsOcrTextOf("data:" + f.mime + ";base64," + f.data, { remainingMs: remain }).then(function (o) {
+        done++;
+        if (o.ok && o.text) {
+          blocks.push({
+            label: String(c.label == null ? "" : c.label), text: o.text, ms: o.ms || 0,
+            seq: seq, page: c.page || 0, kind: c.kind || ""
+          });
+          acc += prefixFor(c, seq).length + String(o.text).length;
+        } else if (!o.ok && /超时/.test(String(o.error || ""))) {
+          /* 超时那张不计 empty(「未识别」≠「没做完」;同 wsOcrCands 既有 else if 口径),
+             它也不进 stopped(stopped 只数它之后的张) */
+          stopped = list.length - done; stop = "time";
+          return Promise.resolve();
+        } else {
+          empty++;
+        }
+        return step();
+      });
+    });
+  }
+  return step().then(function () {
+    return {
+      blocks: blocks, done: done, empty: empty, stopped: stopped, stop: stop,
+      aborted: aborted, ms: Date.now() - t0
+    };
+  });
+}
+/* PDF 文本按页切分:切页判据 = 行级分隔行 ^----- 第 N 页 -----$
+   (与生成端 scripts/make-pdfjs-part.js 的 '----- 第 ' + n + ' 页 -----' 逐字一致;
+    **不用** realText 的宽松正则 —— 那是「有没有文字」的判据,不是分隔符)
+   -> [{ page, head, body }]
+      · page = 分隔行里的页号(1-based);head = 分隔行原文(不含换行);body = 该页正文(末尾空白已去)
+      · page = 0 的条目 = 没有页号的残余(首个分隔行之前的文本;整篇无分隔行时即全文)⇒ 不得丢 */
+var PDF_PAGE_SEP_RE = /^----- 第 (\d+) 页 -----$/;
+function pdfPageSplit(text) {
+  var lines = String(text == null ? "" : text).split("\n");
+  var out = [], cur = null, buf = [];
+  /* cur 为 null 时缓冲的是「首个分隔行之前的残余」(page = 0),非空才落一条(纯空白不产生空块) */
+  function flush() {
+    var body = buf.join("\n").replace(/\s+$/, "");
+    if (cur) out.push({ page: cur.page, head: cur.head, body: body });
+    else if (body) out.push({ page: 0, head: "", body: body });
+    buf = [];
+  }
+  for (var i = 0; i < lines.length; i++) {
+    var m = PDF_PAGE_SEP_RE.exec(lines[i]);
+    if (m) {
+      flush();
+      cur = { page: parseInt(m[1], 10) || 0, head: lines[i] };
+      continue;
+    }
+    buf.push(lines[i]);
+  }
+  if (cur) flush();
+  else if (lines.length) out.push({ page: 0, head: "", body: lines.join("\n").replace(/\s+$/, "") });
+  return out;
+}
+/* 把「按页分好的 OCR 块」插到各页文本之后(块串由调用方渲染,本函数只管位置与顺序):
+   pageText = extractText 的文本;blocksByPage = { 页号: [块串,…] };info(可选数组)= 未匹配页的注记落点。
+   · 无块 ⇒ 原样返回(**逐字节**,不变量②)
+   · 匹配不到页号的块 ⇒ 追加到文末、标题里注明(原页未在文本中找到),并往 info 记一条(不静默丢弃)
+   · 空页(只有分隔行)照常输出分隔行 + 块;跨页截断的尾部留在最后那个页块的正文里(不丢) */
+function docFusePages(pageText, blocksByPage, info) {
+  var text = String(pageText == null ? "" : pageText);
+  var pages = pdfPageSplit(text);
+  var bag = blocksByPage || {};
+  var used = {}, chunks = [], keys = [], added = 0, i, k, key;
+  function asList(v) { return (typeof v === "string") ? [v] : (v || []); }
+  function moved(block) {                                  /* 尾部追加件的标题改写 */
+    var s = String(block == null ? "" : block), j = s.indexOf("】");
+    return (j < 0) ? s : (s.slice(0, j) + "(原页未在文本中找到)" + s.slice(j));
+  }
+  for (i = 0; i < pages.length; i++) {
+    var e = pages[i];
+    var chunk = e.head ? (e.head + (e.body ? "\n" + e.body : "")) : e.body;
+    var list = (e.page > 0 && bag[e.page]) ? asList(bag[e.page]) : null;
+    if (list) {
+      used[e.page] = true;
+      for (k = 0; k < list.length; k++) {
+        if (!list[k]) continue;
+        chunk += "\n\n" + list[k];
+        added++;
+      }
+    }
+    chunks.push(chunk);
+  }
+  var orphan = [];
+  for (key in bag) {
+    if (!Object.prototype.hasOwnProperty.call(bag, key) || used[key]) continue;
+    keys.push(key);
+  }
+  keys.sort(function (a, b) { return (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0); });
+  for (i = 0; i < keys.length; i++) {
+    var arr = asList(bag[keys[i]]);
+    for (k = 0; k < arr.length; k++) if (arr[k]) { orphan.push(moved(arr[k])); added++; }
+  }
+  if (!added) return text;
+  var out = chunks.join("\n\n");
+  if (orphan.length) {
+    out += (out ? "\n\n" : "") + orphan.join("\n\n");
+    if (info && typeof info.push === "function") {
+      info.push("另有 " + orphan.length + " 块图片未匹配到页号,已追加到文末");
+    }
+  }
+  return out;
+}
+
+/* ---- 附件侧「图文按序融合」(非视觉模型;与 Read 侧同一套助手)----
+   与 Read 侧 wsFuseOcrText 的分工:那里贴的是「工具结果 + 状态行」,这里贴的是附件对象
+   (`att.text` / `att.ocrImgs` / `att.degraded`),两者共用 ocrSeqCands / ocrBlockText /
+   docFusePages 三个助手与同一套块格式,只有预算常量与注记落点不同。 */
+
+/* 附件侧块渲染(与 Read 侧 wsFuseOcrText 同一口径):kind:"full"(整页兜底)的块头不带
+   「· 本机 OCR」—— label 里已写明「整页图像 OCR(含文字层重复…)」;两类块头的唯一区别 */
+function attOcrBlock(c, text) {
+  return (c.kind === "full") ? ("【" + c.label + "】\n" + text) : ocrBlockText(c.label, text);
+}
+/* 逐张 OCR 并插块(附件侧入口)。text = 已有正文;items = 候选图 [{mime,data,label,page,kind}]
+   (与 Read 侧同形;data 是 base64 裸串);layout = "pages"(PDF:按页插) | "flat"(office:正文之后按序接)。
+   -> { text, ocrImgs, clipped, over, empty, stopped, stop, aborted, notes:[…] }
+      · ocrImgs = 写入过非空块的张数(§2.5:未识别的另计,不计入 ocrImgs)
+      · over = 超出单次张数预算没做的张数;stopped/stop = 时间或字符预算没做的张数
+      · notes = 给 att.degraded 的注记(张数超限 / 预算用尽 / 未识别 / 引擎不可用),**不静默**;
+        引擎不可用 ⇒ 只给注记、原文照旧(不伪造文本)
+      · 融合后超 ATTACH_TEXT_MAX ⇒ 截断并置 clipped(沿用既有「已截断」标注) */
+function attOcrFuse(text, items, layout) {
+  var base = String(text == null ? "" : text);
+  var all = items || [];
+  var out = {
+    text: base, ocrImgs: 0, clipped: false,
+    over: Math.max(0, all.length - ATT_OCR_MAX_IMAGES),
+    empty: 0, stopped: 0, stop: "", aborted: false, notes: []
+  };
+  var use = all.slice(0, ATT_OCR_MAX_IMAGES);
+  if (!use.length) return Promise.resolve(out);
+  if (!ocrReady()) {
+    out.notes.push("本机 OCR 引擎不可用(" + ((window.OCRKit && window.OCRKit.why) || "缺少 Web Worker / WebAssembly") +
+      "),图片内容无法读取(可换支持视觉的模型)");
+    return Promise.resolve(out);
+  }
+  return ocrSeqCands(use, {
+    deadline: Date.now() + ATT_OCR_TIMEOUT_MS,
+    maxChars: ATTACH_TEXT_MAX,
+    baseChars: base.length,
+    prefixOf: function (c) { return (c.kind === "full") ? ("【" + c.label + "】\n") : ocrBlockHead(c.label); }
+  }).then(function (res) {
+    var blocks = res.blocks || [], rendered = [], byPage = {}, flat = [], i, k, s;
+    for (i = 0; i < blocks.length; i++) {
+      s = attOcrBlock(blocks[i], blocks[i].text);
+      if (!s) continue;
+      rendered.push(s);
+      if (layout === "pages") {
+        k = blocks[i].page || 0;
+        if (!byPage[k]) byPage[k] = [];
+        byPage[k].push(s);
+      } else flat.push(s);
+    }
+    out.ocrImgs = rendered.length;
+    out.empty = res.empty; out.stopped = res.stopped; out.stop = res.stop; out.aborted = res.aborted;
+    if (layout === "pages") out.text = docFusePages(base, byPage, out.notes);
+    else if (flat.length) out.text = base ? (base + "\n\n" + flat.join("\n\n")) : flat.join("\n\n");
+    var nFull = 0, seenPage = {};
+    if (layout === "pages") {
+      for (i = 0; i < blocks.length; i++) {
+        if (blocks[i].kind !== "full") continue;
+        k = blocks[i].page || 0;
+        if (seenPage[k]) continue;
+        seenPage[k] = 1; nFull++;
+      }
+    }
+    if (rendered.length) {
+      out.notes.push("图片 " + rendered.length + " 张已本机 OCR 并" + (layout === "pages" ? "按页" : "按序") +
+        "插入(当前模型不支持图像输入,OCR 可能有误差)");
+    }
+    if (nFull) out.notes.push("其中 " + nFull + " 页为整页图像 OCR(含文字层重复,可能有误差)");
+    if (out.over > 0) out.notes.push("另有 " + out.over + " 图未处理(超出单次上限)");
+    if (res.stopped > 0) {
+      out.notes.push(res.stop === "chars"
+        ? ("另有 " + res.stopped + " 图未处理(结果文本已达单次长度上限)")
+        : ("另有 " + res.stopped + " 图未处理(本机 OCR 时间预算用尽)"));
+    }
+    if (res.empty > 0) out.notes.push(res.empty + " 图 OCR 未识别到文字");
+    if (out.text.length > ATTACH_TEXT_MAX) {
+      out.text = out.text.slice(0, ATTACH_TEXT_MAX);
+      out.clipped = true;
+      out.notes.push("融合后文本超过单次上限,已截断");
+    }
+    return out;
+  });
+}
+/* 附件侧 PDF 取图计划(非视觉;法与 Read 侧 wsPdfImgCands 一致,常量换成附件侧口径):
+   pageImages 报含图 ⇒ 每图一个候选;mode:"full" 的页用「远超整页的面积」触发 renderCrops 的
+   整页护栏 ⇒ 该页退整页渲染;renderCrops 失败 ⇒ renderPages 整页兜底并注记(不静默、不假装成功)。
+   扫描页数 = min(用户设置 pdfMaxPages(), READ_DOC_OCR_MAX_PAGES) —— 页数上限与 Read 侧同源,
+   不另立副本。失败/无图 ⇒ list 为空(注记写进 notes) */
+function attPdfImgCands(buf, notes) {
+  var maxScan = Math.min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES);
+  return window.PDFKit.pageImages(buf, {
+    maxPages: maxScan, dpi: pdfDpi(), region: "rect", timeout: ATT_OCR_TIMEOUT_MS
+  }).then(function (pr) {
+    var out = { list: [], leftover: 0 };
+    if (!pr || !pr.ok) {
+      notes.push("图片检测失败(" + ((pr && pr.error) || "未知") + "),图片内容未读取");
+      return out;
+    }
+    var pages = pr.pages || [], imgPages = [], i, j;
+    for (i = 0; i < pages.length; i++) if (pages[i] && pages[i].hasImages) imgPages.push(pages[i]);
+    if (!imgPages.length) return out;                    /* 纯文本/无图 ⇒ 不改动输出 */
+    var unscanned = Math.max(0, (pr.pageCount || pages.length) - pages.length);
+    if (unscanned > 0) notes.push("仅处理前 " + maxScan + " 页的图片(共 " + unscanned + " 页未扫描图片)");
+    var groups = [], meta = [];
+    for (i = 0; i < imgPages.length; i++) {
+      var pg = imgPages[i];
+      if (pg.mode === "rect" && pg.rects && pg.rects.length) {
+        for (j = 0; j < pg.rects.length; j++) {
+          groups.push({ page: pg.page, rect: pg.rects[j] });
+          meta.push({ page: pg.page, kind: "rect", seq: j + 1 });
+        }
+      } else {
+        groups.push({ page: pg.page, rect: { x: 0, y: 0, w: 1e7, h: 1e7 } });
+        meta.push({ page: pg.page, kind: "full", seq: 1 });
+      }
+    }
+    if (groups.length > ATT_OCR_MAX_IMAGES) {            /* 超出的张数如实报出(不静默丢) */
+      out.leftover = groups.length - ATT_OCR_MAX_IMAGES;
+      groups = groups.slice(0, ATT_OCR_MAX_IMAGES);
+      meta = meta.slice(0, ATT_OCR_MAX_IMAGES);
+    }
+    function mimeOf(u) { return (String(u || "").match(/^data:([^;,]+)/) || [])[1] || "image/jpeg"; }
+    function fill(list) {
+      out.list = [];
+      for (var k = 0; k < list.length; k++) {
+        var m = meta[k] || {}, full = (m.kind === "full");
+        out.list.push({
+          mime: mimeOf(list[k].dataUrl), data: dataUrlPayload(list[k].dataUrl || ""),
+          label: full ? ("第 " + m.page + " 页 · 整页图像 OCR(含文字层重复,可能有误差)") : ("第 " + m.page + " 页 · 图 " + m.seq),
+          page: m.page, kind: full ? "full" : "rect"
+        });
+      }
+      return out;
+    }
+    return window.PDFKit.renderCrops(buf, {
+      groups: groups, dpi: pdfDpi(), format: "image/jpeg", quality: 0.86, timeout: ATT_OCR_TIMEOUT_MS
+    }).then(function (cr) {
+      if (cr && cr.ok && cr.images && cr.images.length) return fill(cr.images);
+      return pagesFallback((cr && cr.error) || "未知");
+    }, function (e) { return pagesFallback((e && e.message) || String(e)); });
+    function pagesFallback(why) {
+      var need = {}, maxPage = 0, k;
+      for (k = 0; k < meta.length; k++) { need[meta[k].page] = true; if (meta[k].page > maxPage) maxPage = meta[k].page; }
+      return window.PDFKit.renderPages(buf, {
+        dpi: pdfDpi(), maxPages: maxPage, format: "image/jpeg", quality: 0.86, timeout: ATT_OCR_TIMEOUT_MS
+      }).then(function (rr) {
+        if (!rr || !rr.ok || !rr.images || !rr.images.length) {
+          notes.push("精确取区与整页渲染都失败(" + why + "),图片内容无法读取");
+          return out;
+        }
+        notes.push("精确取区失败(" + why + "),已改用整页图像 OCR");
+        var list = [], kk;
+        for (kk = 0; kk < rr.images.length; kk++) if (rr.images[kk] && need[rr.images[kk].page]) list.push(rr.images[kk]);
+        list.sort(function (a, b) { return (a.page || 0) - (b.page || 0); });
+        meta = list.map(function (im) { return { page: im.page, kind: "full", seq: 1 }; });
+        return fill(list);
+      }, function (e) {
+        notes.push("精确取区与整页渲染都失败(" + ((e && e.message) || String(e)) + "),图片内容无法读取");
+        return out;
+      });
+    }
+  }, function (e) {
+    notes.push("图片检测失败(" + ((e && e.message) || String(e)) + "),图片内容未读取");
+    return { list: [], leftover: 0 };
+  });
+}
+
 /* ---- 办公文档附件(doc / docx / ppt / pptx / xls / xlsx)----
    解析全在本机内嵌的 OfficeKit 里完成(worker 优先,无 Worker 时降级主线程):
    docx 取文本 + 正文引用的图像;xlsx/xls 转多表 CSV(+ 表内图像);pptx 取文本 + 图像;
@@ -984,6 +1370,8 @@ function officeBrief(f) {
   else if (f.unit === "表" && f.pages) out.push(num(f.pages) + " 表");
   else out.push("文本 " + num(f.textChars || (f.text ? String(f.text).length : 0)) + " 字");
   if (f.imgCount) out.push(num(f.imgCount) + " 图");
+  /* 非视觉模型下图片不进消息、改为本机 OCR 后并入正文(见 resolveOffice);旧数据无 ocrImgs = 0 */
+  if (f.ocrImgs) out.push(num(f.ocrImgs) + " 图已 OCR");
   if (f.clipped) out.push("已截断");
   return out.join(" · ");
 }
@@ -1022,19 +1410,32 @@ function resolveOffice(file, ext, hooks) {
       mode: images.length ? "both" : "text",
       text: text, textChars: r.textChars || text.length, clipped: !!r.clipped,
       images: images, imgCount: images.length,
-      skippedImgs: (r.skippedImgs || 0) + (dropImages ? rawImgs.length : 0),
+      skippedImgs: r.skippedImgs || 0,
       pages: r.pages || 0, unit: r.unit || ""
     };
     if (att.subtype === "doc" || att.subtype === "ppt") {
       att.degraded = "老格式只提取文字(不支持图像提取)";
     }
-    if (dropImages && rawImgs.length) {
-      att.degraded = "当前模型不支持图像输入,只发送了文字";
+    /* 非视觉模型:图片不再丢弃,改用本机 OCR 识别后按序接在正文之后(纯图文档在上面已拒收 ⇒ 行为不变)。
+       toast 按会话一次(既有机制);解析进度仍走 OfficeKit 的 onProgress 通道 ⇒ 可感知、不静默 */
+    if (dropImages && rawImgs.length && text) {
       var ocid = (conv && conv.id) ? String(conv.id) : "";
       if (!Object.prototype.hasOwnProperty.call(officeVisionToastShown, ocid)) {
         officeVisionToastShown[ocid] = true;
-        toast("当前模型不支持图像输入,办公文档里的图片已跳过(只发送文字)", "info", 3600);
+        toast("当前模型不支持图像输入,正在用本机 OCR 识别「" + file.name + "」里的图片…", "info", 3600);
       }
+      var cands = rawImgs.map(function (im, i) {
+        return { mime: im.mime, data: im.data, label: im.label || ("图 " + (i + 1)), page: im.page || 0, kind: "" };
+      });
+      return attOcrFuse(text, cands, "flat").then(function (fz) {
+        att.text = fz.text;
+        att.textChars = fz.text.length;
+        att.ocrImgs = fz.ocrImgs;
+        if (fz.clipped) att.clipped = true;
+        var dn = fz.notes.length ? fz.notes.join(" · ") : "当前模型不支持图像输入,图片未随消息发送";
+        att.degraded = att.degraded ? (att.degraded + " · " + dn) : dn;
+        return att;
+      });
     }
     return att;
   });
@@ -1315,7 +1716,8 @@ function renderAttachBar() {
     var sub = f.kind === "image"
       ? ((f.w && f.h) ? f.w + "×" + f.h : "图片") + (f.scaled ? " · 已缩放" : "")
       : f.kind === "pdf"
-        ? "PDF · " + (f.pages || 1) + " 页 · " + (f.mode === "image" ? "图片模式" : "文本模式")
+        ? "PDF · " + (f.pages || 1) + " 页 · " + (f.mode === "image" ? "图片模式" : "文本模式") +
+          (f.ocrImgs ? " · " + f.ocrImgs + " 图已 OCR" : "")
         : f.kind === "office"
           ? officeBrief(f) + (f.degraded ? " · " + f.degraded : "")
           : fmtBytes(f.size) + (f.enc ? " · " + wsEncName(f.enc) + "(已转码显示)" : "") +
@@ -1363,6 +1765,8 @@ function attachMetaOf(f) {
     mode: f.mode || "", ocrOnly: f.ocr ? 1 : 0, ocrText: f.ocr || "",
     subtype: f.subtype || "", unit: f.unit || "", imgCount: f.imgCount || 0,
     skippedImgs: f.skippedImgs || 0, degraded: f.degraded || "", textChars: f.textChars || 0,
+    /* 非视觉模型下已本机 OCR 并入正文的图片张数(旧数据没有这个键 = 0,无需迁移) */
+    ocrImgs: f.ocrImgs || 0,
     enc: f.enc || ""        /* 非 UTF-8 文本附件的原始编码(旧数据为空 = 按 UTF-8) */
   };
   if (f.ext) m.blob = f.id;      // payload 在 IndexedDB 里,消息里只留这个键
@@ -1422,6 +1826,7 @@ function attachmentParts(f, proto) {
       else if (f.unit === "表" && f.pages) info += " · 共 " + f.pages + " 表";
       else info += " · 文本 " + f.textChars + " 字";
       if (f.imgCount) info += " · " + f.imgCount + " 图";
+      if (f.ocrImgs) info += " · " + f.ocrImgs + " 图已本机 OCR(非视觉模型,图片内容在正文里)";
       if (!f.imgCount && (f.subtype === "doc" || f.subtype === "ppt")) info += " · 仅文本";
       if (f.clipped) info += " · 已截断";
       out.push({
@@ -2049,7 +2454,11 @@ function apiUrl(path) {
   if (/\/(v1|api\/v1)$/.test(b)) return b + (path ? "/" + path : "");
   return b + "/v1/" + path;
 }
+/* 预检规避兼容模式(默认关;门控 + 前置探针见下面「CORS 分层」节的 corsBypassGate / setCorsBypass):
+   请求改发「简单请求」—— Content-Type 取 CORS 安全清单内的 text/plain,且不带任何自定义头,
+   浏览器因此不发 OPTIONS 预检。关闭(或门控不满足)时本函数逐字节不变。 */
 function headersFor(withBody) {
+  if (corsBypassOn()) return corsBypassHeaders(withBody);
   var h = { "Accept": "text/event-stream, application/json" };
   if (withBody !== false) h["Content-Type"] = "application/json";
   var key = (state.settings.apiKey || "").trim();
@@ -2067,13 +2476,24 @@ function errText(e) {
   if (e.name === "AbortError") return "请求已取消";
   return e.message || String(e);
 }
-function friendlyError(e, url) {
+/* 第三参数 family 缺省 ⇒ 缺省分支文案**逐字不变**;family ∈ {preflight, acao, net, timeout, textplain}
+   = 「CORS 分层」节四探针判定的 CORS 族,传入后把浏览器一律报成 `Failed to fetch` 的那条链拆开说清,
+   并给出可执行的下一步(服务端要补哪些头 / 改用同源反向代理 / 关掉兼容模式)。
+   ⚠ **族分支在产线不可达**(C2 审查 P3-5 登记;依据 = 调用点普查):本函数全库 6 个调用点
+   (886 / 3515 / 5234 / 5296 / 5345 / 5953)全部只传 ≤2 参 ⇒ fam 恒为空,产线只会看到缺省文案;
+   族级文案当前只从 CORS_FAMILY_TEXT 的两条消费路径露出(诊断面板结论行 + 开关拒绝 note)。
+   该分支为将来「把族接到发送失败路径」保留,不按死代码删。 */
+function friendlyError(e, url, family) {
   var msg = errText(e);
+  var fam = (family && CORS_FAMILY_TEXT && CORS_FAMILY_TEXT[family] && family !== "ok" && family !== "unknown") ? family : "";
   if (e && e.name === "AbortError") return "已超时或已取消";
   if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) {
-    msg = "无法连接到服务器(网络不可达、地址错误或被跨域策略拦截)";
+    msg = fam ? ("无法连接到服务器:" + corsFamilyText(fam).label + "\n" + corsFamilyAdvice(fam))
+              : "无法连接到服务器(网络不可达、地址错误或被跨域策略拦截)";
   } else if (/ERR_CONNECTION_REFUSED|ECONNREFUSED|拒绝/i.test(msg)) {
     msg = "连接被拒绝:请确认服务已启动,且地址与端口正确";
+  } else if (fam) {
+    msg = msg + "\n" + corsFamilyAdvice(fam);
   }
   return msg + (url ? "\n目标地址:" + url : "");
 }
@@ -3381,7 +3801,7 @@ function startEdit(msgEl, msg) {
   box.querySelector('[data-edit="cancel"]').addEventListener("click", function () { renderChat(); });
   ta.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
-    /* Ctrl/Cmd+Esc 放行给全局中断路径:不当作「取消编辑」 */
+    /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径:不当作「取消编辑」 */
     if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) renderChat();
   });
 }
@@ -4029,6 +4449,8 @@ function openFilePreview(name, text, f) {
     meta.push("PDF · 共 " + (f.pages || 1) + " 页");
     if (!f.wsPreview) meta.push(f.mode === "image" ? "图片模式(" + pdfDpi() + " DPI,已按图片发给模型)" : "纯文本模式(已抽取文字发给模型)");
     if (f.pdfPages) meta.push("预览渲染前 " + f.pdfPages + " 页");
+    /* 非视觉模型下的图文融合注记(含「N 图已本机 OCR」与预算/失败注记;视觉路径没有这个字段) */
+    if (f.degraded) meta.push(f.degraded);
   } else if (f.kind === "image") {
     meta.push("图片" + (f.dim ? " · " + f.dim : "") + " · " + fmtBytes(f.size || 0));
   } else if (f.kind === "office") {
@@ -4144,7 +4566,8 @@ function previewAttachmentPayload(meta, payload, depth) {
     kind: meta.kind, size: meta.size, pages: meta.pages, mode: meta.mode,
     clipped: meta.clipped, images: imgs, ocr: !!meta.ocrOnly,
     subtype: meta.subtype, unit: meta.unit, imgCount: meta.imgCount,
-    skippedImgs: meta.skippedImgs, textChars: meta.textChars, degraded: meta.degraded
+    skippedImgs: meta.skippedImgs, textChars: meta.textChars, degraded: meta.degraded,
+    ocrImgs: meta.ocrImgs
   });
 }
 
@@ -4174,7 +4597,8 @@ function closeMenus() {
 $$(".modal-mask").forEach(function (mask) {
   focusTrap(mask);
   mask.addEventListener("click", function (e) {
-    // 带 data-noclose 的弹窗(设置、系统提示词)只能通过 ✕ / 关闭按钮退出,避免误触丢失编辑
+    // 带 data-noclose 的弹窗(设置、系统提示词)点遮罩不关,只能经 ✕ / 关闭按钮 / 普通 Esc 退出,避免误触丢失编辑
+    // (带 Ctrl/Cmd 的 Esc 走全局中断路径,不关窗;见 onKeyDown 的 Esc 分支)
     if (mask.hasAttribute("data-noclose")) return;
     if (e.target === mask) { closeMask(mask.id); if (mask.id === "tasks-modal") closeTasksModal(); }
   });
@@ -4226,7 +4650,7 @@ function setupNsel(id, options, onChange) {
     var d = nselDef(id);
     if (!d) return;
     var open = nselOpenId === id;
-    /* Ctrl/Cmd+Esc 放行给全局中断路径:浮窗开着也不接管、更不 stopPropagation */
+    /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径:浮窗开着也不接管、更不 stopPropagation */
     if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) { if (open) { e.stopPropagation(); closeNsel(); } return; }
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
@@ -4458,6 +4882,7 @@ function syncSettingsForm() {
   renderAttachPanel();
   syncFaviconUI();
   syncCtxWinInputs();
+  syncCorsBypassUI();
   if (window.__mcpRefresh) window.__mcpRefresh();
 }
 function openSettings(tab) {
@@ -4501,9 +4926,16 @@ function saveSettingsFromModal(close, quiet) {
     var el = $(b[0]);
     if (el) s[b[1]] = numBindValue(el, b);
   });
+  /* 预检规避兼容模式:以开关的**生效态**落盘(门控不满足时开关是置灰 + 未勾选的 ⇒ 一并关掉,
+     不留"存着 true 但用不上"的僵尸状态;详见 setCorsBypass 的注释与 CORS 分层节) */
+  var cbe = $("set-cors-bypass");
+  if (cbe) s.corsPreflightBypass = !!cbe.checked && corsBypassGate().ok;
   if (conv && s.model) conv.model = s.model;
   applyAppearance();
   saveState(true);
+  /* 落盘用的是**生效态**(上面那行),开关 UI 也要按生效态回刷 —— 否则「勾选态下填上 Key + 任一保存并保持打开入口」
+     会出现「复选框显示开着、实际是关着」的不一致(请求行为本身用 corsBypassOn() 每次重算,一直是对的) */
+  syncCorsBypassUI();
   updateTopbar();
   rebuildModelDatalist();
   syncParamInputs();
@@ -4523,6 +4955,7 @@ function setProtocol(proto) {
   elProtoBadge.className = "badge " + state.settings.protocol;
   elProtoBadge.textContent = state.settings.protocol === "openai" ? "OPENAI" : "ANTHROPIC";
   rebuildModelDatalist();
+  syncCorsBypassUI();   /* 协议是「预检规避兼容模式」的门控条件之一 ⇒ 切协议即刷新开关可用性 */
   saveSoon();
 }
 
@@ -5096,14 +5529,396 @@ function envReportText() {
   if (diag && diag.textContent && diag.textContent.indexOf("正在自检") !== 0) out.push("[最近一次诊断]\n" + diag.textContent);
   return out.join("\n");
 }
-/* 连不上时给一句能落地的提示:绝大多数是「地址是本机端口但服务不在」或「跨域 / 网络不通」 */
-function connectHint(url) {
+/* 连不上时给一句能落地的提示:绝大多数是「地址是本机端口但服务不在」或「跨域 / 网络不通」。
+   第二参数 family 与 friendlyError 的族分支同源:同属产线不可达的保留分支(唯一调用点 5954 不传族),
+   传了才走 corsFamilyAdvice —— 同样不按死代码删(见 friendlyError 上方注释与 C2 审查 P3-5)。 */
+function connectHint(url, family) {
+  if (family && CORS_FAMILY_TEXT && CORS_FAMILY_TEXT[family] && family !== "ok" && family !== "unknown") {
+    return "提示:" + corsFamilyAdvice(family);
+  }
   var host = "";
   try { host = String(url).replace(/^[a-z]+:\/\//i, "").split("/")[0]; } catch (e) {}
   if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host)) {
     return "提示:该地址是本机端口,浏览器只会在「运行本页的这台机器」上找服务。确认服务已启动、端口没写错;若服务在别的机器上,请把 localhost 换成它的 IP。";
   }
   return "提示:确认地址与端口正确、服务已启动;若服务在别的机器上,注意服务端需要允许跨域(CORS),手机/平板访问时不要用 localhost。";
+}
+/* ---------------------------------------------------------------------------
+   CORS 分层(四探针)与「预检规避兼容模式」
+   · 非简单请求(带自定义头 / application/json)都要先过 OPTIONS 预检,**实际响应**也必须带
+     Access-Control-Allow-Origin(错误响应同样要带)。任一条缺失,浏览器一律把它藏成
+     `TypeError: Failed to fetch` —— 用户只看到「无法连接到服务器」,分不出是哪一种。
+   · 四探针把这条链拆开(诊断面板与开关前置共用这一处实现),族文案给可执行的下一步。
+   · 兼容模式(默认关、高级区、带前置探针):请求改发「简单请求」(Content-Type: text/plain
+     + 不带任何自定义头)⇒ 浏览器不发 OPTIONS,只看实际响应有没有 ACAO。它救不了
+     「实际响应没有 ACAO」,也救不了「服务端不解析 text/plain」,与 Anthropic 协议同样不兼容 ——
+     这三条死路线在门控理由与族文案里逐条写明。
+   · 本节只做「诊断 + 是否允许打开开关」,**不参与任何自动降级**(doFetch 的既有降级链不动)。
+--------------------------------------------------------------------------- */
+var CORS_PROBE_TIMEOUT_MS = 12000;   /* 每条探针自己的上限(四条并行发出;只在用户手动触发时跑) */
+var CORS_PROBE_BODY_MAX = 400;       /* 只读响应体前若干字符,用于识别「服务端不解析 text/plain」 */
+var CORS_FAMILY_TEXT = {
+  preflight: {
+    label: "预检被拒(OPTIONS 未过)",
+    advice: "服务端没有正确处理 OPTIONS 预检(或预检响应缺 Access-Control-Allow-* 头)。三条出路:① 让服务端放行 OPTIONS(返回 204 且带允许的头);② 改用同源反向代理;③ 无鉴权时打开「预检规避兼容模式」(改发简单请求,不再触发预检)。"
+  },
+  acao: {
+    label: "实际响应无 ACAO",
+    advice: "服务端连实际响应都没带 Access-Control-Allow-Origin(错误响应最容易漏),所以连不带自定义头的简单请求也被浏览器拦下。按诊断面板「CORS 分层」段列出的头补齐(重点:4xx/5xx 响应也要带),或改用同源反向代理。"
+  },
+  net: {
+    label: "网络不可达",
+    advice: "浏览器根本没能把请求发出去(地址 / 端口写错、服务没启动,或网络 / DNS 不通)。确认地址与端口正确、服务已启动;地址是本机端口(localhost / 127.0.0.1)时,浏览器只会在运行本页的这台机器上找服务 —— 服务在别的机器上要换成它的 IP。"
+  },
+  timeout: {
+    label: "服务端未在超时内回话",
+    /* 这份文案有两条消费路径:诊断面板的结论行(corsProbeLines)与开关的拒绝 note(setCorsBypass)——
+       后者当下看不到面板 ⇒ 定位语不许写「诊断面板里」,改成两条路径都成立的「去哪里看矩阵」。
+       断言只引用矩阵标记(「标 ✗(超时) 的探针」),**不得**写成「四条都没等到」(混合态下与矩阵矛盾)。 */
+    advice: "标 ✗(超时) 的探针在 " + Math.round(CORS_PROBE_TIMEOUT_MS / 1000) + " 秒内没等到响应(可能只有其中几条):连接建立了但不回话(服务端卡死 / 过载 / 正在装载模型时很常见)。这一态分不出 CORS 卡在哪一层,「预检规避兼容模式」也要等它回话才能验证 —— 等服务端恢复响应后再重跑;四探针矩阵在 设置 → 环境 → 运行自检 的「CORS 分层」段。"
+  },
+  textplain: {
+    label: "服务端不解析 text/plain",
+    advice: "服务端能收到请求,但拒收 text/plain 请求体(4xx)。「预检规避兼容模式」在它这里无效,请关闭该模式,改由服务端修 CORS 或走同源反向代理。"
+  },
+  ok: { label: "正常", advice: "四类请求都能读到响应,跨域没有问题。" },
+  unknown: { label: "未能判定", advice: "先到 设置 → 模型 填好 Base URL 再重试。" }
+};
+function corsFamilyText(fam) { return CORS_FAMILY_TEXT[fam] || CORS_FAMILY_TEXT.unknown; }
+function corsFamilyAdvice(fam) { return corsFamilyText(fam).advice; }
+/* 服务端指引(诊断面板与 docs/DEVELOPMENT.md 用;含 file:// 下 Origin=null 与「错误响应也要带头」两条) */
+function corsServerGuideText() {
+  return [
+    "服务端需要补的响应头(缺哪条补哪条;补齐后浏览器就不再拦):",
+    "· Access-Control-Allow-Origin: *   (从 file:// 打开时浏览器发的 Origin 是 null,用 * 最省事)",
+    "· Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access",
+    "· Access-Control-Allow-Methods: POST, GET, OPTIONS",
+    "· OPTIONS 预检直接返回 204(不要 500、也不要只在 200 里回 JSON)",
+    "· 错误响应(4xx/5xx)同样要带 Access-Control-Allow-Origin —— nginx 用 add_header ... always;,",
+    "  Apache / 自研网关在 500 与 ErrorDocument 分支也要补(只给 200 加头是最常见的漏点)",
+    "另一条路:让页面与接口同源(同源反向代理把 /v1 转到后端),浏览器就不做跨域检查"
+  ];
+}
+/* 兼容模式的双条件门控(协议 × 是否有 Key):两条都是「必然无效」的死路,不是保守估计 */
+function corsBypassGate() {
+  if (state.settings.protocol === "anthropic") {
+    return { ok: false, reason: "该模式仅对 OpenAI 兼容协议有效:Anthropic 协议必须带 anthropic-version 与 anthropic-dangerous-direct-browser-access 两个自定义头(与有没有 Key 无关),一发就是非简单请求 ⇒ 必然无效。" };
+  }
+  if (String(state.settings.apiKey || "").trim()) {
+    return { ok: false, reason: "该模式要求不带任何自定义头,而 API Key 会变成 Authorization(OpenAI)或 x-api-key(Anthropic)⇒ 必然无效。请先清空 API Key,或让服务端放行预检。" };
+  }
+  return { ok: true, reason: "" };
+}
+function corsBypassOn() { return !!state.settings.corsPreflightBypass && corsBypassGate().ok; }
+/* 兼容模式下的请求头:Content-Type 取 CORS 安全清单内的 text/plain,且**不带任何自定义头** */
+function corsBypassHeaders(withBody) {
+  var h = { "Accept": "text/event-stream, application/json" };
+  if (withBody !== false) h["Content-Type"] = "text/plain;charset=UTF-8";
+  return h;
+}
+function corsProbeReadable(p) { return !!p && (p.state === "ok" || p.state === "http"); }
+/* 单条探针:state 只分「浏览器能不能读到响应」—— 这正是 CORS 的分水岭(4xx/5xx 也算读到) */
+function corsProbeReq(url, opt) {
+  var t0 = Date.now(), to = timeoutSignal(CORS_PROBE_TIMEOUT_MS);
+  var init = { method: (opt && opt.method) || "GET", headers: (opt && opt.headers) || {}, cache: "no-store", signal: to.signal };
+  if (opt && opt.body != null) init.body = opt.body;
+  function done(out) { try { to.abort(); } catch (e1) {} return out; }
+  return fetch(url, init).then(function (r) {
+    return r.text().then(function (t) { return t; }, function () { return ""; }).then(function (t) {
+      return done({ state: r.ok ? "ok" : "http", status: r.status, ms: Date.now() - t0,
+                    body: String(t || "").slice(0, CORS_PROBE_BODY_MAX) });
+    });
+  }, function (e) {
+    return done({ state: (e && e.name === "AbortError") ? "timeout" : "fail", status: 0,
+                  ms: Date.now() - t0, error: errText(e) });
+  });
+}
+/* 辅助探针:mode:"no-cors" 只要能发出去就 resolve(opaque) ⇒ 把「读不到」再分成
+   「网络不可达」与「跨域拦截」(CORS 错误与断网在 fetch 里是同一个 TypeError)。不进四行矩阵。
+   必须带超时:遇到「连得上但不回话」的服务端,这条链会把开关(卡在「正在探测…」,没有任何拒绝文案)
+   与诊断面板一起挂住。超时按 null(未知)处理,不误报成网络不可达 ⇒ 族判定回落到 acao/网络判据。
+   实际上限**与主探针相同**(1× = CORS_PROBE_TIMEOUT_MS):下面那个 setTimeout 先到点并 resolve,
+   随后的 `.then` 立刻 abort 信号 ⇒ 整条链 ≤「四探针并行 1× + 本探针 1×」(外侧另有 36 s 兜底)。
+   注:`timeoutSignal(CORS_PROBE_TIMEOUT_MS * 2)` 的 2× 信号**从不生效**(链的终态已由那个 setTimeout
+   决定),只作宿主定时器被节流时的备份 —— 不要把它当实际上限读。 */
+function corsReachProbe(url) {
+  var to = timeoutSignal(CORS_PROBE_TIMEOUT_MS * 2), timedOut = false, timer = null;
+  return new Promise(function (resolve) {
+    timer = setTimeout(function () { timedOut = true; resolve(null); }, CORS_PROBE_TIMEOUT_MS);
+    fetch(url, { mode: "no-cors", cache: "no-store", signal: to.signal }).then(function () { resolve(true); },
+      function () { resolve(timedOut ? null : false); });
+  }).then(function (v) {
+    clearTimeout(timer);
+    try { to.abort(); } catch (e1) {}
+    return v;
+  });
+}
+/* 「服务端不解析 text/plain」的识别:能在读到的非 2xx 响应体里看到 content-type / 解析类字样才算。
+   启发式(**命中才拒**,默认放行 ⇒ 偏差方向是「宁可误开」:服务端拒绝 text/plain 但文案不可识别时
+   不拦 —— 模式无效但不额外挡人),只在开关注入前置使用。 */
+function corsTextPlainRefused(p) {
+  if (!corsProbeReadable(p) || p.state === "ok") return false;
+  return /content[-\s_]?type|text\/plain|unsupported media|invalid json|malformed json|parse error|failed to parse|无法解析|解析失败|不支持的请求体/i.test(String(p.body || ""));
+}
+/* 探针专用的应用头:**与兼容开关无关**,恒用「关闭该模式」时的请求头语义(application/json + Key / 协议头)。
+   P2/P4 的判别力全在这里:P2/P4 若走 headersFor() 取头,开态下会被短路成简单请求 ⇒ P2 退化成 P1、
+   P4 退化成 P3,坏预检会被诊断面板报成「跨域正常」。 */
+function corsProbeAppHeaders(withBody) {
+  var h = { "Accept": "text/event-stream, application/json" };
+  if (withBody !== false) h["Content-Type"] = "application/json";
+  var key = (state.settings.apiKey || "").trim();
+  if (state.settings.protocol === "openai") {
+    if (key) h["Authorization"] = "Bearer " + key;
+  } else {
+    if (key) h["x-api-key"] = key;
+    h["anthropic-version"] = "2023-06-01";
+    h["anthropic-dangerous-direct-browser-access"] = "true";
+  }
+  return h;
+}
+/* 四探针(§5.6 口径):P1 简单 GET /v1/models · P2 带应用头 GET /v1/models · P3 简单 POST(真实端点) · P4 应用真实 POST */
+function corsProbe() {
+  var models = apiUrl("models"), chat = endpointFor();
+  var out = { at: Date.now(), models: models, chat: chat, model: effectiveModel() || "probe" };
+  if (!models || !chat) { out.error = "未配置 Base URL"; return Promise.resolve(out); }
+  var settled = false;   /* 兜底可能先胜出:此后 probe 链仍在跑,写入一律丢弃(交出去的读数不许事后被改) */
+  var body = JSON.stringify({ model: out.model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false });
+  var probe = Promise.all([
+    corsProbeReq(models, { method: "GET", headers: { "Accept": "application/json" } }),
+    corsProbeReq(models, { method: "GET", headers: corsProbeAppHeaders(false) }),
+    corsProbeReq(chat, { method: "POST", headers: { "Content-Type": "text/plain;charset=UTF-8", "Accept": "text/event-stream, application/json" }, body: body }),
+    corsProbeReq(chat, { method: "POST", headers: corsProbeAppHeaders(), body: body })
+  ]).then(function (rs) {
+    if (settled) return true;
+    out.p1 = rs[0]; out.p2 = rs[1]; out.p3 = rs[2]; out.p4 = rs[3];
+    if (corsProbeReadable(out.p1) && corsProbeReadable(out.p2) && corsProbeReadable(out.p3) && corsProbeReadable(out.p4)) return true;
+    return corsReachProbe(models).then(function (reach) { if (!settled) out.reach = reach; return true; },
+      function () { if (!settled) out.reach = null; return true; });
+  }).then(function () { return true; });
+  /* 外层兜底:某条探针因宿主异常(例如没有真 AbortController)永不 settle 时,整体也必须收敛 ——
+     开关与诊断面板两条消费路径都不允许停在「正在探测…」。兜底胜出后这个定时器必须清掉(否则每次探测留一个)。
+     注:该分支已被真实触发过一次(C2 复查、悬挂服务端下重复探测);「probe 链为何 >36 s 仍未到终态」的根因
+     **未定位**(`?`;见 shared/progress/netdocs-C3-done.md),但结果有界、可见、文案如实。 */
+  var guardTimer = null;
+  var guard = new Promise(function (resolve) { guardTimer = setTimeout(function () { resolve(false); }, CORS_PROBE_TIMEOUT_MS * 3); });
+  return Promise.race([probe, guard]).then(function (done) {
+    settled = true;
+    if (guardTimer) clearTimeout(guardTimer);
+    if (done !== true) {
+      out.pending = true;
+      out.error = "四条探针未在 " + Math.round(CORS_PROBE_TIMEOUT_MS * 3 / 1000) + " 秒内到终态";
+      out.family = "timeout";
+      return out;
+    }
+    out.family = corsProbeFamily(out);
+    out.textplain = corsTextPlainRefused(out.p3);
+    return out;
+  }, function (e) {
+    /* 拒绝出口同样要清兜底定时器(否则留下一个 36 s 后才自触发的孤儿)。
+       当前 probe 链无可达抛点(逐回调核过:fetch / r.text / corsReachProbe 都有 rejection 回调),
+       这是防御性修补;断言与抛出一字不改(两条消费路径的 rejection 分支照旧接过)。 */
+    if (guardTimer) clearTimeout(guardTimer);
+    throw e;
+  });
+}
+/* 族判定(只据「读得到 / 读不到」这一位;文案见 CORS_FAMILY_TEXT):
+   · 应用真实 POST 读得到 ⇒ ok(现在就能用);
+   · 主探针超时(连上了但不回话)⇒ timeout —— 这一态分不出 CORS 层,不能当成 acao / net 报;
+   · 简单请求也读不到 ⇒ 实际响应缺 ACAO;网络层没通时(reach=false)改判「网络不可达」;
+   · 简单 GET 行、简单 POST 不行 ⇒ POST 侧的实际响应 / 路径问题(归 ACAO 族);
+   · 简单请求都行、只有带自定义头的 POST 不行 ⇒ 预检。
+   ⚠ 探针只能推出「哪一层被拦」,分不出「OPTIONS 返回 500」与「OPTIONS 返回 200 但缺 Allow-* 头」
+     (两者在浏览器侧同形)⇒ 界面上写「预检被拒(OPTIONS 未过)」,细节看 DevTools 的 OPTIONS 状态码。 */
+function corsProbeFamily(m) {
+  if (!m || m.error) return "unknown";
+  if (corsTextPlainRefused(m.p3)) return "textplain";   /* 「简单 POST 可读但服务端拒收 text/plain」*/
+  if (corsProbeReadable(m.p4)) return "ok";
+  if (!corsProbeReadable(m.p1)) {
+    if (m.p1 && m.p1.state === "timeout") return "timeout";
+    return (m.reach === false) ? "net" : "acao";
+  }
+  if (!corsProbeReadable(m.p3)) return (m.p3 && m.p3.state === "timeout") ? "timeout" : "acao";
+  return "preflight";
+}
+function corsProbeStateText(p, extra) {
+  if (!p) return "未测";
+  if (p.state === "ok") return "✓" + (extra || "");
+  if (p.state === "http") return "HTTP " + p.status + (extra || "");
+  if (p.state === "timeout") return "✗(超时)";
+  return "✗(不可读)";
+}
+function corsProbeMatrixLine(m) {
+  var p3x = corsProbeReadable(m.p3) ? "(未预检)" : "";
+  return "· CORS:简单 GET " + corsProbeStateText(m.p1)
+    + " · 带应用头 GET " + corsProbeStateText(m.p2)
+    + " · 简单 POST " + corsProbeStateText(m.p3, p3x)
+    + " · 真实 POST " + corsProbeStateText(m.p4);
+}
+/* 诊断面板的「CORS 分层」段(四行矩阵 + 结论 + 服务端指引 + 兼容模式提示;追加语义,不改既有行) */
+function corsProbeLines() {
+  return corsProbe().then(function (m) {
+    var lines = [], i;
+    if (m.error) {
+      /* 兜底态(>36 s)可能已经拿到读数:有读数就照常给矩阵,结论换成兜底口径(有读数却不出矩阵 = 面板自相矛盾);
+         未配置地址时四条探针压根没跑,保持单行。 */
+      if (!m.p1) { lines.push("· CORS:" + m.error + (m.pending ? "" : ",四探针未跑")); return lines; }
+      lines.push(corsProbeMatrixLine(m));
+      lines.push("  · 兜底:" + m.error + " —— 上表是兜底时已拿到的四条探针读数;等服务端恢复响应后再重跑诊断。");
+      return lines;
+    }
+    lines.push(corsProbeMatrixLine(m));
+    if (corsBypassOn()) {
+      lines.push("  · 备注:「预检规避兼容模式」当前开启;本组探针恒按「关闭该模式」的应用头发出(带应用头 GET / 真实 POST),所以上面四行仍是关态下的判别力 —— 它不会因为开了模式而变好看。");
+    }
+    if (m.family === "ok") {
+      lines.push("  ⇒ 结论:跨域正常(四类请求都读到了响应),无需处理。");
+      return lines;
+    }
+    lines.push("  ⇒ 结论:" + corsFamilyText(m.family).label + " —— " + corsFamilyAdvice(m.family));
+    if (!String(state.settings.apiKey || "").trim() && state.settings.protocol === "openai" && m.family !== "timeout") {
+      lines.push("  · 备注:当前是 OpenAI 兼容且未填 API Key,「带应用头 GET」与「简单 GET」同形(对预检没有判别力);填了 Key 或切到 Anthropic 才会分叉。");
+    }
+    if (m.family === "preflight" || m.family === "acao") {
+      var guide = corsServerGuideText();
+      for (i = 0; i < guide.length; i++) lines.push("  " + guide[i]);
+      if (corsBypassGate().ok) {
+        lines.push("  · 若暂时改不了服务端:可在 设置 → 模型 → 高级(兼容性) 打开「预检规避兼容模式」(打开前会先跑这组探针,探不通会拒绝)。");
+      }
+    }
+    return lines;
+  });
+}
+/* 开关的 UI 同步:门控不满足时置灰,并把「为什么必然无效」写在提示 / 红框里 */
+function syncCorsBypassUI() {
+  var el = $("set-cors-bypass"), hint = $("cors-bypass-hint"), note = $("cors-bypass-note");
+  if (!el) return;
+  var g = corsBypassGate(), on = corsBypassOn();
+  el.checked = on;
+  el.disabled = !g.ok;
+  if (hint) {
+    hint.textContent = g.ok
+      ? (on ? "已开启:请求改发简单请求(Content-Type: text/plain、不带自定义头),浏览器不再发 OPTIONS 预检。它只对「服务端缺预检」有效,不用时请关掉。"
+      : "关闭(默认)。打开前会先探测服务端:只有「简单 POST 能读到响应」才允许打开 —— 服务端连实际响应都没带 Access-Control-Allow-Origin 时,这个模式同样无效。")
+      : g.reason;
+  }
+  if (note) {
+    if (!g.ok) { note.className = "note show err"; note.textContent = g.reason; }
+    else if (note.className.indexOf("err") !== -1) { note.className = "note"; note.textContent = ""; }   /* 清掉上一次拒绝的残留(关窗重开不再留在原地) */
+  }
+}
+/* 开关动作:勾上 ⇒ 先跑四探针(前置探针),P3 读得到才真正开启;否则拒绝并给族文案 */
+function setCorsBypass(checked) {
+  var el = $("set-cors-bypass"), note = $("cors-bypass-note");
+  function refuse(why, extra) {
+    state.settings.corsPreflightBypass = false;
+    saveSoon();
+    syncCorsBypassUI();
+    if (note) { note.className = "note show err"; note.textContent = why + (extra ? "\n" + extra : ""); }
+  }
+  if (!checked) {
+    state.settings.corsPreflightBypass = false;
+    if (note) { note.className = "note"; note.textContent = ""; }
+    saveSoon();
+    syncCorsBypassUI();
+    return;
+  }
+  var g = corsBypassGate();
+  if (!g.ok) {   /* 门控在点击期间变了(或事件被绕过):如实拒绝,不打开 */
+    if (note) { note.className = "note show err"; note.textContent = g.reason; }
+    syncCorsBypassUI();
+    return;
+  }
+  if (el) el.disabled = true;
+  if (note) { note.className = "note show"; note.textContent = "正在探测服务端的 CORS(四条探针,每条最多 " + Math.round(CORS_PROBE_TIMEOUT_MS / 1000) + " 秒)…"; }
+  corsProbe().then(function (m) {
+    if (el) el.disabled = false;
+    if (m.error) {
+      refuse(m.error + (/Base URL/.test(m.error) ? ",无法探测 —— 先在上面填好 Base URL。" : ",本次不打开。"));
+      toast("未能开启:探测未完成", "warn", 3600); return;
+    }
+    /* 前置探针的两条拒绝路径:**先**看「4xx 且响应体点名 text/plain」(服务端能收到但不解析),
+       再看「压根读不到」(实际响应没有 ACAO —— 简单请求同样被拦)。两者都不允许打开 */
+    if (m.textplain) {
+      refuse("服务端不按 text/plain 解析请求体(HTTP " + (m.p3 && m.p3.status) + "),此模式无效,请关掉。",
+        "族判定:" + corsFamilyText(m.family).label + " —— " + corsFamilyAdvice(m.family));
+      toast("未能开启:服务端不解析 text/plain", "warn", 4200);
+      return;
+    }
+    if (!corsProbeReadable(m.p3)) {
+      var famTxt = corsFamilyText(m.family).label + " —— " + corsFamilyAdvice(m.family);
+      /* 超时 = 连接建立了但不回话:分不出是 text/plain 还是 ACAO 的问题 ⇒ 如实说「无法验证」并保持关闭
+         (这条兜底文案必须有:否则开关会一直停在「正在探测…」,连拒绝都不给) */
+      if (m.p3 && m.p3.state === "timeout") {
+        refuse("服务端在 " + Math.round(CORS_PROBE_TIMEOUT_MS / 1000) + " 秒内没有回话(连接建立了但不响应),无法确认这个模式对它是否有效,本次不打开。", famTxt);
+        toast("未能开启:服务端未在超时内回话", "warn", 4200);
+        return;
+      }
+      refuse("服务端在实际响应上也没有 Access-Control-Allow-Origin(简单 POST 也读不到),此模式无效。", famTxt);
+      toast("未能开启:服务端侧条件不满足", "warn", 4200);
+      return;
+    }
+    state.settings.corsPreflightBypass = true;
+    saveSoon();
+    syncCorsBypassUI();
+    if (note) {
+      note.className = "note show ok";
+      note.textContent = "已开启:简单 POST 读到 HTTP " + m.p3.status + "(未触发预检)。" + corsFamilyAdvice(m.family);
+    }
+    toast("已开启「预检规避兼容模式」", "warn", 4200);
+  }, function (e) {
+    if (el) el.disabled = false;
+    if (note) { note.className = "note show err"; note.textContent = "探测失败:" + errText(e); }
+  });
+}
+/* PDF 引擎读数行(「诊断」与上报文本共用;数据源 = PDFKit.diag(),字段口径见 make-pdfjs-part.js):
+   · 取文本:reader = 手动 reader 泵(修后默认) / getTextContent = 老版本 pdf.js 回落
+   · 流迭代:原生 = 宿主自带 / 已垫片 = 宿主缺失但垫片兜住(Chrome<124 一类) / 缺失 = 两者都没有
+   · 取图:精确取区(Route C)是否可用 —— 批次 B 之前恒「不可用」,页面渲染不受此影响
+   · 图文融合:**已启用 / 未启用** —— 与「取图」是两件事:能力可用 ≠ 现在就在做 OCR,
+     融合只在「当前模型不支持图像输入 + 本机 OCR 引擎可用」时才启用(附件/Read 两条路径同判据)
+   PDFKit.diag 缺失(老产物)时降级成旧口径,不抛错、不影响既有 5 行输出。 */
+function pdfEngineLine() {
+  var K = window.PDFKit;
+  if (!K) { return "· PDF 引擎:未加载"; }
+  var d = null;
+  try { d = (typeof K.diag === "function") ? K.diag() : null; } catch (e) { d = null; }
+  if (!d) {
+    return "· PDF 引擎:pdf.js " + (K.version || "?") + " · 未初始化 · 取文本:/ · 流迭代:/ · 取图:"
+      + (K.available ? "可用" : "不可用");
+  }
+  var si = d.streamIter || {};
+  var modeTxt = d.mode === "worker" ? "worker" : (d.mode === "main-thread" ? "主线程" : "未初始化");
+  var iterTxt = si.native ? "原生" : (si.shimmed ? "已垫片" : "缺失");
+  return "· PDF 引擎:pdf.js " + (d.version || K.version || "?") + " · " + modeTxt
+    + " · 取文本:" + (d.textStrategy || "?") + " · 流迭代:" + iterTxt
+    + " · 取图:" + (d.regionRender ? "可用" : "不可用")
+    + " · 图文融合:" + fuseStateText();
+}
+/* 「图文融合」当前是否真的会启用(见上;取图能力/OCR 引擎/模型视觉能力三个条件)。
+   视觉能力**三态**:true / false / null(= auto 且还没有该模型的探测记录,能力未知)——
+   未知时**不做**本机 OCR 融合(Read 侧 toolVisionCanImage / 附件侧 resolvePdf·resolveOffice
+   一律按 `vision === false` 才走融合:未知按「可发图」处理,与批 B 之前的行为一致),
+   所以文案如实写「未知」,不得写成「支持图像输入」。 */
+function fuseStateText() {
+  var K = window.PDFKit;
+  if (!K || typeof K.pageImages !== "function" || typeof K.renderCrops !== "function") return "不可用(取图能力缺失)";
+  var v = visionState();
+  if (v.vision === false) {
+    return ocrReady() ? "已启用(当前模型不支持图像输入)" : "不可用(本机 OCR 引擎不可用)";
+  }
+  if (v.vision === true) return "未启用(当前模型支持图像输入)";
+  return "未启用(图像能力未知,还没探测到该模型;可在 设置 → 模型 把该模型的图像能力设为「不支持」后启用 OCR 融合)";
+}
+/* 仅提示、不拦的环境备注(PDFKit.notes;正常宿主为空数组) */
+function pdfEngineNotes() {
+  var out = [];
+  try {
+    var K = window.PDFKit;
+    if (K && K.notes && K.notes.length) {
+      for (var i = 0; i < K.notes.length; i++) { out.push("· 提示:" + K.notes[i]); }
+    }
+  } catch (e) {}
+  return out;
 }
 async function runDiagnostics() {
   var box = $("diag-result");
@@ -5167,6 +5982,17 @@ async function runDiagnostics() {
   lines.push("· 公式渲染:" + (hasKatex ? "正常" : "不可用"));
   lines.push("· 内嵌库:pdf.js " + (window.PDFKit ? (window.PDFKit.version || "?") : "未加载") +
     " · Tesseract.js " + (window.OCRKit ? (window.OCRKit.version || "?") : "未加载"));
+  /* PDF 引擎细读 + 仅提示项(追加语义:上面 5 行与 envReportText 的 DOM 抓取都不动) */
+  lines.push(pdfEngineLine());
+  var pdfNotes = pdfEngineNotes();
+  for (var pn = 0; pn < pdfNotes.length; pn++) { lines.push(pdfNotes[pn]); }
+  /* CORS 分层(追加;四探针矩阵 + 族结论 + 服务端指引 + 兼容模式提示) */
+  try {
+    var corsLines = await corsProbeLines();
+    for (var cl = 0; cl < corsLines.length; cl++) { lines.push(corsLines[cl]); }
+  } catch (ec) {
+    lines.push("· CORS:探测失败(" + errText(ec) + ")");
+  }
   box.className = "note show" + (bad ? " err" : " ok");
   box.textContent = (bad ? "自检完成(有需要处理的项目)\n" : "自检完成\n") + lines.join("\n");
 }
@@ -5769,12 +6595,21 @@ function updateCtxMeter() {
   var extra = 0;
   draftFiles.forEach(function (f) { extra += draftAttachTokens(f); });
   var sys = ((conv && conv.system) || state.settings.systemPrompt || "");
-  /* 工作区上下文也计入估算:与 buildBody 用的是同一个 wsContextBlock() */
+  /* 四块动态拼接与 buildBody **同源同序**(工作区 → 后台任务提醒 → 外部 MCP instructions → 上下文用量提醒);
+     后台任务块必须用**只读变体** pvTaskBlockText:文本与 pvTaskBlock 逐字节相同、但不登记在途通知 ——
+     只读估算里调 pvTaskBlock 会把完成提醒标成「已通知」,把完成回流链打乱(口径同 cxEstSummaryRequest)。
+     此前只复制了工作区与 MCP 两块 ⇒ 有「待告知后台任务」或「已过提醒水位」时这个估算偏低。 */
   var wsCtx = wsContextBlock();
   if (wsCtx) sys = sys ? (sys + "\n\n" + wsCtx) : wsCtx;
-  /* 外部 MCP instructions 是否注入也计入:与 buildBody 同口径(含会话级覆盖判定) */
+  var taskCtx = (typeof pvTaskBlockText === "function") ? pvTaskBlockText(conv) : "";
+  if (taskCtx) sys = sys ? (sys + "\n\n" + taskCtx) : taskCtx;
   var mcpCtx = mcpInstructionsBlock(conv);
   if (mcpCtx) sys = sys ? (sys + "\n\n" + mcpCtx) : mcpCtx;
+  /* 本函数挂在输入框 input 事件上(每次按键都跑)⇒ 全量估算只做**一次**,快照同时供下面两处消费者:
+     cxContextBlock 的提醒阈值判定与 updateCtxMonitor 的用量环(此前各自现算一次 ⇒ 每次按键多一倍)。 */
+  var snap = ctxSnapshot(conv);
+  var cxCtx = (typeof cxContextBlock === "function") ? cxContextBlock(conv, snap) : "";
+  if (cxCtx) sys = sys ? (sys + "\n\n" + cxCtx) : cxCtx;
   wsRailSync();   /* 接缝:右栏可见性 + 挂载按钮 + 元数据缓存补热(无 IO,除了一次可能的 wsMeta) */
   var total = p.tokens + estimateTokens(sys) + estimateTokens(elInput.value || "") + extra;
   var el = $("st-ctx");
@@ -5786,7 +6621,7 @@ function updateCtxMeter() {
       ? "历史已按「最多携带的历史消息条数」截断,只发送最近 " + p.list.length + " 条"
       : "估算的下一轮请求上下文用量";
   }
-  updateCtxMonitor();
+  updateCtxMonitor(snap);
 }
 
 /* ---------------------------------------------------------------------------
@@ -5908,8 +6743,8 @@ function ctxRingOffset(ratio) {
   var r = clamp(Number(ratio) || 0, 0, 1);
   return (C * (1 - r)).toFixed(2);
 }
-function updateCtxMonitor() {
-  var s = ctxSnapshot();
+function updateCtxMonitor(snap) {
+  var s = snap || ctxSnapshot();   /* 调用方已算过快照时复用它(实现里没有别的写点,所有读点口径不变) */
   var numEl = $("ctx-meter-num");
   var met = $("ctx-meter");
   if (!numEl || !met) return;
@@ -6100,7 +6935,7 @@ function startRenameConv(c) {
   }
   inp.addEventListener("keydown", function (ev) {
     if (ev.key === "Enter") { ev.preventDefault(); commit(true); }
-    /* Ctrl/Cmd+Esc 放行给全局中断路径:重命名输入框不被它顺手取消 */
+    /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径:重命名输入框不被它顺手取消 */
     else if (ev.key === "Escape" && !ev.ctrlKey && !ev.metaKey) { ev.preventDefault(); commit(false); }
   });
   inp.addEventListener("blur", function () { commit(true); });
@@ -6842,7 +7677,7 @@ function bindUI() {
   $("find-input").addEventListener("input", function () { runFind($("find-input").value); });
   $("find-input").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { e.preventDefault(); stepFind(e.shiftKey ? -1 : 1); }
-    /* Ctrl/Cmd+Esc 放行给全局中断路径:查找栏不被它关掉 */
+    /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径:查找栏不被它关掉 */
     if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) { e.preventDefault(); closeFind(); }
   });
   $("find-next").addEventListener("click", function () { stepFind(1); });
@@ -7005,7 +7840,7 @@ function bindUI() {
   modelInput.addEventListener("focus", function () { renderModelSuggest(); });
   modelInput.addEventListener("input", function () { renderModelSuggest(); });
   modelInput.addEventListener("keydown", function (e) {
-    /* Ctrl/Cmd+Esc 放行给全局中断路径:模型候选浮层不被它收掉 */
+    /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径:模型候选浮层不被它收掉 */
     if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) { hideModelSuggest(); return; }
     if (e.key === "Enter") {
       e.preventDefault();
@@ -7115,6 +7950,10 @@ function bindUI() {
       saveSoon();
     });
   });
+  /* 预检规避兼容模式**不进 SWITCH_BIND**:它要先过门控 + 前置探针才允许置 true,
+     勾选动作走 setCorsBypass(见「CORS 分层」节),这里只挂事件 */
+  var cbe = $("set-cors-bypass");
+  if (cbe) cbe.addEventListener("change", function () { setCorsBypass(cbe.checked); });
   $$("#theme-switch button").forEach(function (b) {
     b.addEventListener("click", function () {
       state.settings.theme = b.getAttribute("data-theme");
@@ -8976,7 +9815,7 @@ function wsAskChoice(title, message, options) {
       resolve(options[i] ? options[i].v : null);
     }
     function onKey(e) {
-      /* Ctrl/Cmd+Esc 放行给全局中断路径(停止生成 / 中止压缩):弹窗不接管,自己也不被它关掉 */
+      /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径(停止生成 / 中止压缩):弹窗不接管,自己也不被它关掉 */
       if (e.key !== "Escape" || e.ctrlKey || e.metaKey) return;
       e.stopImmediatePropagation();    /* 别让全局 Esc 顺手关掉后面的设置弹窗 */
       done(defIdx);
@@ -9000,7 +9839,8 @@ function wsAskChoice(title, message, options) {
      (配额 clamp、路径规范化、名称截断)照旧执行,不因为有了这层就省略;
    · onSubmit 返回 Promise 时保持打开:resolve 出 { error } 就地显示错误,否则关闭;
      返回别的东西(或不返回)= 调用方已处理完,直接关闭。
-   · 只能经 ✕ / 取消 / Esc 关闭(点遮罩不关,与设置类弹窗一致,避免误触丢掉输入)。
+   · 只能经 ✕ / 取消 / 普通 Esc 关闭(带 Ctrl/Cmd 的 Esc 穿透给全局中断路径,不关窗;
+     点遮罩不关,与设置类弹窗一致,避免误触丢掉输入)。
 --------------------------------------------------------------------------- */
 function askDialogErr(mask, msg) {
   var el = mask ? mask.querySelector(".note.err") : null;
@@ -9134,7 +9974,7 @@ function openAskDialog(spec) {
        没选「延迟 250ms 再聚焦 + 期间 disabled」:那条路会把用户已经决定的快速回车也一并吞掉,
        还要和 submit() 里 Promise 分支的 okBtn.disabled 状态纠缠,改动面反而更大 */
     if (e.key === "Enter" && e.repeat) { e.preventDefault(); return; }
-    /* Ctrl/Cmd+Esc 放行给全局中断路径(停止生成 / 中止压缩):弹窗不接管,自己也不被它关掉 */
+    /* 带 Ctrl/Cmd 的 Esc(中断主键是 Ctrl+X,这是历史别名)放行给全局中断路径(停止生成 / 中止压缩):弹窗不接管,自己也不被它关掉 */
     if (e.key !== "Escape" || e.ctrlKey || e.metaKey) return;
     e.stopImmediatePropagation();    /* 别让全局 Esc 顺手关掉后面的设置弹窗 */
     close();

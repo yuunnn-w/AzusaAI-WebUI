@@ -2716,6 +2716,15 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
         </div>
         <div class="sec-title">服务器返回的模型</div>
         <div class="list-box" id="models-inline" style="max-height:260px"></div>
+        <div class="sec-title">高级(兼容性)</div>
+        <div class="field">
+          <div class="switch-row">
+            <div class="sw-txt"><label>预检规避兼容模式</label><small>服务端没处理 CORS 预检(OPTIONS)时的应急手段:请求改用简单请求(Content-Type: <code>text/plain</code>、不带任何自定义头),浏览器不再发预检。仅「OpenAI 兼容 + 未填 API Key」时可用;打开前会自动探测服务端(四条探针),探不通就拒绝开启。只作应急,不用时请关掉。</small></div>
+            <label class="switch"><input type="checkbox" id="set-cors-bypass" /><span class="slider"></span></label>
+          </div>
+          <div class="hint" id="cors-bypass-hint"></div>
+          <div class="note" id="cors-bypass-note"></div>
+        </div>
       </div>
 
       <!-- ---------- 生成 ---------- -->

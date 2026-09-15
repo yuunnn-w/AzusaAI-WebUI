@@ -122,6 +122,9 @@ var DEFAULT_SETTINGS = {
   baseUrl: DEFAULT_BASE,
   apiKey: "",
   model: "",
+  /* 预检规避兼容模式(默认关;设置 → 模型 → 高级区):请求改发「简单请求」以绕过 OPTIONS 预检。
+     仅 OpenAI 兼容 + 未填 API Key 时可用;开启前自带前置探针(门控与探针口径见 appD 的 corsBypassGate / setCorsBypass) */
+  corsPreflightBypass: false,
   stream: true,
   autoscroll: true,
   showReasoning: true,
