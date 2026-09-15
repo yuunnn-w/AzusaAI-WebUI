@@ -310,26 +310,73 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | `CX_KEEP_MAX_MSGS` | 8 | 保留尾部最多几条消息（`auto` 向左扩展时的约束） |
 | `CX_LOOP_TAIL_MIN` | 2 | 「单用户轮有界 tail 档」要求尾部至少含这么多个**完整工具循环** |
 | `CX_MIN_MSGS` | 4 | 少于这么多条消息时拒绝压缩（`ECOMPACT_SMALL`） |
-| `CX_SUMMARY_MAX_TOK` | 8192 | **摘要请求的 `max_tokens`，独立于会话设置**（用户把聊天 `max_tokens` 设成 1024 也不影响摘要） |
-| `CX_SUMMARY_TIMEOUT_MS` / `CX_SUMMARY_RETRY` | 180000 / 2 | 摘要超时与重试（含"溢出则缩小投影"重试） |
-| `CX_HISTORY_PART_CAP` / `CX_HISTORY_TOTAL_CAP` / `CX_HISTORY_HEAD_CAP` | 4096 / 120000 / 16000 | 摘要输入投影：单条上限 / 总字符上限 / 头部保留字符数 |
+| `CX_SUMMARY_TIMEOUT_MS` | 900000 | 摘要请求超时（**每次尝试各计**；全量输入后在长会话可能数分钟，Esc 可随时取消） |
+| `CX_SUMMARY_OUT_CAP` / `CX_SUMMARY_OUT_MIN` / `CX_SUMMARY_FIT_MARGIN_RATIO` | 131072 / 4096 / 0.05 | 摘要输出预算：封顶（Kimi `128*1024`）/ 适配收窄下限 / 输入估算余量（配套下限 1024） |
+| `CX_SUMMARY_ATTEMPTS_MAX` / `CX_SUMMARY_SHRINK_RATIOS` / `CX_SUMMARY_SHRINK_MAX` | 5 / `[0.7,0.5,0.35]` / 3 | 重试链：总尝试上限 / 溢出缩窗比例 / 缩窗次数上限（Kimi 同值） |
+| `CX_SUMMARY_BACKOFF_BASE_MS` / `_MAX_MS` / `_JITTER` | 500 / 32000 / 0.25 | 可重试错误的指数退避（`min(500×2^i, 32s)`，+0~25% 抖动） |
+| `CX_SUMMARY_MEDIA_KEEP_RECENT` / `CX_SUMMARY_MEDIA_MAX_BYTES` | 2 / 32 MiB | 媒体降级档保留最近几张图（Kimi 同值）/ 媒体体积闸（本项目扩展） |
 
 **切分语义**：`split = min(kimiSplit, lastUser)`，其中 `kimiSplit` = 从末尾向前第一个满足 `cxCanSplitAfter` 的位置 + 1（Kimi 语义，单独求出，不与 tail 起点混用），`lastUser` = 最后一条**真实**用户输入（`m.compact` 非空的压缩产物不算）。⇒ **默认档** tail 非空且必含「最后一条真实用户输入 → 末尾」整段；随后 `while (split > 0 && !cxCanSplitAfter(list, split-1)) split--` 只向左回退（保留更多，永不越过 `lastUser`）。`mode="auto"` 只向更早方向扩展（`CX_KEEP_MAX_MSGS` / `tailBudget` 内）；`mode="manual"` 不扩展。
 
 **单用户轮有界 tail 档**（`cxLoopSplitBound`，唯一允许 `split > lastUser` 的情形）：全列表恰有 1 条真实用户输入 + 切点落在**完整工具循环**边界（`list[p-1].role === "tool"` 且 `cxCanSplitAfter(list, p-1)`）+ tail 含 ≥ `CX_LOOP_TAIL_MIN` 个完整循环 + `tailTokens ≤ tailBudget`；命中时那条用户消息由 `keepHead` 原样保住（`elided = false`），切点永不落在进行中的循环上。该形态（一条用户消息 + 长工具循环 = 长时间自主工作）在默认档下 `split ≡ 0`、压不动。
 
-**摘要请求**：`stream:false`，OpenAI 侧 `messages:[{system}, {user: 投影 + 指令}]`、Anthropic 侧 `system` + 单条 user；`sys` = `conv.system || settings.systemPrompt`（+ `wsContextBlock` / `mcpInstructionsBlock`）—— **刻意不带 `pvTaskBlock`**：它注入即登记 `PV_NOTIFY_INFLIGHT`，而摘要请求没有配套的 `pvNotifyCommit/Rollback`，会静默吞掉后台任务的完成回流。
+**摘要请求**：`stream:false`，组装一律走 `buildBody(list + [指令], model, false, c, {maxTokens: budget, summary: true})` 单一来源（OpenAI 侧 `[system] + list + [user 指令]`；Anthropic 侧 `system` + `normalizeAnthropic`）；消息体 = **完整历史**（`payloadMessages(conv.messages, {noCap:true})` 的全部消息，角色 / 工具调用 / 工具结果原样，**发送前不做任何单条/总长裁剪** —— 对齐 Kimi「投影截断 = 压缩无意义」的裁定）；工具集与聊天轮同源（history-union），采样 / 思考挡位同源；`sys` 使用 `pvTaskBlockText` **只读变体**（文本与 `pvTaskBlock` 逐字节相同，但不登记 `PV_NOTIFY_INFLIGHT` —— 摘要请求没有配套的 `pvNotifyCommit/Rollback`，登记会静默吞掉后台任务完成回流）。
 
-**投影中部省略**：逐条投影后的总文本超过 `CX_HISTORY_TOTAL_CAP` 时，保留**头部** `CX_HISTORY_HEAD_CAP` + 尾部余额，中间插一行「【投影省略】中间约 K 字符已省略」——不从最旧丢（最早的用户意图/约束在头部）。工具结果按 `CX_HISTORY_PART_CAP` 截尾，附件只留 `[附件:名(类型,大小)]` + 已抽取文本前 N 字符，图片只留 `[图像:名]`（投影里不会出现 `data:` / base64）。
+**全量优先、不得已才降级（写死顺序）**：① 先压**输出预算**（无损）：`budget = min(win, 128K)` 按 `room = win − estInput − margin`（`margin = max(1024, win×5%)`）三分支收窄到不低于 `CX_SUMMARY_OUT_MIN`（`estInput` 用四桶估算现算，不用 `ctxSnapshot`）；② 再缩**消息集合**（有损）：溢出缩窗 `[0.7,0.5,0.35]`（≤3 次，对象 = 当前集合总估算 token，尾部装满、丢前导 tool 结果）、截断/空响应丢最旧一条 + 前导 tool 结果；③ **媒体两档**：默认全量进请求 → `degraded`（保留最近 2 图、更早换 `[图像已省略…]` 占位；`request_too_large` 或媒体载荷 > 32 MiB 触发）→ `stripped`（全部占位；`image_format` 或 degraded 后仍超限触发）。预算在缩窗后**不重算**（偏保守）。可重试错误（超时 / 网络层 / 408·409·429·5xx）指数退避 500 ms→32 s + 抖动，总尝试 ≤ 5；`cxClassifySummaryFailure` 十类（溢出 / 体积 / 图片格式 / 截断 / 过滤 / 空 / 超时 / 可重试 / 致命 / 取消）——**500 不判溢出**（不触发有损缩窗）。
+
+**`compactMeta` 与界面读数**：数值键 = `at / dropped / droppedTokens / before / after / released / freedBytes / ms` + 重试链五键 `attempts / shrinks / inputDropped / inputShrunk / mediaLevel`（**0 = 未发生**；`sanitizeConv` 的 `CM_NUMS` 只做"非有限数归 0"校验，不给旧数据补默认值对象）。`inputShrunk === 1` 时摘要卡显示「摘要输入曾缩窗（丢 N 条）」（纯媒体降级且未丢消息时显示「图片降级，未丢消息」）、`attempts > 1` 时显示「尝试 N 次」；`/compact` 完成 toast 与 Compact 工具回执同步追加一句 —— 摘要覆盖范围不完整必须如实标注。
 
 **释放后置与共享 blob 陷阱（改这块之前必读）**：被丢弃消息的附件**不在 splice 里删**——`cxDropMessages(conv, from, to)` 只做「收集键 + 估算 token + splice」，释放必须由调用方在**保留集重插回数组之后**执行 `cxReleasePlan(keys)`（`keep = cxSurvivingBlobKeys()` 是**全库引用重算**，因此 `duplicateConv` 副本共享的键、以及 head 保留消息自己引用的键都会被保护），唯一的异步出口是 `cxReleaseBlobs(todo)`。三条顺序契约：① 先移除 + 重插保留集，再释放；② `keep` 重算必须在同步块结束、head 回位之后取；③ 同步块内不得 `await`（双标签页的 `pullConvsFromIdb`/`mergeConvs*` 可能在整个 await 之后替换数组）。
 **统一口径的五个调用点**（此前四处既有缺陷 + 一处同源）：`clearConvMessagesNow`、`trimConversation`、`compressOneConv`、清理空间的内联 80 条裁剪、`stripAttachmentData` —— 一律 `var p = cxReleasePlan(keys); if (p.todo.length) cxReleaseBlobs(p.todo);`。
 
-**失败/取消零改动**：摘要成功后才动数据；动数据前过两道闸（非工具路径 = `cxHistoryHash` 相等 **且** `cxHistoryPrefixIntact`；工具路径 = 前缀完整、允许尾部增长）；`cxApplyCompaction` 先按 id 重取会话（`getConv(conv.id)`），其后只用重取到的对象。工具路径「只算不落」（`CX_RUN.pending`），应用点是**本轮所有工具调用结束后**的唯一一处（`await cxApplyPending(tf)`，漏 `await` 会让被删消息继续发给模型）。
+**失败/取消零改动**：摘要成功后才动数据；动数据前过两道闸（非工具路径 = `cxHistoryHash` 相等 **且** `cxHistoryPrefixIntact`；工具路径 = 前缀完整、允许尾部增长）；`cxApplyCompaction` 先按 id 重取会话（`getConv(conv.id)`），其后只用重取到的对象。工具路径「只算不落」（`CX_RUN.pending`），应用点是**本轮所有工具调用结束后**的唯一一处（`await cxApplyPending(tf)`，漏 `await` 会让被删消息继续发给模型）。**取消通道 = 运行级 `AbortController`**：`CX_RUN.ctrl` 在整段压缩运行期间持有（请求与退避 `cxSummarySleep` 共用同一 signal；`cxCallSummary` 把它桥进本次请求的局部 ctrl，不再自设/自清 `CX_RUN.ctrl`）；Esc 在生成中走 `stopGenerating → cxAbortActive`（既有链路），手动压缩（`generating=false`）走 `cxRunActive → cxAbortActive`（**不**调 `stopGenerating`，避免误杀沙箱 / 工具等待 / 自动续跑）；ladder 另有「成功前 abort 复检」关闭「响应已到、应用未开始」的窄窗。
 
 **摘要与用量环**：摘要请求的 token 消耗**不进**用量环与累计统计（它是管理开销）；压缩成功后目标会话的实测锚点作废（`usage.exact = false`、`lastMsgId = ""`，累计量不动），否则用量环不下降、去重与触发判定失真。
 
 **版本号唯一口径**：`APP_VERSION`（`appA.part`）是用户可见版本号的唯一权威 —— 环境面板、环境信息、导出备份的 `version`、MCP `clientInfo`、关于弹窗、`<meta name="version">`（启动时同步）全部读它；不要在别处再写版本字面量。
+
+### 4.6 文件工具的多媒体读取（Read 图片 / 办公文档 / PDF）
+
+**路径双写（唯一权威句 `WS_PATH_DUAL_NOTE`，`appE.part`）**：工作区 6 个文件工具一律用 `/…`（`wsNormPath` 只认 `/` 开头、禁 `..` 与反斜杠），而 Python 解释器里同一份数据挂载在 `/workspace`（`PY_MOUNT` / `pyContainerPath`）——**两者指向同一份文件**。这句话同时进 `【工作区】` 上下文块（每轮请求的 system，≈100–130 token 成本）、6 个文件工具与两个执行工具的 `modelDesc`、`PV_TASK_COMMON`（4 个任务类工具共用尾段）。两条定向纠错都只改错误文案：工作区工具路径以 `/workspace` 开头且报 ENOENT 时，`wsToolRun` 追加口径提醒，且**只在"去掉前缀后的路径确实存在"**（同步查 `WS_META_CACHE[wsId].tree`，缓存缺失就不确指）时给出「你要的可能是 /x」；Python 侧的 `__pyShimOpen` 在 `FileNotFoundError` 分支里对 `not p.startswith(_KIMI_MOUNT) and os.path.exists(_KIMI_MOUNT + p)` 的情形补一句「这个文件在工作区里是 "/workspace" + 原路径」——**只覆盖 `builtins.open`**：`os.open` 是另一个引用，`pathlib.Path.open/read_text` 走的是 `io.open`（**不在覆盖内**），`pandas.read_csv` / `PIL.Image.open` 等最终走 `builtins.open` 的路径在内；**只加文案、不改异常类型**（仍是 `FileNotFoundError`）。两点实现约束（回归教训）：① 挂载点由 JS 侧 `JSON.stringify(__PY_MOUNT)` 拼成 **Python 字面量** `_KIMI_MOUNT` 注入 —— 裸写 `__PY_MOUNT` 是 worker 的 JS 变量，Python 命名空间里不存在（会 `NameError`，把 `FileNotFoundError` 换成更难读的报错）；② wrapper 的安装与「本次有没有超预载上限文件」**解耦**（工作区挂载即安装，`_KIMI_REMOTE` 每次 run 重写），否则没有超限文件时该提示永不生效；安装失败往 stderr 打一行诊断而不是静默吞掉。
+
+**Read 的类型路由**（`wsReadTool`，顺序即优先级）：文本（含 svg；输出逐字节不变）→ 办公 / PDF（后缀或 magic）→ 图片（magic 命中且 mime 是 `image/*`，或后缀 ∈ 可解码集合 png/jpg/jpeg/gif/webp/bmp/avif/ico/tif/tiff）→ 宏格式单独拒 → 其余二进制给新 EBINARY 文案（`zipfile` 解包再 Read 是新增的真实出路）。
+
+**图片预算（单一权威 `READ_*` / `TOOL_MEDIA_CHAT_*`，`appE.part`）**：最长边 ≤ `READ_IMG_MAX_EDGE`(2000) 且与 `imgMaxSide()` 取小；尽力压到 `READ_IMG_BYTE_BUDGET`(256 KiB)，梯子 = PNG（保 alpha）→ JPEG 0.8/0.6/0.4 → 边长回退 2000/1000/768/512/384/256；**单张硬顶 = 单次总量 = `READ_IMG_HARD_MAX` = 1 MiB**（压不到就报错、**不发原图**）；单次交付 `READ_MEDIA_MAX_IMAGES`(4) 张、累计 ≤ `READ_MEDIA_TOTAL_BYTES`(1 MiB)，超出按读取顺序保留并在状态行写「另有 N 张超出单次上限未附带」；直通（字节 ≤ 256 KiB、边 ≤ 上限、mime ∈ `SAFE_IMG_MIME`）**仍会解码验证一次**再交付原字节——这一层挡住"截断/损坏但 IHDR 还写着小尺寸"的假直通。解码两道门：像素 `READ_IMG_DECODE_MAX_PX`(40M，先用 `wsImgSniffDims` 嗅 PNG/JPEG/GIF/BMP/WebP 尺寸头，**嗅不到尺寸的 avif/ico 只能在解码后复核**，这是已知残差) + 字节 `READ_IMG_DECODE_MAX`(32 MiB)，取与。交付 mime 收敛到 `{image/png,image/jpeg}`（重编码）∪ `SAFE_IMG_MIME`（直通）——**源 mime 不在 SAFE 集时不走「压不动回原字节」**（否则交付 mime 会落在收敛集合之外，例如 1×1 BMP 交付 `image/bmp`），改为交付最佳重编码（仍 ≤ 单张硬顶）。
+
+**非视觉 → OCR**：`wsOcrTextOf` 是唯一出口；输入是**按上表缩放后的画布 dataURL**（与附件 `maybeOcrImage` 同形）；超时 = **整次 Read 的总预算** `min(READ_OCR_TIMEOUT_MS(120 s), toolLimit("timeoutMs"))`，多页共享、页间查 `ctx.signal.aborted`、文本累加到工具结果预算即停；引擎不可用 / 超时 / 无文字各有独立可读文案（**不写"请重试"**）。
+
+**媒体怎么进模型（`m.media` 内联 + 协议双形态）**：消息上唯一新字段 `m.media[]`（`kind/mime/data/w/h/bytes/path/label/from/srcW/srcH/scaled`；`resultText` 只写文本 + 「已附带 N 张」）。payload 项内部字段 `media` 由 `payloadMessages` 带出：**Anthropic** 走 `tool_result.content` 内容块数组（文本 + image）；**OpenAI 兼容**走"tool 文本 + **按工具轮分组**的一条合成 user 消息"（连续 `role==="tool"` 段 = 同一工具轮，组内 media 合并、插在段末最后一条 tool 之后，跨段不合并 ⇒ 不产生 `tool→user→tool` 交错）；合成消息**只存在于请求体**，不落盘、不进界面。工具轮内还有一个 `msgList.push({role:"tool"})`（续答轮），**必须带上同一个 media**，漏了就是"本轮模型看不到刚读的图"。
+
+**严格端点 400 的降级与复位**：`isToolMediaStructureError`（显式状态码 `{400,422}` + 结构类正则）命中且 `msgList` 里仍有带 media 的 tool 项时，工具轮内 `mediaOff = true` 后重跑本轮（**整次 send 只一次**；`buildBody` 收 `noToolMedia` ⇒ 工具文本照发、仅图片不随本次发送），并 toast 说明。复位路径三条：① 本次自动降级（不落盘）；② 设置 → 模型 把该模型图像能力设为「不支持」（`visionForce:"no"`）或换模型；③ 删除 / 压缩掉那条带图片的工具消息。降级后仍失败时，失败文案追加一条指向②的恢复建议。
+
+**两条预算纪律**：文本预算（`toolLimit("maxOut")`）只管 `m.content`，媒体字节走 `m.media` ⇒ 附图不挤状态行、正文过长也不削图；**聊天轮软护栏** `trimToolMediaForRequest` 对非摘要请求保留最近 `TOOL_MEDIA_CHAT_KEEP_ITEMS`(8) 条带媒体工具项、累计 `TOOL_MEDIA_CHAT_MAX_BYTES`(8 MiB，`data` 字符量)，更早的**非破坏性**替换为 `[图像已省略:超出请求体积上限,需要时可重新读取]`（存储一字不动）；摘要请求不走这条护栏（b25 的 `cxSummaryMedia` 阶梯 + 32 MiB 闸自有口径）。工具媒体计入 token 估算的唯一入口是 `estimateToolMediaTokens`（调用点清单：`payloadMessages` 的 token 循环 + `cxPayloadMsgTokens`）。
+
+**存储代价（如实）**：媒体内联在消息里（不新增 blob 键 ⇒ 不触碰释放链），单条消息最大 ≈1.4 MB base64；三条放大面 = 每次 `saveState(true)` 整条会话写、导出备份整份 `JSON.stringify`、历史图片逐轮重发（软护栏封顶）。**「优化存储」可回收**（`stripAttachmentData` 在 `m.content` 早退之前删 `m.media`，`keepIds` 保护口径不变）。**计量口径**：`storageBytes()` 量的是 localStorage 设置串，**不是会话存量** —— 报告占用请用 `navigator.storage.estimate()` / IDB 实测，不要拿它宣称"媒体存储已计量"。
+
+**Read 复用办公 / PDF 引擎的边界**：复用引擎（`OfficeKit.parse` / `PDFKit.extractText|renderPages` / `OCRKit.recognize`）与数值（`ATTACH_TEXT_MAX`、`officeSizeCap()`、`pdfDpi()`、`pdfMaxPages()`、`ocrLangs()`、`SAFE_IMG_MIME`、`IMAGE_EXT/OFFICE_EXT/MACRO_EXT`），**不复用** `resolveOffice/resolvePdf/resolveImage` 的 File+vision+toast 包装（Read 的入参是 Blob + 目标会话，包装会引入"生成期间切走会话"的判定错会话问题）；PDF 走文本优先、不吃 `pdfMode()` 设置。文档状态的"文件:…"信息一律并入**末尾状态行**（不占行号，`line_offset` 语义与文本读一致），`clipped` 在状态行标注。
+
+### 4.7 提示词风格契约（模型可见文本的唯一风格口径）
+
+> 适用面 = 内置 `AGENT_TOOLS` 的 `modelDesc` + 四个系统注入块（`wsContextBlock` / `pvTaskBlockText` / `mcpInstructionsBlock` / `cxContextBlock`）+ 工具结果注记 + 附件部件文本。**外部 MCP 工具描述与 `mcpHistoryPlaceholder` 显式豁免**（内容由服务器直通，不满足本契约属正常）。
+
+- **骨架（S1/S2）**：首行 = 单句总述（6 个文件工具与任务 / 压缩类工具沿用**边界句**首行，功能句紧随其后；`ExecuteJavaScript` / `ExecutePython` / `AskUser` / `PythonPackages` 为功能句首行）→ 空行 → `- ` 要点；要点 >8 条或跨 ≥2 话题时分节（`**短标题**` 独占一行；`ExecutePython` 五节）。**唯一例外**：`WS_PATH_DUAL_NOTE`（b26 路径口径句）在文件工具 `modelDesc` 里保持「首句后独立一行」的原位 —— 它是每轮 system 里唯一的路径口径来源、被 9 处引用，不为空行形态挪位。
+- **语气（S3/S4/S13）**：中文祈使管做什么、陈述管是什么；强约束用加粗，**不引英文强调词**（`NEVER` / `DO NOT` / `MUST` 0 命中）；每条「禁止 / 必须」附理由。
+- **反例与替代（S5）**：每个「不要用 / 不能」都要给出替代或指路（如 `Read` 的「二进制 → 用 ExecutePython 以 `"rb"` 读」，且明说**不要重试**）。
+- **参数权威（S6）**：参数事实（必填性 / 默认 / 单位 / 上限 / 省略行为）的**唯一权威 = `inputSchema.description`**；`modelDesc` 只留「关键参数」要点。凡 `modelDesc` 删掉或弱化的参数事实，必须能在 schema 里逐条找到（审查时对拍，见 4.7 表）。
+- **标点与反引号（S7/S8）**：列表前缀一律 `- `（`· ` 只允许行内出现）；参数名 / 错误码 / 路径字面量用反引号包裹（工具名保持裸名，协议 token 例外）；括号统一半角。
+- **数字与标签（S9/S10/S11）**：不写「较大 / 适量 / 若干 / 一些」类模糊量词，数字逐处带值（无权威数字时改为可验证的具体口径，如任务列表用 `PV_TASK_LIST_MAX`）；`next_step:` 只加在**本身已含出路**的句子上（截断提示、EBINARY 文案；任务族不加，避免与 `PV_TASK_COMMON` 重复）；注入块统一 `【…】` 头 + `- ` 列表。
+- **双面文案（S12）**：同一字符串既进模型又进用户面（工具卡片 / toast）时用**中性措辞** —— 不出现只对用户说的话，也不出现只给模型的语法（`next_step:`）；用户去处（改哪个开关）改为**事实括注**（非祈使、无第二人称）。
+- 落地记录：`shared/progress/b27-impl-done.md`（含 S0.5 三段合并表、逐行映射、五维差分与字符量读数）。
+
+### 4.8 生成中的待发送缓冲区（b28）
+
+- **状态**：`SQ = { convId, items }`（`appD`，**内存态、不持久化**；`items[i] = { id, convId, text, at }`）+ `genConvId`（在飞 send 的归属会话）。
+- **归属**：`item.convId` 恒 = 入队时的会话 = `SQ.convId`；flush 目标取 `opts.bufItem.convId`（生成期间允许切走，消息必须落回原会话）；浮窗只在 `conv.id === SQ.convId` 时可见。
+- **顺序面（三处写死，动它们等于重写本机制）**：① `sendMessage` 的 finally 里 **`genConvId = ""` 在 `sqFlushAfterTurn(sendConvId)` 之前**；② flush **同步**调 `sendMessage`（不 await、不 catch），插在 `pvNotifyCheck()` 之前 ⇒ 缓冲消息优先于 E12 自动续跑；③ 出队点唯一（`SQ.items.shift()`），交接期不可召回/丢弃，`sendMessage` 在 push 用户消息之前的所有早退分支统一 `sqRestoreBuf`（幂等）。
+- **入队门**：仅 `generating === true` 且 `conv.id === genConvId` 时入队；附件 `draftFiles` / `office` 解析中一律拒绝 + toast（v1 不支持附件入队）。
+- **UI**：`#send-queue`（`head.part`，贴输入框正上方，`#slash-menu` 的 z-70 之下）；行文本一律 `textContent`；按钮走 `#send-queue-rows` 上的**事件委托**（先例 = `ctx-pop`）；hint 四态（默认 / 等待 / 压缩 / 残留）；`↑`（输入框**完全为空**时）召回最后一条 —— **有意偏离 Kimi 的 busy 门**（空闲也允许召回，否则 `ECOMPACT_ABORT` 残留态无法用 ↑ 恢复）。
+- **可见性重算**：`sqRender()` 挂在 `renderChat()`（`appC`）的两个出口 ⇒ 会话切换 / 删除 / 新建 / 整库替换 / 分支切换自动跟随。
+- **已知缺口（登记）**：`generating = true` 之后、`try` 之前的两处 `await`（`hydrateAttachments` / `cxAutoBeforeSend`）若 reject，条目不回队且 `generating` 卡 true（现码全路径 resolve；加固属 L3 状态机面，另批）。
 
 ## 5. 未来方向
 

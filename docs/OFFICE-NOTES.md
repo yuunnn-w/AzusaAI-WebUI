@@ -117,4 +117,5 @@ worker 路径(真实 `OfficeKit`)与主线程参照(注入库体 + 胶水直接�
   | 文本上限 | 131,072 字符 | `ATTACH_TEXT_MAX`(`appD.part`),与胶水里的 `TEXT_MAX` 必须一致(目前靠注释承诺,无构建期断言) |
 - **加密 OOXML 的识别**靠魔数:加密的 `docx/xlsx/pptx` 会被 Office 另存成 CFB(OLE2)容器 → 见到 `D0 CF 11 E0 A1 B1 1A E1` 直接给「可能已加密或受密码保护」,不去猜密码。
 - **`file://` 下 classic blob worker 可用**(与 Tesseract 的 worker 是同一类路径);worker 里 `importScripts(blob:)` / `fetch(blob:)` 会被浏览器拒绝,所以载荷一律**随 worker 源一起塞进去**,不用 `importScripts`。
+- **`Read` 工具也复用本引擎**：`Read` 遇 doc / docx / ppt / pptx / xls / xlsx 时直接调 `OfficeKit.parse`（与工作区预览同一调用式，不走 `resolveOffice` 的 File+vision+toast 包装）；抽取文本走共享分页内核 `wsLinePageResult`（"文件:…"信息并入末尾状态行、不占行号），文档图片按模型视觉能力附带（单次 ≤4 张、累计 ≤1 MiB）或非视觉（文本为空时）走 OCR。
 - 只在 **Chrome/Edge** 实测;**Safari / Firefox 未实测**(与项目其它内嵌库同一条边界)。

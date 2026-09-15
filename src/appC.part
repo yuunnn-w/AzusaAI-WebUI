@@ -506,6 +506,14 @@ function makeCompactEl(m) {
     if (meta.released) {
       head.appendChild(chip("释放 " + num(meta.released) + " 个附件" + (meta.freedBytes ? " · " + fmtBytes(meta.freedBytes) : "")));
     }
+    /* 摘要输入缩窗 / 尝试次数(§3.9):缩窗 = 摘要覆盖范围不完整,必须如实显示;
+       纯媒体降级(未丢消息)用另一句,避免「丢 0 条」误导 */
+    if (meta.inputShrunk === 1) {
+      head.appendChild(chip(Number(meta.inputDropped) > 0
+        ? "摘要输入曾缩窗（丢 " + num(meta.inputDropped) + " 条）"
+        : "摘要输入曾缩窗（图片降级，未丢消息）"));
+    }
+    if (Number(meta.attempts) > 1) head.appendChild(chip("尝试 " + num(meta.attempts) + " 次"));
     head.appendChild(chip(meta.source === "auto" ? "自动" : (meta.source === "tool" ? "模型调用" : "手动")));
     if (meta.at) head.appendChild(chip(fmtTime(meta.at)));
   }
@@ -651,6 +659,31 @@ function makeCodeEl(lang, text) {
   pre.appendChild(code);
   return pre;
 }
+/* 工具读取的图片(Read 的 m.media):**折叠态不得挂载任何 <img>** —— renderToolCard 每次整卡重建,
+   折叠态挂大 data URL 会在每次重建时反复分配;展开态才赋 src(≤160 px 缩略,点击走 openLightbox) */
+function makeToolMediaRow(m, open) {
+  var row = document.createElement("div");
+  row.className = "tc-media";
+  var list = (m && m.media) || [];
+  if (!open) {
+    row.textContent = list.length + " 张图片(展开查看)";
+    return row;
+  }
+  list.forEach(function (im, i) {
+    if (!im || !im.data) return;
+    var img = document.createElement("img");
+    img.className = "tc-media-img";
+    var name = (im.path || "image") + (im.label ? (" " + im.label) : "") + " (" + (i + 1) + "/" + list.length + ")";
+    img.alt = name;
+    img.title = name;
+    img.src = "data:" + (im.mime || "image/png") + ";base64," + im.data;
+    img.addEventListener("click", function () {
+      openLightbox(img.src, name);
+    });
+    row.appendChild(img);
+  });
+  return row;
+}
 function renderToolCard(host, m) {
   while (host.firstChild) host.removeChild(host.firstChild);
   var st = (m.needsApproval || askUserPending(m)) ? "wait" : (m.status === "ok" ? "ok" :
@@ -726,6 +759,8 @@ function renderToolCard(host, m) {
       : "正在执行…";
     body.appendChild(w);
   }
+  /* 工具读取的图片(Read 的 m.media):折叠态一行文字 / 展开态缩略图(P2-8) */
+  if (m.media && m.media.length) body.appendChild(makeToolMediaRow(m, open));
   if (askUserCard(m)) appendAskBody(body, m);
   card.appendChild(body);
   /* 提交/跳过那一行放在正文之后(独立类 .tc-ask-foot:.tc-ops 没有上内边距,复用它会让按钮贴着正文) */
@@ -956,7 +991,7 @@ function renderChat() {
   var keepTop = elChat.scrollTop;
   while (elChatInner.firstChild) elChatInner.removeChild(elChatInner.firstChild);
   /* 没有会话、或会话还是空的(刚新建):都渲染欢迎页(Logo + 问候 + 推荐问题) */
-  if (!conv || !conv.messages.length) { renderWelcome(); return; }
+  if (!conv || !conv.messages.length) { renderWelcome(); sqRender(); return; }
   for (var i = 0; i < conv.messages.length; i++) {
     var m = conv.messages[i];
     /* 压缩产物(交接总结 / 省略说明)不是真实对话:走独立的摘要气泡,不参与 turnId 合泡 */
@@ -976,6 +1011,7 @@ function renderChat() {
   elChat.scrollTop = keepTop;
   if (!conv.messages.length) scrollToBottom(true);
   if (typeof findState !== "undefined" && findState && findState.kw && !generating) runFind(findState.kw, true);
+  sqRender();     /* 会话切换/删除/新建/整库替换等都会走 renderChat ⇒ 缓冲浮窗随之重算可见性 */
 }
 function welcomeEnvChips() {
   function chip(label, on) {

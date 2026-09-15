@@ -171,5 +171,7 @@ docs/TESS-NOTES.md                    本文件
 `vendor/tess-src/libtest-ocr.html` 只在模板 `libtest-ocr.tmpl.html` 存在时产出 ——
 模板未随仓库保留,所以现行布局里**没有**这个文件。
 
+- **`Read` 工具也复用本引擎**：非视觉模型下，`Read` 的图片、扫描件 PDF 页图、以及"抽不出文本的办公文档图片"都走 `OCRKit.recognize`（输入是**按工具图片上限缩放后的画布 dataURL**，与附件 `maybeOcrImage` 同形）；语言取 `ocrLangs()`；超时是**整次 Read 的总预算**（`READ_OCR_TIMEOUT_MS`=120 s 与 `toolLimit("timeoutMs")` 取小，多页共享、页间检查中止信号），结果里如实标注 OCR / 置信度 / "可能有识别误差"。
+
 第三方许可:tesseract.js / tesseract.js-core —— Apache-2.0;语言数据 tessdata_fast —— Apache-2.0;
 tiny-inflate —— MIT(版权与许可文本已内联在 `.part` 的包装层里)。

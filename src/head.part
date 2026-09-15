@@ -721,6 +721,19 @@ html[data-theme="light"] .hljs-tag { color: #116329; }
   font-size: 11px; font-family: var(--font-mono); color: var(--text-faint);
   min-width: 34px; text-align: center;
 }
+/* 朗读进行中:按钮高亮 + 音量图标轻微脉冲;点同一条消息的按钮、播完、切换/出错都会移除 .on,
+   动画随类一起消失,不留残影 */
+.msg-actions button[data-act="speak"].on {
+  color: var(--accent); border-color: rgba(var(--accent-rgb),.45); background: rgba(var(--accent-rgb),.12);
+}
+.msg-actions button[data-act="speak"].on .icon { animation: speakPulse 1.3s ease-in-out infinite; }
+@keyframes speakPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .5; transform: scale(.86); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-actions button[data-act="speak"].on .icon { animation: none; }
+}
 
 /* 编辑框 */
 .edit-box { margin-top: 4px; }
@@ -874,6 +887,28 @@ html[data-theme="light"] .hljs-tag { color: #116329; }
   border-radius: var(--r-md); box-shadow: var(--shadow-3); padding: 5px;
 }
 #slash-menu.open { display: block; animation: popIn .16s var(--ease); }
+/* 待发送缓冲区浮窗(#slash-menu 先例:同轴同宽、贴输入框正上方;z-69 低于 #slash-menu 的 70)
+   注:.sq-btn 两条规则必须带 #send-queue 作用域 —— 设置面板另有同名类(源序靠后者胜,会静默互相覆盖) */
+#send-queue {
+  position: absolute; left: 0; right: 0; bottom: 100%;
+  width: var(--content-w); max-width: calc(100% - 44px); margin: 0 auto 8px;
+  display: none; z-index: 69;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-md); box-shadow: var(--shadow-3); padding: 5px;
+  max-height: 148px; overflow-y: auto;
+}
+#send-queue.open { display: block; animation: popIn .16s var(--ease); }
+.sq-row { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: var(--r-sm); }
+.sq-row:hover { background: rgba(var(--accent-rgb), .07); }
+.sq-text { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#send-queue .sq-btn { width: 28px; height: 28px; flex: none; border-radius: var(--r-sm); border: none; background: transparent;
+  display: flex; align-items: center; justify-content: center; color: var(--text-faint); cursor: pointer; }
+#send-queue .sq-btn:hover { background: var(--surface-3); color: var(--text); }
+.sq-hint { padding: 3px 8px 5px; font-size: 11px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html[data-density="compact"] .sq-row { padding: 4px 7px; }
+@media (max-width: 560px) { .sq-hint { display: none; } }
 .slash-item {
   display: flex; align-items: baseline; gap: 9px; width: 100%; text-align: left;
   padding: 8px 10px; border-radius: var(--r-sm); border: 1px solid transparent;
@@ -1713,6 +1748,9 @@ html[data-theme="light"] .tool-card {
 }
 .tool-card .tc-lab + pre { margin-bottom: 11px; }
 .tool-card .tc-note { font-size: 11.5px; color: var(--text-dim); line-height: 1.6; margin-bottom: 9px; }
+/* 工具读取的图片(Read 的 m.media):折叠态只出一行文字(零 <img>),展开态才挂缩略图 */
+.tool-card .tc-media { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 11px; font-size: 11.5px; color: var(--text-dim); }
+.tool-card .tc-media-img { max-width: 160px; max-height: 160px; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; }
 .tool-card pre { max-height: calc(var(--code-lines) * 1.6em + 24px); }
 .tool-card.in-reasoning { border-style: dashed; }
 
@@ -2445,6 +2483,11 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
       </div>
       <!-- 斜杠命令浮窗(输入框里打 `/` 时出现;位置由 CSS 贴到输入区正上方) -->
       <div id="slash-menu" role="listbox" aria-label="可用命令"></div>
+      <!-- 待发送缓冲区(生成中回车入队;本轮结束后自动发送;层级低于 #slash-menu) -->
+      <div id="send-queue" role="list" aria-label="待发送消息(本轮结束后自动发送)" hidden>
+        <div class="sq-rows" id="send-queue-rows"></div>
+        <div class="sq-hint" id="send-queue-hint"></div>
+      </div>
       <!-- 调节浮层(生成参数 + 工具开关;位置由 placePopover 贴到按钮正上方) -->
       <div class="popover" id="params-pop" style="width:320px; max-width:calc(100vw - 20px);">
         <div class="pop-title">调节(保存在本地,仅影响之后的请求)</div>

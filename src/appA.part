@@ -92,13 +92,20 @@ var CX_HEAD_TOK = 2000;         // 最早用户输入保留预算(= Kimi COMPACT
 var CX_KEEP_MAX_MSGS = 8;       // 保留尾部最多几条消息(我们的扩展预算,非 Kimi 原值)
 var CX_LOOP_TAIL_MIN = 2;       // 「单用户轮有界 tail 档」要求 tail 至少含这么多个完整工具循环
 var CX_RESERVE_MIN = 16384;     // 冗余触发项下限:reserve = min(max(本值, win*0.05), win*0.5)
-var CX_SUMMARY_MAX_TOK = 8192;  // 摘要请求 max_tokens(独立于 settings.maxTokens;OpenAI / Anthropic 同值)
-var CX_SUMMARY_TIMEOUT_MS = 180000;   // 摘要请求超时(ms)
-var CX_SUMMARY_RETRY = 2;       // 摘要请求失败重试次数(含溢出缩小重试)
-var CX_HISTORY_PART_CAP = 4096; // 摘要输入投影:单条消息文本上限(超限留头+留尾,中间省略)
-var CX_HISTORY_TOTAL_CAP = 120000; // 摘要输入投影总字符上限(超限按「中部省略」处理)
-var CX_HISTORY_HEAD_CAP = 16000;   // 投影头部保留字符数(最早的内容:原始意图 / 约束所在)
+var CX_SUMMARY_TIMEOUT_MS = 900000;   // 摘要请求超时(ms);每次尝试各计。全量输入后 180s 会在长会话误杀 ⇒ 抬到 15 分钟(Esc 可随时取消)
 var CX_MIN_MSGS = 4;            // 少于这么多条消息时拒绝压缩(可压缩内容不足)
+/* ---- 摘要请求的预算 / 重试链(对齐 Kimi fullCompaction;口径见 shared/specs/compact-align-kimi-plan.md §3.2/§3.4) ---- */
+var CX_SUMMARY_OUT_CAP = 131072;        // 摘要输出预算封顶(= Kimi DEFAULT_COMPACTION_MAX_COMPLETION_TOKENS = 128*1024)
+var CX_SUMMARY_OUT_MIN = 4096;          // 适配收窄的下限(连最小预算都放不下 ⇒ 改缩输入,不再压预算)
+var CX_SUMMARY_ATTEMPTS_MAX = 5;        // 摘要请求总尝试上限(= Kimi MAX_COMPACTION_RETRY_ATTEMPTS)
+var CX_SUMMARY_SHRINK_RATIOS = [0.7, 0.5, 0.35];  // 溢出缩窗比例(= Kimi COMPACTION_OVERFLOW_SHRINK_RATIOS)
+var CX_SUMMARY_SHRINK_MAX = 3;          // 缩窗次数上限(= Kimi MAX_COMPACTION_OVERFLOW_SHRINK_ATTEMPTS)
+var CX_SUMMARY_BACKOFF_BASE_MS = 500;   // 可重试错误的退避基数(= Kimi _base/utils/retry.ts)
+var CX_SUMMARY_BACKOFF_MAX_MS = 32000;  // 退避上限
+var CX_SUMMARY_BACKOFF_JITTER = 0.25;   // 退避抖动(0~25% 正向)
+var CX_SUMMARY_FIT_MARGIN_RATIO = 0.05; // estInput 余量比例(配套下限 1024,见 cxSummaryBudget)
+var CX_SUMMARY_MEDIA_KEEP_RECENT = 2;   // 媒体降级档保留最近几张图(= Kimi MEDIA_DEGRADE_KEEP_RECENT)
+var CX_SUMMARY_MEDIA_MAX_BYTES = 32 * 1024 * 1024;  // 媒体体积闸(本项目的扩展,非 Kimi 原值):起步即 degraded 档
 /* 最大输出滑块上限 384K;Anthropic 协议必须带 max_tokens,未设置时用 256K */
 var MAX_TOK_LIMIT = 393216;
 var ANTHROPIC_DEFAULT_MAXTOK = 262144;
@@ -305,7 +312,8 @@ function sanitizeConv(c) {
     if (!cm || typeof cm !== "object" || Array.isArray(cm)) delete c.compactMeta;
     else if (cm.source !== "manual" && cm.source !== "auto" && cm.source !== "tool") delete c.compactMeta;
     else {
-      var CM_NUMS = ["at", "dropped", "droppedTokens", "before", "after", "released", "freedBytes", "ms"];
+      var CM_NUMS = ["at", "dropped", "droppedTokens", "before", "after", "released", "freedBytes", "ms",
+        "attempts", "shrinks", "inputDropped", "inputShrunk", "mediaLevel"];
       CM_NUMS.forEach(function (k) {
         if (typeof cm[k] !== "number" || !isFinite(cm[k])) cm[k] = 0;
       });
@@ -320,6 +328,29 @@ function sanitizeConv(c) {
     if (!Array.isArray(m.alternates)) { delete m.alternates; delete m.altIndex; }
     else if (typeof m.altIndex !== "number" || m.altIndex < 0 || m.altIndex >= m.alternates.length) {
       m.altIndex = 0;
+    }
+    /* 工具读取的图片(m.media):内联 base64 ⇒ 只做类型校验(半损坏的备份不许拖爆页面)。
+       **以 bytes 为主校验**(≤ 单张硬顶 READ_IMG_HARD_MAX),data.length 只作上界兜底
+       (base64 ≈ 4/3,给 2× + 256 的余量,仍能挡住半损坏巨串);坏元素删除、空数组删字段,
+       消息本身照常保留。缺字段 = 无媒体(不创建字段,老会话语义不变)。 */
+    if (m.media !== undefined) {
+      if (!Array.isArray(m.media)) delete m.media;
+      else {
+        var keep = [], mi;
+        for (mi = 0; mi < m.media.length; mi++) {
+          var im = m.media[mi];
+          if (!im || typeof im !== "object") continue;
+          if (typeof im.mime !== "string" || !im.mime) continue;
+          if (typeof im.data !== "string" || !im.data) continue;
+          if (typeof im.bytes !== "number" || !isFinite(im.bytes) || im.bytes <= 0) continue;
+          if (typeof im.w !== "number" || !isFinite(im.w) || im.w <= 0) continue;
+          if (typeof im.h !== "number" || !isFinite(im.h) || im.h <= 0) continue;
+          if (im.bytes > READ_IMG_HARD_MAX) continue;
+          if (im.data.length > im.bytes * 2 + 256) continue;
+          keep.push(im);
+        }
+        if (keep.length) m.media = keep; else delete m.media;
+      }
     }
   });
   return c;
@@ -1443,7 +1474,8 @@ function contentToDisplay(content) {
   }
   return out.join("\n");
 }
-/* 上下文估算:一张图按 ~900 token 粗算(比 "[图像]" 三个字准得多) */
+/* 上下文估算:一张图按 ~900 token 粗算(比 "[图像]" 三个字准得多);
+   工具消息上的内联媒体不走这里 —— 见 estimateToolMediaTokens(实测拟合口径) */
 function estimateContentTokens(content) {
   if (!Array.isArray(content)) return estimateTokens(contentToText(content)) + 4;
   var n = 4;
@@ -1452,6 +1484,20 @@ function estimateContentTokens(content) {
     if (!c) continue;
     if (c.type === "image_url" || c.type === "image") n += 900;
     else if (c.type === "text") n += estimateTokens(c.text || "");
+  }
+  return n;
+}
+/* 工具消息上的媒体(token 估算;实测拟合 tokens ≈ max(1026, round(W×H/1024)),见方案 §2):
+   **调用点清单(跨批契约 §3.12-2)**:① payloadMessages 的 token 循环;② b25 的 cxPayloadMsgTokens
+   (其三处消费自动继承)。新增任何「对消息序列做 token 估算」的代码路径都必须经这两处之一。 */
+function estimateToolMediaTokens(m) {
+  var arr = (m && Array.isArray(m.media)) ? m.media : null;
+  if (!arr || !arr.length) return 0;
+  var n = 0;
+  for (var i = 0; i < arr.length; i++) {
+    var im = arr[i] || {};
+    var w = Number(im.w) || 0, h = Number(im.h) || 0;
+    n += Math.max(1026, Math.round(w * h / 1024));
   }
   return n;
 }

@@ -532,6 +532,169 @@ function transcodeImage(dataUrl, mime) {
     return { mime: outMime, data: dataUrlPayload(out), w: cw, h: ch, scaled: tooBig, resample: tooBig ? mode : "" };
   });
 }
+/* ---- 工具读取图片(Read)专用的尺寸嗅探 / fit(§3.5) ----
+   与附件侧 transcodeImage 同源(loadImageEl/downscaleImage/canvas)但预算更严、且多两道解码护栏:
+   像素门(先按尺寸头嗅探,不进解码)+ 字节门。READ_* 常量在 appE(本段之后)⇒ 只在函数体内取。 */
+/* 尺寸头嗅探(PNG/JPEG/GIF/BMP/WebP;Kimi sniffImageDimensions 同法):只读头部几十字节,零解码成本。
+   嗅不到(avif/ico/损坏/截断)返回 null ⇒ 调用方在解码后用 naturalWidth/Height 复核像素门 */
+function wsImgSniffDims(buf, mime) {
+  var u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf || new ArrayBuffer(0));
+  function u16be(o) { return (u8[o] << 8) | u8[o + 1]; }
+  function u32be(o) { return (u8[o] * 16777216) + (u8[o + 1] << 16) + (u8[o + 2] << 8) + u8[o + 3]; }
+  function u16le(o) { return u8[o] | (u8[o + 1] << 8); }
+  function u32le(o) { return u8[o] + (u8[o + 1] << 8) + (u8[o + 2] << 16) + (u8[o + 3] * 16777216); }
+  if (u8.length >= 24 && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) {
+    return { w: u32be(16), h: u32be(20) };                                   /* PNG:IHDR 宽高(大端) */
+  }
+  if (u8.length >= 10 && u8[0] === 0x47 && u8[1] === 0x49 && u8[2] === 0x46) {
+    return { w: u16le(6), h: u16le(8) };                                     /* GIF:GIF8 + 逻辑屏宽高(小端) */
+  }
+  if (u8.length >= 26 && u8[0] === 0x42 && u8[1] === 0x4d) {
+    return { w: u32le(18), h: u32le(22) };                                   /* BMP:BITMAPINFOHEADER 宽高(小端) */
+  }
+  if (u8.length >= 30 && u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46 &&
+      u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 && u8[11] === 0x50) {
+    if (u8[12] === 0x56 && u8[13] === 0x50 && u8[14] === 0x38 && u8[15] === 0x58) {   /* VP8X */
+      return { w: 1 + (u8[24] | (u8[25] << 8) | (u8[26] << 16)), h: 1 + (u8[27] | (u8[28] << 8) | (u8[29] << 16)) };
+    }
+    if (u8[12] === 0x56 && u8[13] === 0x50 && u8[14] === 0x38 && u8[15] === 0x4c) {   /* VP8L(无损耗) */
+      var b0 = u8[21], b1 = u8[22], b2 = u8[23], b3 = u8[24];
+      return { w: 1 + (((b1 & 0x3f) << 8) | b0), h: 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6)) };
+    }
+    if (u8[12] === 0x56 && u8[13] === 0x50 && u8[14] === 0x38 && u8[15] === 0x20) {   /* VP8(有损耗) */
+      return { w: u16le(26) & 0x3fff, h: u16le(28) & 0x3fff };
+    }
+    return null;
+  }
+  if (u8.length >= 4 && u8[0] === 0xff && u8[1] === 0xd8) {                  /* JPEG:逐段找 SOFn */
+    var o = 2;
+    while (o + 9 < u8.length) {
+      if (u8[o] !== 0xff) { o++; continue; }
+      var mk = u8[o + 1];
+      if (mk === 0xd8 || mk === 0x01 || (mk >= 0xd0 && mk <= 0xd7)) { o += 2; continue; }
+      var len = u16be(o + 2);
+      if (len < 2) return null;
+      if (mk >= 0xc0 && mk <= 0xcf && mk !== 0xc4 && mk !== 0xc8 && mk !== 0xcc) {
+        return { w: u16be(o + 7), h: u16be(o + 5) };
+      }
+      o += 2 + len;
+    }
+    return null;
+  }
+  return null;
+}
+/* 工具读取图片的统一 fit(§3.5;语义照 Kimi 三原则:直通优先 / 梯度压缩 / 压不动给原图):
+   0) 解码门:字节门(32 MiB)+ 尺寸头嗅探的像素门(40M px,嗅不到者解码后复核);
+   1) 直通:字节 ≤ 256 KiB 且最长边 ≤ min(2000, imgMaxSide()) 且 mime ∈ SAFE_IMG_MIME ⇒ 原字节交付;
+   2) 否则解码 → 等比缩到上限 → PNG(保 alpha 时)/JPEG 质量梯度 + 边长回退阶梯;
+   3) 最终字节 ≥ 原字节且边长没变小 ⇒ 回退原字节(不交付更差的版本;仅限源 mime ∈ SAFE_IMG_MIME,
+      否则交付最佳重编码 —— 交付 mime 必须落在下面第 5 条的集合里);
+   4) 全梯仍 > 单张硬顶(1 MiB)⇒ 报错,**不发原图**;
+   5) 交付 mime 只允许 {image/png,image/jpeg}(重编码)∪ SAFE_IMG_MIME(直通)。 */
+function wsImgFitForModel(blob, mime, opts) {
+  opts = opts || {};
+  var maxEdge = opts.maxEdge || READ_IMG_MAX_EDGE;
+  var budget = opts.budget || READ_IMG_BYTE_BUDGET;
+  var hardMax = opts.hardMax || READ_IMG_HARD_MAX;
+  var decodeMax = opts.decodeMax || READ_IMG_DECODE_MAX;
+  var maxPx = opts.maxPx || READ_IMG_DECODE_MAX_PX;
+  var mimeIn = String(mime || "");
+  var size = (blob && blob.size) || 0;
+  function fail(msg) { return { ok: false, error: msg }; }
+  function origBytes(w0, h0) {
+    return wsBlobBuffer(blob).then(function (ab) {
+      return { ok: true, mime: mimeIn, data: abToBase64(ab), w: w0, h: h0, bytes: size,
+               srcW: w0, srcH: h0, scaled: false, direct: true };
+    });
+  }
+  if (!blob || !size) return Promise.resolve(fail("图片内容为空"));
+  if (size > decodeMax) {
+    return Promise.resolve(fail("图片过大(" + fmtBytes(size) + "),超过本工具的图片处理上限(" + fmtBytes(decodeMax) +
+      ");可用 ExecutePython(已装 Pillow)先缩小/裁剪,再 Read 那份小图"));
+  }
+  return readAs(blob.slice(0, Math.min(size, 65536)), "buffer").then(function (buf) {
+    var dims = wsImgSniffDims(buf, mimeIn);
+    if (dims && dims.w > 0 && dims.h > 0 && dims.w * dims.h > maxPx) {
+      return fail("图片像素过大(" + dims.w + "×" + dims.h + " ≈ " + Math.round(dims.w * dims.h / 1000000) +
+        "M 像素,上限 " + Math.round(maxPx / 1000000) + "M);可用 ExecutePython(已装 Pillow)先缩小/裁剪,再 Read 那份小图");
+    }
+    var edgeLimit = Math.min(maxEdge, imgMaxSide());
+    var direct = !!(dims && dims.w > 0 && dims.h > 0 && size <= budget &&
+        Math.max(dims.w, dims.h) <= edgeLimit && SAFE_IMG_MIME[mimeIn]);
+    if (!direct && !canvasOK()) return fail("当前浏览器不支持图片处理(canvas),无法读取这张图片");
+    if (!CAP.objectUrl) {
+      /* 无法解码验证:直通候选按原字节交付(旧行为),其余明确失败 */
+      if (direct) return origBytes(dims.w, dims.h);
+      return fail("当前浏览器不支持图片读取(URL.createObjectURL),无法读取这张图片");
+    }
+    var url = null;
+    return loadImageEl((url = URL.createObjectURL(blob))).then(function (img) {
+      var w0 = img.naturalWidth || img.width, h0 = img.naturalHeight || img.height;
+      if (!w0 || !h0) throw new Error("图片尺寸无效");
+      if (w0 * h0 > maxPx) throw new Error("PIXEL:" + w0 + "×" + h0);
+      /* 直通:验证确可解码后**仍交付原字节**(不重编码、不掉画质)—— 这一步同时挡住"截断/损坏但
+         IHDR 还写着小尺寸"的假直通(方案 §3.10 的 /broken.png 反例:R5) */
+      if (direct) return origBytes(w0, h0);
+      var scale = Math.min(1, edgeLimit / Math.max(w0, h0));
+      var tw = Math.max(1, Math.round(w0 * scale)), th = Math.max(1, Math.round(h0 * scale));
+      var keepAlpha = /png|gif|webp|bmp|avif|ico|tiff/i.test(mimeIn);
+      var mode = imgResampleMode();
+      var e0 = Math.max(tw, th), edges = [], cand = [e0, 1000, 768, 512, 384, 256], i, j;
+      for (i = 0; i < cand.length; i++) if (cand[i] <= e0 && edges.indexOf(cand[i]) < 0) edges.push(cand[i]);
+      var tryList = [];
+      if (keepAlpha) tryList.push(["image/png", null]);
+      tryList.push(["image/jpeg", 0.8], ["image/jpeg", 0.6], ["image/jpeg", 0.4]);
+      var best = null;
+      for (i = 0; i < edges.length; i++) {
+        var k = edges[i] / e0;
+        var cw = Math.max(1, Math.round(tw * k)), chh = Math.max(1, Math.round(th * k));
+        var canvas = downscaleImage(img, cw, chh, mode, keepAlpha);
+        for (j = 0; j < tryList.length; j++) {
+          var encMime = tryList[j][0], q = tryList[j][1], dataUrl = "";
+          try { dataUrl = (q == null) ? canvas.toDataURL(encMime) : canvas.toDataURL(encMime, q); }
+          catch (e3) { continue; }
+          if (!dataUrl || dataUrl.indexOf("data:") !== 0) continue;
+          var payload = dataUrlPayload(dataUrl);
+          var bytes = Math.round(payload.length * 3 / 4);
+          if (bytes > hardMax) continue;                       /* 单张硬顶:超过即不采 */
+          if (!best || bytes < best.bytes) best = { mime: encMime, data: payload, w: cw, h: chh, bytes: bytes };
+          if (bytes <= budget) break;
+        }
+        if (best && best.bytes <= budget) break;
+      }
+      if (!best) throw new Error("ENCODE");
+      if (best.bytes >= size && best.w >= w0 && best.h >= h0) {   /* 压不动:回退原字节(仍受硬顶约束) */
+        /* 但源 mime 不在 SAFE 集时**不回退**:交付 mime 必须收敛到 {png,jpeg} ∪ SAFE_IMG_MIME,
+           宁可交付略大的重编码,也不把下游(接口/模型侧)不认的格式递出去(best ≤ hardMax,见上循环) */
+        if (SAFE_IMG_MIME[mimeIn]) {
+          if (size > hardMax) throw new Error("HUGE");
+          return origBytes(w0, h0);
+        }
+      }
+      if (best.bytes > hardMax) throw new Error("HUGE");
+      return { ok: true, mime: best.mime, data: best.data, w: best.w, h: best.h, bytes: best.bytes,
+               srcW: w0, srcH: h0, scaled: (best.w < w0 || best.h < h0) };
+    }).then(function (r) {
+      if (url) { try { URL.revokeObjectURL(url); } catch (e4) {} }
+      return r;
+    }, function (e) {
+      if (url) { try { URL.revokeObjectURL(url); } catch (e4) {} }
+      var msg = wsMsg(e);
+      if (msg.indexOf("PIXEL:") === 0) {
+        return fail("图片像素过大(" + msg.slice(6) + "),超过本工具的图片处理上限;可用 ExecutePython(已装 Pillow)先缩小/裁剪,再 Read 那份小图");
+      }
+      if (msg === "HUGE") {
+        return fail("已按最大压缩仍超出本工具图片上限(" + fmtBytes(hardMax) + ");请先裁剪/缩小后再 Read(可用 ExecutePython 的 Pillow)");
+      }
+      if (msg === "ENCODE" || /无法解码|尺寸无效/.test(msg)) {
+        /* 解不开的常见是 TIFF(浏览器 <img> 不支持):文案里点名,并给出 Pillow 逃生舱 */
+        var label = (/tiff?/i.test(mimeIn) || /\.tiff?$/i.test(String(opts.path || ""))) ? "TIFF" : "";
+        return fail("浏览器无法解码这张图片(" + (label || mimeIn || "未知格式") + ");可用 ExecutePython 的 Pillow 转成 PNG/JPEG 后再 Read");
+      }
+      return fail("图片处理失败:" + msg);
+    });
+  });
+}
 
 /* ---- 自定义标签页图标(设置 → 外观):解码 → 居中剪方 → ≤FAVICON_MAX_SIDE(不放大)→ PNG ----
    用户原始文件(含 SVG 里的脚本)全程只经过 FileReader → <img> → canvas → toDataURL,
@@ -1219,7 +1382,7 @@ function attachmentParts(f, proto) {
     out.push({
       type: "text",
       attach: attachMetaOf(f),
-      text: "文件:" + f.name + "(PDF,共 " + (f.pages || 1) + " 页" + (f.clipped ? ",已截断" : "") + ")\n\n" + (f.text || "")
+      text: "文件:" + f.name + "(PDF · 共 " + (f.pages || 1) + " 页" + (f.clipped ? " · 已截断" : "") + ")\n\n" + (f.text || "")
     });
     return out;
   }
@@ -1239,12 +1402,12 @@ function attachmentParts(f, proto) {
     }
     if (f.text) {
       var info = String(f.subtype || "").toUpperCase();
-      if (f.unit === "页" && f.pages) info += ",共 " + f.pages + " 页";
-      else if (f.unit === "表" && f.pages) info += ",共 " + f.pages + " 表";
-      else info += ",文本 " + f.textChars + " 字";
-      if (f.imgCount) info += "," + f.imgCount + " 图";
-      if (!f.imgCount && (f.subtype === "doc" || f.subtype === "ppt")) info += ",仅文本";
-      if (f.clipped) info += ",已截断";
+      if (f.unit === "页" && f.pages) info += " · 共 " + f.pages + " 页";
+      else if (f.unit === "表" && f.pages) info += " · 共 " + f.pages + " 表";
+      else info += " · 文本 " + f.textChars + " 字";
+      if (f.imgCount) info += " · " + f.imgCount + " 图";
+      if (!f.imgCount && (f.subtype === "doc" || f.subtype === "ppt")) info += " · 仅文本";
+      if (f.clipped) info += " · 已截断";
       out.push({
         type: "text",
         attach: attachMetaOf(f),
@@ -1255,11 +1418,12 @@ function attachmentParts(f, proto) {
   }
   var body = String(f.text || "");
   var fence = body.indexOf("```") > -1 ? "````" : "```";
+  var tinfo = [f.enc ? ("编码 " + wsEncName(f.enc) + " · 已转码显示") : "", f.clipped ? "内容过长 · 已截断" : ""]
+    .filter(Boolean).join(" · ");
   out.push({
     type: "text",
     attach: attachMetaOf(f),
-    text: "文件:" + f.name + (f.enc ? "(编码:" + wsEncName(f.enc) + ",已转码显示)" : "") +
-      (f.clipped ? "(内容过长,已截断)" : "") + "\n" +
+    text: "文件:" + f.name + (tinfo ? "(" + tinfo + ")" : "") + "\n" +
       fence + "\n" + body + "\n" + fence
   });
   return out;
@@ -1458,13 +1622,179 @@ async function cxAutoBeforeSend(tf) {
     }
     return { ok: false, code: code, compacted: false, text: "" };
   }
-  toast("自动压缩失败:" + cxCodeText(code) + " —— 本轮照常继续", "warn", 6000);
+  toast("自动压缩失败:" + cxCodeText(code, false, r && r.note) + " —— 本轮照常继续", "warn", 6000);
   return { ok: false, code: code, compacted: false, text: "" };
 }
 /* 轮次之间的检查点:同一判定(去重 / 限流 / 降噪一致) */
 async function cxAutoBetweenRounds(tf) {
   var r = await cxAutoBeforeSend(tf);
   return r || { ok: false, code: "", compacted: false, text: "" };
+}
+/* ---- 生成中的待发送缓冲区(内存 · 单槽 · 多项 · 按会话归属) ----
+   用户原话:Agent 循环工作期间回车 → 文本进缓冲区(输入框上方浮窗),本轮(含全部工具轮)结束后
+   立即自动发送并继续对话;循环结束前可召回(编辑按钮 / ↑)或丢弃。条目不持久化(刷新即失,与 Kimi
+   的内存队列对齐)。同一时刻只有一个在飞 send(模块级 generating 是全局单飞)⇒ 只留一个会话槽。
+   item = { id, convId, text, at };convId = **入队时**那条会话 —— 生成期间允许切走会话,
+   缓冲消息必须落回它入队时那一条(读侧见 sendMessage 的 opts.bufItem.convId)。 */
+var SQ = { convId: "", items: [] };
+var genConvId = "";        /* 在飞 send 的归属会话:sendMessage 同步段写;finally 里**先清再 flush** */
+function sqHasItems() { return !!(SQ && SQ.items && SQ.items.length); }
+function sqHasFor(convId) { return !!(convId && SQ.convId === convId && SQ.items.length); }
+/* 上下文用量环:把缓冲文本当成"待发送草稿"的一部分,文本从输入框移进缓冲时读数不跳变 */
+function sqDraftTokens(c) {
+  if (!c || !conv || c.id !== conv.id || !sqHasItems()) return 0;
+  var n = 0, i;
+  for (i = 0; i < SQ.items.length; i++) n += estimateTokens(SQ.items[i].text || "");
+  return n;
+}
+/* 生成中回车 → 入队(唯一入口;空文本不动作,保持"空 Enter 无效果") */
+function sqEnqueueFromInput() {
+  var text = elInput.value.trim();
+  if (!text) return;
+  /* 只有"入队时那条会话"能入队:生成期间切走后回车不该悄悄塞进别人的队列 */
+  if (!conv || conv.id !== genConvId) {
+    toast("另一条会话正在生成中,本条消息未发送", "warn", 4200);
+    return;
+  }
+  if (pendingOffice.length) {
+    toast("办公文档还在本机解析中,完成后才能发送(点附件上的 ✕ 可取消)", "warn", 3600);
+    return;
+  }
+  if (draftFiles.length) {   /* v1 不支持附件入队(文本与附件都不动,不产生半截状态) */
+    toast("生成中:带附件的消息请等本轮结束后再发送(文字与附件都保留在输入框)", "warn", 4600);
+    return;
+  }
+  /* 槽与条目在同一个同步段写入,convId 用同一个值(I2 强化:每项 convId 恒 = SQ.convId) */
+  SQ.convId = genConvId;
+  SQ.items.push({ id: uid(), convId: genConvId, text: text, at: Date.now() });
+  elInput.value = "";
+  autoResize();
+  updateCtxMeter();
+  sqRender();
+  focusInput();
+}
+/* 早退回队(幂等):同一 item 重复调用只放回一次,防"交接期异常 → 重复发送" */
+function sqRestoreBuf(item) {
+  if (!item || !item.id) return;
+  for (var i = 0; i < SQ.items.length; i++) if (SQ.items[i].id === item.id) { sqRender(); return; }
+  if (!SQ.convId) SQ.convId = item.convId || "";
+  SQ.items.unshift(item);
+  sqRender();
+}
+/* 召回(编辑按钮 & ↑ 共用):严格镜像 Kimi 的"编辑器完全为空"判定(D4,不 trim) */
+function sqRecall(itemId) {
+  if (elInput.value.length !== 0) {
+    toast("输入框里还有内容,先清空再召回(避免覆盖草稿)", "warn", 3600);
+    return;
+  }
+  var i, it = null;
+  for (i = 0; i < SQ.items.length; i++) if (SQ.items[i].id === itemId) { it = SQ.items[i]; break; }
+  if (!it) return;
+  SQ.items.splice(i, 1);
+  elInput.value = it.text;
+  autoResize();
+  updateCtxMeter();
+  sqRender();
+  focusInput();
+}
+function sqDiscard(itemId) {
+  for (var i = 0; i < SQ.items.length; i++) {
+    if (SQ.items[i].id === itemId) { SQ.items.splice(i, 1); break; }
+  }
+  updateCtxMeter();
+  sqRender();
+}
+/* 残留态(未生成但队列非空)的手动恢复路径:唯一入口 = 空 Enter(hint 明示) */
+function sqSendableIdle() {
+  return !generating && sqHasItems() && !!conv && conv.id === SQ.convId &&
+    !elInput.value.trim() && !draftFiles.length;
+}
+function sqSendHead() {
+  if (generating || !sqSendableIdle()) return;
+  var it = SQ.items.shift();
+  sqRender();
+  sendMessage(it.text, { bufItem: it });
+}
+/* 回合结束后的自动发送:取队首 1 条,**同步**调 sendMessage(不 await、不 catch —— 错误在
+   sendMessage 既有链路里 toast)。它的同步段会把 generating 置回 true ⇒ 紧随的 pvNotifyCheck()
+   命中 "if (generating) return" 自动让位(缓冲是用户内容,优先于 E12 自动续跑) */
+function sqFlushAfterTurn(endedConvId) {
+  if (generating) return;
+  if (!sqHasItems()) return;
+  if (SQ.convId !== endedConvId) return;
+  if (!getConv(SQ.convId)) {                 /* 目标会话已删(或整库替换拿走):整槽丢弃 */
+    SQ.items = []; SQ.convId = "";
+    sqRender();
+    toast("该对话已被删除,待发送消息已丢弃", "warn", 5000);
+    return;
+  }
+  if (!effectiveModel().trim() || !apiUrl("")) {   /* 廉价前置校验:不出队、留待用户动作 */
+    sqRender();
+    toast("待发送消息已保留:配置好模型 / Base URL 后按 Enter 或召回发送", "warn", 5200);
+    return;
+  }
+  var it = SQ.items.shift();                 /* 交接即出队 */
+  sqRender();
+  sendMessage(it.text, { bufItem: it });
+}
+function sqHintText() {
+  if (!generating && sqHasItems()) return "按 Enter 立即发送";
+  if ((typeof ASK_WAITS !== "undefined" && ASK_WAITS && Object.keys(ASK_WAITS).length) ||
+      (typeof TOOL_WAITS !== "undefined" && TOOL_WAITS && Object.keys(TOOL_WAITS).length)) {
+    return "正在等你回答 / 放行,之后自动发送";
+  }
+  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") return "压缩完成后自动发送";
+  return "本轮结束后自动发送 · Esc 不取消待发送 · ↑ 召回最后一条 · 可编辑 / 丢弃";
+}
+/* 浮窗渲染(清空重建;调用点 = 入队/召回/丢弃/交接 + renderChat 两个出口) */
+function sqRender() {
+  var box = $("send-queue"), rows = $("send-queue-rows"), hint = $("send-queue-hint");
+  if (!box || !rows || !SQ || !SQ.items) return;
+  var show = SQ.items.length > 0 && !!conv && conv.id === SQ.convId;   /* I6:只在归属会话可见 */
+  while (rows.firstChild) rows.removeChild(rows.firstChild);           /* 先清空:隐藏时不留残留 DOM */
+  if (!show) {
+    box.classList.remove("open");
+    box.setAttribute("hidden", "");
+    return;
+  }
+  SQ.items.forEach(function (it) {
+    var row = document.createElement("div");
+    row.className = "sq-row";
+    row.setAttribute("role", "listitem");
+    row.setAttribute("data-id", it.id);
+    var t = document.createElement("span");
+    t.className = "sq-text";
+    t.textContent = it.text;             /* 一律 textContent:缓冲文本可能含标签 */
+    t.title = it.text;
+    row.appendChild(t);
+    var be = document.createElement("button");
+    be.className = "sq-btn"; be.type = "button";
+    be.setAttribute("data-sq-act", "edit");
+    be.setAttribute("aria-label", "编辑这条待发送消息");
+    be.innerHTML = icon("edit", "sm");
+    row.appendChild(be);
+    var bd = document.createElement("button");
+    bd.className = "sq-btn"; bd.type = "button";
+    bd.setAttribute("data-sq-act", "discard");
+    bd.setAttribute("aria-label", "丢弃这条待发送消息");
+    bd.innerHTML = icon("trash", "sm");
+    row.appendChild(bd);
+    rows.appendChild(row);
+  });
+  if (!rows.__sqBound) {                /* 事件委托一次绑定(先例 = ctx-pop 的 click 委托) */
+    rows.__sqBound = true;
+    rows.addEventListener("click", function (e) {
+      var btn = (e.target && e.target.closest) ? e.target.closest("[data-sq-act]") : null;
+      if (!btn) return;
+      var row = btn.closest(".sq-row");
+      var id = row ? row.getAttribute("data-id") : "";
+      if (!id) return;
+      if (btn.getAttribute("data-sq-act") === "edit") sqRecall(id); else sqDiscard(id);
+    });
+  }
+  if (hint) hint.textContent = sqHintText();
+  box.classList.add("open");
+  box.removeAttribute("hidden");
 }
 function doSend() {
   if (generating) return;
@@ -1700,22 +2030,118 @@ function safeJson(text, limit) {
   return text.length > (limit || 400) ? text.slice(0, limit || 400) + "…" : text;
 }
 
-/* 组装将要发送的消息(带上下文裁剪) */
-function payloadMessages(baseList) {
+/* ---- 工具媒体进请求的三种装配(单一来源;§3.4/§3.8.3) ----
+   · trimToolMediaForRequest:聊天轮软护栏(非破坏性;摘要请求不调用);
+   · stripToolMediaForWire:结构类 4xx 降级(noToolMedia)时去掉 media(工具文本照发);
+   · expandToolMediaForOpenAI:OpenAI 兼容形态,按工具轮分组插一条合成 user(只进请求体)。
+   常量(TOOL_MEDIA_CHAT_*)在 appE(本段之后)⇒ 只在函数体内取,不在模块级读。 */
+function trimToolMediaForRequest(list) {
+  var keepN = TOOL_MEDIA_CHAT_KEEP_ITEMS, maxBytes = TOOL_MEDIA_CHAT_MAX_BYTES;
+  var idx = [], i, j;
+  for (i = 0; i < list.length; i++) {
+    var m = list[i];
+    if (m && m.role === "tool" && m.media && m.media.length) idx.push(i);
+  }
+  if (!idx.length) return list;
+  var keepFrom = Math.max(0, idx.length - keepN);      /* 只裁**更早**的:当前工具轮的图永不被裁 */
+  var cut = {}, bytes = 0, any = false;
+  for (i = idx.length - 1; i >= 0; i--) {
+    var it = list[idx[i]], sz = 0;
+    for (j = 0; j < it.media.length; j++) sz += String((it.media[j] && it.media[j].data) || "").length;
+    if (i >= keepFrom && bytes + sz <= maxBytes) { bytes += sz; continue; }
+    cut[idx[i]] = true; any = true;
+  }
+  if (!any) return list;
+  var out = list.slice();
+  for (var k in cut) {
+    if (!Object.prototype.hasOwnProperty.call(cut, k)) continue;
+    var src = out[k], copy = {}, key;
+    for (key in src) if (Object.prototype.hasOwnProperty.call(src, key) && key !== "media") copy[key] = src[key];
+    copy.content = String(src.content == null ? "" : src.content) + "\n[图像已省略:超出请求体积上限,需要时可重新读取]";
+    out[k] = copy;
+  }
+  return out;
+}
+function stripToolMediaForWire(list) {
+  var out = [], changed = false, i, key;
+  for (i = 0; i < list.length; i++) {
+    var m = list[i];
+    if (m && m.role === "tool" && m.media && m.media.length) {
+      var copy = {};
+      for (key in m) if (Object.prototype.hasOwnProperty.call(m, key) && key !== "media") copy[key] = m[key];
+      out.push(copy); changed = true;
+    } else out.push(m);
+  }
+  return changed ? out : list;
+}
+/* OpenAI 兼容:tool 消息 content 只认字符串 ⇒ 把同一工具轮(连续 role==="tool" 段)的媒体合并成
+   **一条**合成 user 消息,插在该段最后一条 tool 之后(跨段不合并 ⇒ 不产出 tool→user→tool 交错)。
+   非破坏性:带 media 的项浅拷贝并删掉内部 media 字段(msgList 与 payload 共享对象,就地删会把
+   下一轮的图也删掉);合成消息只在请求体里存在:不落盘、不进界面、文案写明「这不是用户的新提问」。 */
+function expandToolMediaForOpenAI(list) {
+  var out = [], i;
+  for (i = 0; i < list.length; i++) {
+    var m = list[i];
+    if (!m || m.role !== "tool" || !m.media || !m.media.length) { out.push(m); continue; }
+    var j = i, media = [], paths = [];
+    while (j < list.length && list[j] && list[j].role === "tool") {
+      var src = list[j];
+      if (src.media && src.media.length) {
+        var copy = {}, key;
+        for (key in src) if (Object.prototype.hasOwnProperty.call(src, key) && key !== "media") copy[key] = src[key];
+        out.push(copy);
+        for (var k = 0; k < src.media.length; k++) {
+          var im = src.media[k] || {};
+          media.push(im);
+          if (im.path) paths.push(im.path);
+          else if (im.label) paths.push(im.label);
+        }
+      } else out.push(src);
+      j++;
+    }
+    if (media.length) {
+      var parts = [{ type: "text", text: "以下是 Read 工具读取的 " + media.length + " 个文件" +
+        (paths.length ? "(" + paths.join("、") + ")" : "") + "的图片内容,请据此继续完成任务(这不是用户的新提问)" }];
+      for (var q = 0; q < media.length; q++) parts.push(imagePartFor("openai", media[q].mime, media[q].data, null));
+      out.push({ role: "user", content: parts });
+    }
+    i = j - 1;
+  }
+  return out;
+}
+/* 结构类 4xx 分类器(与 b25 cxIsOverflowError 同范式:显式状态码集合 + 显式正则):
+   只匹配「消息/工具结构」类报文,不误伤配额 / 鉴权 / 模型不存在(那三类走既有失败路径) */
+function isToolMediaStructureError(err) {
+  if (!err) return false;
+  var st = Number(err.__httpStatus);
+  if (st !== 400 && st !== 422) return false;
+  return /tool_call|tool_calls|tool_use|tool_result|tool role|messages\[\d+\]|Invalid.*(tool|content|message)|content.*(type|must)|unexpected.*(role|content)/i.test(String(err.message || ""));
+}
+
+/* 组装将要发送的消息(带上下文裁剪)。
+   opts(缺省 undefined ⇒ 既有行为逐字节不变):
+     noCap : true = 绕过「携带历史条数上限(ctxMsgs)」截断 —— **仅压缩请求用**
+            (摘要输入必须是完整历史;聊天轮不传,语义不变) */
+function payloadMessages(baseList, opts) {
   if (!conv && !baseList) return { list: [], truncated: false, tokens: 0 };
+  var noCap = !!(opts && opts.noCap === true);
   var src = baseList || conv.messages;
   var all = [];
   for (var i = 0; i < src.length; i++) {
     var m = src[i];
     if (m.error) continue;
-    /* 工具结果:必须回传,否则模型会因为缺少 tool_call 的应答而报错 */
+    /* 工具结果:必须回传,否则模型会因为缺少 tool_call 的应答而报错。
+       media(内联图片)是**payload 项内部字段**:不落盘、不进 wire,由 openai 分支的
+       expandToolMediaForOpenAI / anthropic 分支按规范各自展开(见 §3.4) */
     if (m.role === "tool") {
-      all.push({
+      var tItem = {
         role: "tool",
         content: m.content || (m.status === "wait" ? "用户尚未确认执行" : "工具未执行"),
         tool_call_id: m.toolCallId,
         name: m.toolName
-      });
+      };
+      if (m.media && m.media.length) tItem.media = m.media;
+      all.push(tItem);
       continue;
     }
     if (m.streaming) continue;
@@ -1728,7 +2154,7 @@ function payloadMessages(baseList) {
   }
   var s = state.settings;
   var list = all, truncated = false;
-  if (s.ctxMsgs > 0 && list.length > s.ctxMsgs) {
+  if (!noCap && s.ctxMsgs > 0 && list.length > s.ctxMsgs) {
     list = list.slice(list.length - s.ctxMsgs);
     truncated = true;
     /* 截断后开头若是孤立的工具结果:只补一条说明**修不好结构** —— 服务端会因为
@@ -1743,6 +2169,8 @@ function payloadMessages(baseList) {
   var tokens = 0;
   list.forEach(function (m) {
     tokens += estimateContentTokens(m.content);
+    /* 工具媒体必须计入(否则用量环 / 自动压缩低估);调用点清单见方案 §3.12-2 */
+    tokens += estimateToolMediaTokens(m);
     if (m.tool_calls) {
       m.tool_calls.forEach(function (c) {
         tokens += estimateTokens(c.function.name + c.function.arguments) + 6;
@@ -1760,15 +2188,24 @@ function normalizeAnthropic(list) {
   for (var i = 0; i < list.length; i++) {
     var m = list[i];
     if (m.role === "tool") {
-      var block = {
-        type: "tool_result",
-        tool_use_id: m.tool_call_id || "",
-        content: typeof m.content === "string" ? m.content : contentToText(m.content)
-      };
+      var tMedia = (m.media && m.media.length) ? m.media : null;
+      var tContent = typeof m.content === "string" ? m.content : contentToText(m.content);
+      var blk;
+      if (tMedia) {
+        /* Anthropic 原生形态:tool_result.content 是内容块数组(文本 + image 块) */
+        var tBlocks = [];
+        if (tContent) tBlocks.push({ type: "text", text: tContent });
+        for (var ti = 0; ti < tMedia.length; ti++) {
+          tBlocks.push(imagePartFor("anthropic", tMedia[ti].mime, tMedia[ti].data, null));
+        }
+        blk = { type: "tool_result", tool_use_id: m.tool_call_id || "", content: tBlocks };
+      } else {
+        blk = { type: "tool_result", tool_use_id: m.tool_call_id || "", content: tContent };
+      }
       var prev = out[out.length - 1];
-      if (prev && prev.role === "user" && prev.__toolResults) prev.content.push(block);
+      if (prev && prev.role === "user" && prev.__toolResults) prev.content.push(blk);
       else {
-        pushMsg("user", [block]);
+        pushMsg("user", [blk]);
         out[out.length - 1].__toolResults = true;
       }
       continue;
@@ -1840,7 +2277,12 @@ function applyReasoningEffort(body, proto) {
   if (proto === "openai") body.reasoning_effort = lv;
   else body.output_config = { effort: lv };
 }
-function buildBody(list, model, stream, targetConv) {
+/* 请求体组装(聊天轮**与压缩请求**的唯一来源;禁止另写第二份 —— sys / 采样 / 工具三处口径
+   一经分叉必然漂移)。
+   opts(缺省 undefined ⇒ 既有行为逐字节不变):
+     maxTokens : number  最大输出覆盖,OpenAI / Anthropic 都恒写(压缩请求用,写死见下)
+     summary   : true    压缩请求标记(仅:sys 链改用 pvTaskBlockText 只读变体;不触发其它分支) */
+function buildBody(list, model, stream, targetConv, opts) {
   var s = state.settings;
   /* 请求体的「上下文部分」(system / 工作区 / 工具集)一律按**目标会话**取:
      targetConv 缺省 = 模块级 conv(既有行为不变);发送链显式传"发起这次生成时"那条会话。
@@ -1854,8 +2296,10 @@ function buildBody(list, model, stream, targetConv) {
   var wsCtx = wsContextBlock(c);
   if (wsCtx) sys = sys ? (sys + "\n\n" + wsCtx) : wsCtx;
   /* 后台任务的完成提醒走同一条 sys 拼接链(临时拼接,不写回 conv.system、不改 conv.messages)。
-     每轮请求都调一次 → "生成中"时新完成的会在下一轮 tool-loop 自然带上;注入一次即 notified:true */
-  var taskCtx = pvTaskBlock(c);
+     每轮请求都调一次 → "生成中"时新完成的会在下一轮 tool-loop 自然带上;注入一次即 notified:true。
+     压缩请求(summary:true)一律改用只读变体 pvTaskBlockText:文本逐字节相同、但不登记在途通知
+     (压缩请求没有配套的 pvNotifyCommit / pvNotifyRollback,登记会打乱完成回流链) */
+  var taskCtx = (opts && opts.summary === true) ? pvTaskBlockText(c) : pvTaskBlock(c);
   if (taskCtx) sys = sys ? (sys + "\n\n" + taskCtx) : taskCtx;
   /* 外部 MCP 服务器的 instructions —— 默认不注入,只有 mcpInjectInstructions=true
      且外部工具**在本会话生效**、服务器已连接时才拼进 sys(与工作区块并列;
@@ -1867,20 +2311,34 @@ function buildBody(list, model, stream, targetConv) {
   var cxCtx = cxContextBlock(c);
   if (cxCtx) sys = sys ? (sys + "\n\n" + cxCtx) : cxCtx;
   var body = { model: model, messages: list };
+  /* 请求装配层的两条媒体纪律(§3.4 / §3.8.3):
+     · 聊天轮软护栏:非摘要请求先过 trimToolMediaForRequest(摘要请求由 b25 的 cxSummaryMedia 阶梯
+       + 32 MiB 闸管,避免两套裁剪互相打架);
+     · noToolMedia(结构类 4xx 降级,见 sendMessage 的工具轮):本次去掉 media(工具文本照发)。
+     两者都**非破坏性**(只浅拷贝被改动的 payload 项)—— msgList 跨轮复用同一批对象。 */
+  var wire = list;
+  if (!(opts && opts.summary === true)) wire = trimToolMediaForRequest(list);
+  if (opts && opts.noToolMedia) wire = stripToolMediaForWire(wire);
   if (s.protocol === "openai") {
-    if (sys) body.messages = [{ role: "system", content: sys }].concat(list);
+    if (sys) body.messages = [{ role: "system", content: sys }].concat(expandToolMediaForOpenAI(wire));
+    else body.messages = expandToolMediaForOpenAI(wire);
     body.stream = !!stream;
     /* 要求服务端在流式末尾回 usage,才能拿到真实的 completion_tokens */
     if (stream) body.stream_options = { include_usage: true };
     applySampling(body, "openai");
+    /* 压缩请求的输出预算覆盖必须写在 applySampling **之后**:applySampling 会先按 maxTokensFor
+       写一次 max_tokens,覆盖写在前面会被它盖掉。压缩请求恒写(注意:聊天轮的 OpenAI 分支在
+       maxTokens<=0 时不写 max_tokens,所以"恒写"是压缩请求独有的新行为,只由 opts.maxTokens 触发) */
+    if (opts && opts.maxTokens > 0) body.max_tokens = Math.round(opts.maxTokens);
     applyReasoningEffort(body, "openai");
     applyToolsToBody(body, "openai", c);
   } else {
-    body.messages = normalizeAnthropic(list);
+    body.messages = normalizeAnthropic(wire);
     body.max_tokens = maxTokensFor("anthropic");
     body.stream = !!stream;
     if (sys) body.system = sys;
     applySampling(body, "anthropic");
+    if (opts && opts.maxTokens > 0) body.max_tokens = Math.round(opts.maxTokens);
     applyReasoningEffort(body, "anthropic");
     applyToolsToBody(body, "anthropic", c);
   }
@@ -1937,22 +2395,26 @@ function stopGenerating() {
 
 async function sendMessage(text, opts) {
   opts = opts || {};
-  if (generating) return;
+  if (generating) { if (opts.bufItem) sqRestoreBuf(opts.bufItem); return; }   /* 防御性回队(见方案 §3.3-7) */
   /* 走到这里文字 / 附件已在调用方手上(编辑、重发、工具回填等),不能被清草稿动作清掉 */
-  if (!conv && !newConversation({ keepDraft: true })) return;
+  if (!conv && !newConversation({ keepDraft: true })) { if (opts.bufItem) sqRestoreBuf(opts.bufItem); return; }
   /* 这一轮的归宿:生成期间允许切走会话(selectConv 会改写模块级 conv),收尾一律落到
      **发起这次生成时**那条会话上(见 finally 与 commit 的第二参数) */
-  var sendConvId = conv.id;
+  /* 缓冲消息按**入队时**那条会话发送(生成期间用户可能已切走);缺失/会话已消失时回落到当前会话 */
+  var sendConvId = (opts.bufItem && opts.bufItem.convId && getConv(opts.bufItem.convId))
+    ? opts.bufItem.convId : conv.id;
   function sendTarget() { return getConv(sendConvId) || conv; }
   var model = effectiveModel().trim();
   if (!model) {
     toast("请先选择或输入模型名称", "warn");
     openSettings("model");
+    if (opts.bufItem) sqRestoreBuf(opts.bufItem);
     return;
   }
   if (!apiUrl("")) {
     toast("请先在设置中填写 Base URL", "warn");
     openSettings("model");
+    if (opts.bufItem) sqRestoreBuf(opts.bufItem);
     return;
   }
   var useStream = !!state.settings.stream && CAP.stream;
@@ -1960,6 +2422,7 @@ async function sendMessage(text, opts) {
   /* 先立刻进入「生成中」状态,再去做磁盘活 ——
      否则等 IndexedDB 的那几十毫秒里,界面还是「可以再点一次发送」的样子 */
   generating = true;
+  genConvId = sendConvId;         /* 在飞 send 的归属会话(同步段写入,与 generating 同一拍) */
   updateSendButton(true);
   syncParamInputs();
 
@@ -1977,6 +2440,7 @@ async function sendMessage(text, opts) {
     generating = false;
     updateSendButton(false);
     toast("这条对话已被清空或删除,本条消息没有发送", "warn", 5000);
+    if (opts.bufItem) sqRestoreBuf(opts.bufItem);     /* 缓冲消息回队首:一定不丢文本 */
     return;
   }
 
@@ -1990,6 +2454,15 @@ async function sendMessage(text, opts) {
     if (cxEnabled()) {
       var pre = await cxAutoBeforeSend(tf);
       if (pre && pre.code === "ECOMPACT_ABORT") {
+        /* 缓冲消息不经输入框:先复位 generating 再放回队首 —— sqRestoreBuf 内部 sqRender 的 hint
+           依赖该顺序(否则短暂显示"本轮结束后自动发送"的残留态);非缓冲路径仍走下面"草稿还回输入框" */
+        if (opts.bufItem) {
+          generating = false;
+          sqRestoreBuf(opts.bufItem);
+          updateSendButton(false);
+          toast("已取消:压缩被中止,本条消息未发送(已放回待发送队列)", "info", 4200);
+          return;
+        }
         /* 用户按 Esc 取消了这次压缩 ⇒ **放弃本次发送**(否则"停不掉的压缩 + 照发"是最坏的组合)。
            草稿必须还回去:doSend 在调 sendMessage 之前就清空了 elInput / draftFiles,而且不 await 它 ——
            不还就等于把用户的正文与附件吞掉。自动续跑路径(skipUserMsg)下 text === null,
@@ -2238,7 +2711,7 @@ async function sendMessage(text, opts) {
        用户可能已经切走,模块级 conv 已是另一条:buildBody 缺省读它就会把两套会话口径混进
        同一份请求(消息历史走 list/tf,目标走 sendTarget();目标已消失时退回当前会话,
        与"收手前的最后一轮"一致) */
-    var body = buildBody(list, model, useStream, sendTarget());
+    var body = buildBody(list, model, useStream, sendTarget(), mediaOff ? { noToolMedia: true } : undefined);
     var res = await doFetch(body);
     if (!res.ok) {
       var detail = "";
@@ -2431,6 +2904,8 @@ async function sendMessage(text, opts) {
     var payload = payloadMessages(opts.history || tf.messages);
     var msgList = payload.list.slice();
     asst.truncated = payload.truncated;
+    /* 结构类 4xx 降级开关(§3.4):本次 send 内生效,不落盘 —— 置 true 后本轮的请求体不再带工具媒体 */
+    var mediaOff = false;
     toolBeginTurn();
     while (true) {
       toolBeginTurn();                 // 「每轮最多调用次数」按轮计
@@ -2456,6 +2931,22 @@ async function sendMessage(text, opts) {
           var pmO = payloadMessages(tgtOvf.messages);
           msgList = pmO.list.slice();
           continue;
+        }
+        /* 结构类 4xx(该服务端不接受工具结果里的图片)⇒ **去掉 media 重试一次**(§3.4):
+           工具文本照发,仅图片不随本次结果发送;整次 send 只此一次,不做次数循环。
+           复位路径三条:自动降级(本次)/ 换模型或 visionForce:"no" / 删消息或压缩 */
+        if (!mediaOff && isToolMediaStructureError(turnErr)) {
+          var listHasMedia = false, mi0, mm0;
+          for (mi0 = 0; mi0 < msgList.length; mi0++) {
+            mm0 = msgList[mi0];
+            if (mm0 && mm0.role === "tool" && mm0.media && mm0.media.length) { listHasMedia = true; break; }
+          }
+          if (listHasMedia) {
+            mediaOff = true;
+            toast("该服务端不接受工具结果中的图片,已去掉图片重试(文本结果照常发送)", "warn", 5000);
+            toolLogPush("err", "服务端拒绝工具结果中的图片(结构类 4xx),本次已去掉图片重试");
+            continue;
+          }
         }
         throw turnErr;
       }
@@ -2497,7 +2988,8 @@ async function sendMessage(text, opts) {
         saveState(true);
         msgList.push({
           role: "tool", content: tmsg.content || "工具未执行",
-          tool_call_id: tmsg.toolCallId, name: tmsg.toolName
+          tool_call_id: tmsg.toolCallId, name: tmsg.toolName,
+          media: mediaOff ? undefined : tmsg.media
         });
       }
       /* ★ 工具触发的压缩唯一应用点:此刻本轮**所有**工具结果都已写入 tf.messages,
@@ -2544,7 +3036,8 @@ async function sendMessage(text, opts) {
       setConn("ok", "已连接");
       toast("已停止生成", "info", 1500);
     } else {
-      asst.error = friendlyError(err, endpointFor());
+      asst.error = friendlyError(err, endpointFor()) +
+        (mediaOff ? "\n可在 设置→模型 把该模型的图像能力设为\"不支持\"(或删除/压缩含图片的工具消息)后重试" : "");
       asst.streaming = false;
       commit(asst, sendTarget());
       setConn("err", "请求失败");
@@ -2590,7 +3083,12 @@ async function sendMessage(text, opts) {
                   srvSpeed: srvPredSpeed, srvTokens: srvPredictedN };
     updateStatusBar();
     if (asst.error) focusInput();
-    /* 本轮生成已结束。若期间有后台任务跑完(且这一轮没机会注入),空闲时自动续跑一次 */
+    /* 本轮归属结束:**先清 genConvId,再 flush** —— flush 内新 sendMessage 的同步段会把它
+       重写为新回合的会话;清零点若排在 flush 之后会把新回合的归属抹掉(链式回合入队全废) */
+    genConvId = "";
+    sqFlushAfterTurn(sendConvId);
+    /* 本轮生成已结束。若期间有后台任务跑完(且这一轮没机会注入),空闲时自动续跑一次。
+       注意:上面若真发出了缓冲消息,此刻 generating 已回到 true ⇒ 这里自然让位(不抢发) */
     try { pvNotifyCheck(); } catch (e2) {}
   }
 }
@@ -2965,14 +3463,27 @@ elChatInner.addEventListener("click", function (e) {
 });
 
 /* ---- 朗读 ---- */
-var speakingEl = null;
+/* 播放状态以这里为准(speakingEl = 正在读的那颗按钮;speakingMsgId 记它属于哪条消息);
+   synth.speaking / pending 只作辅助 —— speak() 返回到真正开声前两者都是假,只看它们会把
+   "正在读"误判成"没在读",再点同一颗按钮就变成从头重读（旧实现先把 speakingEl 置空再判
+   "是不是同一颗按钮",判断恒假）。 */
+var speakingEl = null, speakingMsgId = null;
+/* 复位:移除 .on(高亮与图标脉冲动画随类消失)。按钮所属消息可能已被重绘移除,
+   在游离节点上 classList 依然安全,不抛错 */
+function speakReset() {
+  if (speakingEl && speakingEl.classList) speakingEl.classList.remove("on");
+  speakingEl = null; speakingMsgId = null;
+}
 function speakMessage(msg, btn) {
   if (!CAP.speech) { toast("当前浏览器不支持语音合成", "warn"); return; }
   var synth = window.speechSynthesis;
-  if (synth.speaking) {
-    synth.cancel();
-    if (speakingEl) { speakingEl.classList.remove("on"); speakingEl = null; }
-    if (speakingEl === btn) return;
+  if (speakingEl || synth.speaking || synth.pending) {
+    /* 同一条消息(同一颗按钮,或重绘后的新按钮)= 停止朗读;
+       别的消息的按钮 = 停当前这条,继续往下读新的 */
+    var same = speakingEl === btn || (speakingMsgId != null && !!msg && msg.id === speakingMsgId);
+    try { synth.cancel(); } catch (e0) {}
+    speakReset();
+    if (same) return;
   }
   var text = contentToText(msg.content).trim();
   if (!text) { toast("没有可朗读的内容", "warn"); return; }
@@ -2981,12 +3492,17 @@ function speakMessage(msg, btn) {
   u.lang = /[\u4e00-\u9fff]/.test(text) ? "zh-CN" : "en-US";
   u.rate = 1.05;
   u.onend = u.onerror = function () {
-    if (speakingEl === btn) { btn.classList.remove("on"); speakingEl = null; }
+    /* 换读别的消息后,旧 utterance 的回调还会到(speakingEl 已指向新按钮)⇒ 只认当前这颗 */
+    if (speakingEl === btn) speakReset();
   };
-  if (speakingEl) speakingEl.classList.remove("on");
+  speakReset();   /* 理论上前面已复位;防旧节点残留 .on */
   speakingEl = btn;
+  speakingMsgId = (msg && msg.id != null) ? msg.id : null;
   btn.classList.add("on");
-  try { synth.speak(u); } catch (e) { toast("朗读失败:" + (e.message || e), "error"); btn.classList.remove("on"); speakingEl = null; }
+  try { synth.speak(u); } catch (e) {
+    toast("朗读失败:" + (e.message || e), "error");
+    if (speakingEl === btn) speakReset();
+  }
 }
 
 /* ---- 图片预览 ---- */
@@ -3169,7 +3685,7 @@ function spaceRun() {
     p = p.then(function () {
       if (k === "attach") {
         var n = stripAttachmentData(true, keepIds);
-        done.push("清理附件 " + n + " 个");
+        done.push("清理图片 " + n + " 张");
       } else if (k === "compress") {
         var removed = 0;
         state.conversations.forEach(function (c) {
@@ -3691,9 +4207,17 @@ function renderNsel(id) {
   for (i = 0; i < d.options.length; i++) if (d.options[i].v === d.value) cur = d.options[i];
   var val = d.el.querySelector(".nsel-val");
   if (val) {
-    val.innerHTML = (cur && cur.v)
-      ? escapeHtml(cur.label) + '<span class="nsv-tag">' + escapeHtml(cur.v) + "</span>"
-      : '<span class="nsv-none">' + escapeHtml(cur ? cur.label : "—") + "</span>";
+    /* 选项可带自有 tag 覆盖芯片文本:tag 为空串 = 正常样式但不渲染芯片
+       (标题已含"开 / 关"这类信息时,避免收起态再挂一颗值芯片);无 tag 属性 = 旧口径
+       (值非空渲染值芯片,值为空走 nsv-none 灰样式) */
+    var tagOv = !!(cur && Object.prototype.hasOwnProperty.call(cur, "tag"));
+    if (cur && (tagOv || cur.v)) {
+      var chip = tagOv ? cur.tag : cur.v;
+      val.innerHTML = escapeHtml(cur.label) +
+        (chip ? '<span class="nsv-tag">' + escapeHtml(chip) + "</span>" : "");
+    } else {
+      val.innerHTML = '<span class="nsv-none">' + escapeHtml(cur ? cur.label : "—") + "</span>";
+    }
   }
   d.el.querySelector(".nsel-btn").setAttribute("aria-expanded", nselOpenId === id ? "true" : "false");
   if (nselOpenId === id) renderNselPop(id);
@@ -4837,12 +5361,19 @@ function migrateAttachmentsToIdb() {
     });
   }, function () { return { moved: 0, ok: false }; });
 }
-/* 优化:把历史消息里的图片 / PDF 二进制数据剥掉(文本文件内容保留),体积能降一大截 */
+/* 优化:把历史消息里的图片 / PDF 二进制数据剥掉(文本文件内容保留),体积能降一大截。
+   工具读取的图片(内联在 m.media[].data,不落 blob 键)同样按「优化存储」回收(只删字段、不动正文) */
 function stripAttachmentData(quiet, keepIds) {
-  var before = storageBytes(), n = 0, keys = [];
+  var before = storageBytes(), n = 0, nTool = 0, keys = [];
   state.conversations.forEach(function (c) {
     if (keepIds && keepIds[c.id]) return;      /* 保护范围内的对话:附件一个都不动 */
     c.messages.forEach(function (m) {
+      /* 工具媒体:插在下面 `!Array.isArray(m.content)` 早退**之前** —— tool 消息的 content 是字符串,
+         早退之后永远进不来(§3.8.4) */
+      if (m && Array.isArray(m.media) && m.media.length) {
+        nTool += m.media.length;
+        delete m.media;
+      }
       if (!Array.isArray(m.content)) return;
       var out = [];
       m.content.forEach(function (p) {
@@ -4882,10 +5413,12 @@ function stripAttachmentData(quiet, keepIds) {
   var after = storageBytes();
   renderDataPanel(); renderChat(); updateStorageMeter();
   if (!quiet) {
-    toast(n ? "已清理 " + n + " 张历史图片(含附件库),释放 " + fmtBytes(Math.max(0, before - after))
-      : "没有可清理的图片数据", n ? "success" : "info", 3600);
+    var total = n + nTool;
+    toast(total ? "已清理 " + total + " 张历史图片" + (nTool ? "(其中工具读取的图片 " + nTool + " 张)" : "") +
+      "(含附件库),释放 " + fmtBytes(Math.max(0, before - after))
+      : "没有可清理的图片数据", total ? "success" : "info", 3600);
   }
-  return n;
+  return n + nTool;
 }
 
 /* ---- 提示词模板库 ---- */
@@ -5280,7 +5813,7 @@ function ctxSnapshot(targetConv) {
   var src = ctxWindowSrc(model);
   var sys = ((c && c.system) || state.settings.systemPrompt || "");
   var sysTok = estimateTokens(sys);
-  var draftTok = isCur ? estimateTokens(elInput.value || "") : 0;
+  var draftTok = (isCur ? estimateTokens(elInput.value || "") : 0) + sqDraftTokens(c);
   var attTok = 0;
   if (isCur) draftFiles.forEach(function (f) { attTok += draftAttachTokens(f); });
   var p = payloadMessages(c ? c.messages : undefined);
@@ -6298,8 +6831,17 @@ function bindUI() {
     }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
       e.preventDefault();
-      if (generating) return;
+      if (generating) { sqEnqueueFromInput(); return; }          /* 本批:生成中进缓冲 */
+      if (!elInput.value.trim() && !draftFiles.length && sqSendableIdle()) { sqSendHead(); return; }
       doSend();
+    }
+    /* ↑ 召回最后一条(严格:输入框完全为空 + 无修饰键 + 非组合 + 斜杠浮窗未开时才有意义;
+       有意**不**补 Kimi 的 busy 门 —— 空闲也允许召回,否则 ECOMPACT_ABORT 残留态无法用 ↑ 恢复) */
+    if (e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing
+        && elInput.value.length === 0 && sqHasFor(conv && conv.id)) {
+      e.preventDefault();
+      sqRecall(SQ.items[SQ.items.length - 1].id);
+      return;
     }
   });
   elSend.addEventListener("click", function () { if (generating) stopGenerating(); else doSend(); });
@@ -6633,7 +7175,7 @@ function bindUI() {
     syncSidebarBackdrop();
   });
   window.addEventListener("beforeunload", function (e) {
-    if (!generating) return;
+    if (!generating && !sqHasItems()) return;     /* 缓冲残留时同样给留页提示 */
     e.preventDefault();
     e.returnValue = "";
   });
@@ -6673,6 +7215,10 @@ function onKeyDown(e) {
     if (!wsRailCollapsed() && wsRailVisible() && wsRailFormGet() !== "column") { wsRailClose(); return; }
     if ($("find-bar").classList.contains("open")) { closeFind(); return; }
     if (generating) { stopGenerating(); return; }
+    /* 手动压缩(generating=false)期间的 Esc:中止压缩运行(请求与退避 sleep 都会断)。
+       **不**调 stopGenerating —— 它会 denyAllToolWaits / killAllSandboxes / pvSuppressAutoLoop,
+       对手动取消过重且误伤(cxCompactNow 的 finally 会把状态行恢复为「已连接」) */
+    if (typeof cxRunActive === "function" && cxRunActive()) { cxAbortActive("用户取消压缩"); return; }
     return;
   }
   /* 有弹窗(任何 .modal-mask.open,含动态确认弹窗 #ask-modal-dyn)开着时,其余全局快捷键
