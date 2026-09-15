@@ -922,7 +922,8 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
   width: 100%; border: none; outline: none; resize: none;
   background: transparent; color: var(--text);
   padding: 14px 16px 4px; font-size: 14.5px; line-height: 1.62;
-  max-height: 260px; overflow-y: auto; font-family: inherit;
+  max-height: calc(1.62em * 5 + 18px);   /* 兜底 = 5 行(1.62em×5 + 14px 上 / 4px 下 padding);JS autoResize 按计算样式写入精确值 */
+  overflow-y: auto; font-family: inherit;
 }
 #input::placeholder { color: var(--text-faint); }
 .composer-bar { display: flex; align-items: center; gap: 7px; padding: 6px 9px 9px 12px; }
@@ -2483,8 +2484,8 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
       </div>
       <!-- 斜杠命令浮窗(输入框里打 `/` 时出现;位置由 CSS 贴到输入区正上方) -->
       <div id="slash-menu" role="listbox" aria-label="可用命令"></div>
-      <!-- 待发送缓冲区(生成中回车入队;本轮结束后自动发送;层级低于 #slash-menu) -->
-      <div id="send-queue" role="list" aria-label="待发送消息(本轮结束后自动发送)" hidden>
+      <!-- 待发送缓冲区(生成中回车入队;下一个工具轮边界插入;层级低于 #slash-menu) -->
+      <div id="send-queue" role="list" aria-label="待发送消息(下一轮工具结果后自动发送)" hidden>
         <div class="sq-rows" id="send-queue-rows"></div>
         <div class="sq-hint" id="send-queue-hint"></div>
       </div>
@@ -3005,7 +3006,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
         <div class="field">
           <label>单次执行超时</label>
           <div class="range-row"><input type="range" id="set-tool-timeout" min="60000" max="3600000" step="60000" /><span class="val" id="set-tool-timeout-v"></span></div>
-          <div class="hint">1 ~ 60 分钟(默认 10 分钟)。超时后直接销毁运行沙箱 —— 即使代码是死循环也能停下来,并把超时信息作为工具结果返回给模型。生成过程中按停止(Esc)也会立即销毁沙箱。</div>
+          <div class="hint">1 ~ 60 分钟(默认 10 分钟)。超时后直接销毁运行沙箱 —— 即使代码是死循环也能停下来,并把超时信息作为工具结果返回给模型。生成过程中按停止(Ctrl+Alt+Esc)也会立即销毁沙箱。</div>
         </div>
         <div class="field">
           <label>每轮最多调用次数</label>
@@ -3026,7 +3027,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
         </div>
         <div class="field">
           <div class="switch-row">
-            <div class="sw-txt"><label for="set-py-stop-kill">停止生成时也终止后台任务</label><small>默认关闭:按 Esc / 停止生成只中止当前这次回答,后台 Python 任务继续跑。打开后「停止」会连后台任务一起终止(未回写的产物会丢失)。</small></div>
+            <div class="sw-txt"><label for="set-py-stop-kill">停止生成时也终止后台任务</label><small>默认关闭:按 Ctrl+Alt+Esc / 停止生成只中止当前这次回答,后台 Python 任务继续跑。打开后「停止」会连后台任务一起终止(未回写的产物会丢失)。</small></div>
             <label class="switch"><input type="checkbox" id="set-py-stop-kill" /><span class="slider"></span></label>
           </div>
         </div>

@@ -130,7 +130,7 @@ function clearConvMessages(id) {
   if (!c) return;
   if (!c.messages.length) { toast("这个对话还没有消息", "warn"); return; }
   /* 忙碌门:生成中清空会让正在回填的那一轮无处落笔(也把上下文与请求体错位),先挡住 */
-  if (generating) { toast("正在生成中,请先按 Esc 停止再清空", "warn", 3600); return; }
+  if (generating) { toast("正在生成中,请先按 Ctrl+Alt+Esc 停止再清空", "warn", 3600); return; }
   if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") {
     toast("正在压缩上下文中,请稍候再清空", "warn", 3600); return;
   }
@@ -335,9 +335,25 @@ function convToMarkdown(c) {
 --------------------------------------------------------------------------- */
 var elInput = $("input"), elSend = $("btn-send");
 function focusInput() { try { elInput.focus(); } catch (e) {} }
+/* 输入框最高显示 5 行文本(超过即内部滚动;紧凑模式 / 页面缩放 / 窄窗为同一口径)。
+   高度 = 计算样式的 line-height × 5 + 上下 padding;line-height: normal 时按 fontSize×1.5 兜底 */
+var INPUT_MAX_LINES = 5;
+function inputMaxHeight() {
+  var cs = null;
+  try { cs = window.getComputedStyle(elInput); } catch (e) {}
+  if (!cs) return 0;                     /* 取不到计算样式:返回 0 = 不设上限(交给 CSS 的兜底值) */
+  var fs = parseFloat(cs.fontSize) || 14.5;
+  var lh = parseFloat(cs.lineHeight);
+  if (!lh || isNaN(lh)) lh = fs * 1.5;
+  var pt = parseFloat(cs.paddingTop) || 0;
+  var pb = parseFloat(cs.paddingBottom) || 0;
+  return Math.round(lh * INPUT_MAX_LINES + pt + pb);
+}
 function autoResize() {
   elInput.style.height = "auto";
-  elInput.style.height = Math.min(elInput.scrollHeight, 260) + "px";
+  var maxH = inputMaxHeight();
+  if (maxH > 0) elInput.style.maxHeight = maxH + "px";
+  elInput.style.height = (maxH > 0 ? Math.min(elInput.scrollHeight, maxH) : elInput.scrollHeight) + "px";
 }
 function updateHint() {
   var h = $("composer-hint");
@@ -1631,9 +1647,11 @@ async function cxAutoBetweenRounds(tf) {
   return r || { ok: false, code: "", compacted: false, text: "" };
 }
 /* ---- 生成中的待发送缓冲区(内存 · 单槽 · 多项 · 按会话归属) ----
-   用户原话:Agent 循环工作期间回车 → 文本进缓冲区(输入框上方浮窗),本轮(含全部工具轮)结束后
-   立即自动发送并继续对话;循环结束前可召回(编辑按钮 / ↑)或丢弃。条目不持久化(刷新即失,与 Kimi
-   的内存队列对齐)。同一时刻只有一个在飞 send(模块级 generating 是全局单飞)⇒ 只留一个会话槽。
+   用户原话:Agent 循环工作期间回车 → 文本进缓冲区(输入框上方浮窗),**下一个工具轮边界**
+   (工具结果写入后、下一次模型请求前)即作为 user 消息插入会话,支持中途补充需求;最后一个工具轮
+   之后到达的由回合结束的兜底 flush 发送。循环结束前可召回(编辑按钮 / ↑)或丢弃;普通 Esc 丢弃整槽
+   (仅当槽归属当前会话、浮窗可见时;中断已改为 Ctrl+Alt+Esc)。条目不持久化(刷新即失,与 Kimi 的内存队列对齐)。同一时刻只有一个在飞
+   send(模块级 generating 是全局单飞)⇒ 只留一个会话槽。
    item = { id, convId, text, at };convId = **入队时**那条会话 —— 生成期间允许切走会话,
    缓冲消息必须落回它入队时那一条(读侧见 sendMessage 的 opts.bufItem.convId)。 */
 var SQ = { convId: "", items: [] };
@@ -1704,6 +1722,13 @@ function sqDiscard(itemId) {
   updateCtxMeter();
   sqRender();
 }
+/* 丢弃整槽(普通 Esc 的收尾动作;无确认弹窗,与逐条丢弃一致) */
+function sqDiscardAll() {
+  SQ.items = [];
+  SQ.convId = "";
+  updateCtxMeter();
+  sqRender();
+}
 /* 残留态(未生成但队列非空)的手动恢复路径:唯一入口 = 空 Enter(hint 明示) */
 function sqSendableIdle() {
   return !generating && sqHasItems() && !!conv && conv.id === SQ.convId &&
@@ -1715,9 +1740,10 @@ function sqSendHead() {
   sqRender();
   sendMessage(it.text, { bufItem: it });
 }
-/* 回合结束后的自动发送:取队首 1 条,**同步**调 sendMessage(不 await、不 catch —— 错误在
+/* 回合结束后的兜底发送:取队首 1 条,**同步**调 sendMessage(不 await、不 catch —— 错误在
    sendMessage 既有链路里 toast)。它的同步段会把 generating 置回 true ⇒ 紧随的 pvNotifyCheck()
-   命中 "if (generating) return" 自动让位(缓冲是用户内容,优先于 E12 自动续跑) */
+   命中 "if (generating) return" 自动让位(缓冲是用户内容,优先于 E12 自动续跑)。
+   主路径 = 工具轮边界的 sqInsertAtToolBoundary;这里兜住"最后一个工具轮之后 / 无工具轮"到达的条目 */
 function sqFlushAfterTurn(endedConvId) {
   if (generating) return;
   if (!sqHasItems()) return;
@@ -1737,6 +1763,32 @@ function sqFlushAfterTurn(endedConvId) {
   sqRender();
   sendMessage(it.text, { bufItem: it });
 }
+/* 工具轮边界插入(主路径):生成期间入队的缓冲消息在「工具结果写入后、下一次模型请求前」
+   逐条作为 user 消息补进会话(下一轮请求自然带上 = 中途补充需求);持久化 + msgList 同步 + 渲染,
+   交接即出队。未插到的(例如这是最后一轮)留在队里,由 finally 的 sqFlushAfterTurn 兜底发送。
+   目标会话已走 / 槽归属不对:整段不动,不丢文本 */
+function sqInsertAtToolBoundary(sendConvId, tf, msgList) {
+  if (!tf || !msgList || !sqHasItems() || SQ.convId !== sendConvId) return 0;
+  if (!getConv(sendConvId)) return 0;
+  var n = 0;
+  while (SQ.items.length) {
+    var it = SQ.items.shift();                 /* 交接即出队(与本函数共用主路径;flush 兜底仍保留) */
+    var content = buildUserContent(it.text, null);
+    tf.messages.push({ id: uid(), role: "user", content: content, createdAt: Date.now() });
+    msgList.push({ role: "user", content: protocolContent(content, state.settings.protocol) });
+    n++;
+  }
+  if (!n) return 0;
+  tf.updatedAt = Date.now();
+  /* 与普通发送路径同一套配套:自动命名 + 空闲自动续跑计数复位(插入等价于用户真实发言) */
+  autoTitle(tf.id);
+  if (typeof pvAutoLoopReset === "function") pvAutoLoopReset(tf.id);
+  saveState(true);
+  if (tf === conv) { renderChat(); scrollToBottom(true); }
+  updateCtxMeter();
+  sqRender();
+  return n;
+}
 function sqHintText() {
   if (!generating && sqHasItems()) return "按 Enter 立即发送";
   if ((typeof ASK_WAITS !== "undefined" && ASK_WAITS && Object.keys(ASK_WAITS).length) ||
@@ -1744,7 +1796,7 @@ function sqHintText() {
     return "正在等你回答 / 放行,之后自动发送";
   }
   if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") return "压缩完成后自动发送";
-  return "本轮结束后自动发送 · Esc 不取消待发送 · ↑ 召回最后一条 · 可编辑 / 丢弃";
+  return "下一轮工具结果后自动发送 · Esc 丢弃待发送 · ↑ 召回最后一条 · 可编辑 / 丢弃";
 }
 /* 浮窗渲染(清空重建;调用点 = 入队/召回/丢弃/交接 + renderChat 两个出口) */
 function sqRender() {
@@ -2370,13 +2422,13 @@ function createSSEParser(onEvent) {
 function updateSendButton(busy) {
   elSend.classList.toggle("stop", busy);
   elSend.innerHTML = icon(busy ? "stop" : "send");
-  elSend.title = busy ? "停止生成(Esc)" : "发送(Enter)";
+  elSend.title = busy ? "停止生成(Ctrl+Alt+Esc)" : "发送(Enter)";
   elSend.setAttribute("aria-label", busy ? "停止生成" : "发送");
 }
 function stopGenerating() {
   if (abortCtrl) { try { abortCtrl.abort(); } catch (e) {} }
   /* 压缩独立持自己的 CX_RUN.ctrl(发送前自动压缩那段窗口里模块级 abortCtrl 还是 null):
-     不在这里一并中止的话,Esc 之后摘要请求还会继续跑完再改数据 */
+     不在这里一并中止的话,Ctrl+Alt+Esc 之后摘要请求还会继续跑完再改数据 */
   if (typeof cxAbortActive === "function") { try { cxAbortActive("用户停止生成"); } catch (e) {} }
   denyAllToolWaits();      // 正在等待放行的工具调用也要一起取消
   killAllSandboxes("已中止:生成被停止");   // 正在跑的沙箱立即销毁
@@ -2386,7 +2438,7 @@ function stopGenerating() {
   /* 后台 Python 任务默认**不受影响**;只有用户打开了
      「停止生成时也终止后台任务」才一并停掉(设置里的开关,默认关) */
   if (state.settings.pyTaskStopKills === true) {
-    var n = pyTaskStopAll("停止生成(Esc)");
+    var n = pyTaskStopAll("停止生成(Ctrl+Alt+Esc)");
     if (n) toast("已按设置一并终止 " + n + " 个后台 Python 任务", "warn", 3600);
   } else if (typeof pvRunningList === "function" && pvRunningList().length) {
     toast("已停止本次生成;后台 Python 任务仍在运行(可在设置 → 工具与权限 里停止)", "info", 4200);
@@ -2446,7 +2498,7 @@ async function sendMessage(text, opts) {
 
   /* ---- 上下文压缩:本 turn 的自动压缩计数复位 + 发送前自动压缩 ----
      这一段在 abortCtrl 创建(下面 1886 行附近)**之前**运行 ⇒ 压缩必须自持 CX_RUN.ctrl,
-     Esc 由 stopGenerating → cxAbortActive 停掉(见 §9.1 的时序陷阱)。
+     Ctrl+Alt+Esc 由 stopGenerating → cxAbortActive 停掉(见 §9.1 的时序陷阱)。
      重生成 / 编辑重发路径(opts.history)按历史截取组装请求,不做自动压缩 */
   CX_RUN.regen = !!opts.history;
   if (!opts.history) {
@@ -2455,7 +2507,7 @@ async function sendMessage(text, opts) {
       var pre = await cxAutoBeforeSend(tf);
       if (pre && pre.code === "ECOMPACT_ABORT") {
         /* 缓冲消息不经输入框:先复位 generating 再放回队首 —— sqRestoreBuf 内部 sqRender 的 hint
-           依赖该顺序(否则短暂显示"本轮结束后自动发送"的残留态);非缓冲路径仍走下面"草稿还回输入框" */
+           依赖该顺序(否则短暂显示"下一轮工具结果后自动发送"的残留态);非缓冲路径仍走下面"草稿还回输入框" */
         if (opts.bufItem) {
           generating = false;
           sqRestoreBuf(opts.bufItem);
@@ -2463,7 +2515,7 @@ async function sendMessage(text, opts) {
           toast("已取消:压缩被中止,本条消息未发送(已放回待发送队列)", "info", 4200);
           return;
         }
-        /* 用户按 Esc 取消了这次压缩 ⇒ **放弃本次发送**(否则"停不掉的压缩 + 照发"是最坏的组合)。
+        /* 用户按 Ctrl+Alt+Esc 取消了这次压缩 ⇒ **放弃本次发送**(否则"停不掉的压缩 + 照发"是最坏的组合)。
            草稿必须还回去:doSend 在调 sendMessage 之前就清空了 elInput / draftFiles,而且不 await 它 ——
            不还就等于把用户的正文与附件吞掉。自动续跑路径(skipUserMsg)下 text === null,
            那条路径**不能**碰输入框/附件条(用户此刻可能正在打字) */
@@ -3005,6 +3057,10 @@ async function sendMessage(text, opts) {
       }
       if (lostTarget) break;
       if (abortCtrl && abortCtrl.signal && abortCtrl.signal.aborted) break;
+      /* ★ 工具轮边界插入:生成期间入队的缓冲消息在「工具结果写入后、下一次模型请求前」
+         逐条作为 user 消息补进会话 —— 下一轮请求立刻带上(中途补充需求)。
+         没插到的(例如这是最后一轮)留在队里,由 finally 的 sqFlushAfterTurn 兜底发送 */
+      sqInsertAtToolBoundary(sendConvId, tf, msgList);
       /* 继续生成:同一 turnId 的新助手消息,渲染时会并进同一个气泡 */
       asst = {
         id: uid(), role: "assistant", content: "", model: model,
@@ -3027,7 +3083,7 @@ async function sendMessage(text, opts) {
   } catch (err) {
     /* 走到这里说明这一轮请求没有成功(中止 / 网络错误 / 4xx):
        把在途的后台任务完成通知回滚成"未通知",下次请求会重新带上 ——
-       否则一次失败(或请求还没发出去就被 Esc)就把完成回流信息永久吞掉。
+       否则一次失败(或请求还没发出去就被 Ctrl+Alt+Esc)就把完成回流信息永久吞掉。
        已经 2xx 过的那次提交是空集,这里重复调用无副作用 */
     pvNotifyRollback();
     if (err && err.name === "AbortError") {
@@ -3325,7 +3381,8 @@ function startEdit(msgEl, msg) {
   box.querySelector('[data-edit="cancel"]').addEventListener("click", function () { renderChat(); });
   ta.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
-    if (e.key === "Escape") renderChat();
+    /* Ctrl/Cmd+Esc 放行给全局中断路径:不当作「取消编辑」 */
+    if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) renderChat();
   });
 }
 function autoGrow(ta) {
@@ -4169,7 +4226,8 @@ function setupNsel(id, options, onChange) {
     var d = nselDef(id);
     if (!d) return;
     var open = nselOpenId === id;
-    if (e.key === "Escape") { if (open) { e.stopPropagation(); closeNsel(); } return; }
+    /* Ctrl/Cmd+Esc 放行给全局中断路径:浮窗开着也不接管、更不 stopPropagation */
+    if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) { if (open) { e.stopPropagation(); closeNsel(); } return; }
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       if (!open) { openNsel(id); return; }
@@ -6042,7 +6100,8 @@ function startRenameConv(c) {
   }
   inp.addEventListener("keydown", function (ev) {
     if (ev.key === "Enter") { ev.preventDefault(); commit(true); }
-    else if (ev.key === "Escape") { ev.preventDefault(); commit(false); }
+    /* Ctrl/Cmd+Esc 放行给全局中断路径:重命名输入框不被它顺手取消 */
+    else if (ev.key === "Escape" && !ev.ctrlKey && !ev.metaKey) { ev.preventDefault(); commit(false); }
   });
   inp.addEventListener("blur", function () { commit(true); });
   inp.addEventListener("click", function (ev) { ev.stopPropagation(); });
@@ -6073,7 +6132,7 @@ function paletteSources() {
     out.push({ group: group, name: name, desc: desc, icon: iconName, key: key, fn: fn });
   }
   add("操作", "新建对话", "Ctrl+N", "plus", "Ctrl N", function () { newConversationUI(); });
-  add("操作", generating ? "停止生成" : "发送当前输入", generating ? "Esc" : "Enter", generating ? "stop" : "send", "Enter",
+  add("操作", generating ? "停止生成" : "发送当前输入", generating ? "Ctrl+Alt+Esc" : "Enter", generating ? "stop" : "send", "Enter",
     function () { if (generating) stopGenerating(); else doSend(); });
   add("操作", "打开设置", "Ctrl+,", "sliders", "Ctrl ,", function () { openSettings(); });
   add("操作", "MCP 工具设置", "模型能否调用工具", "plug", "", function () { openSettings("mcp"); });
@@ -6310,7 +6369,7 @@ function slashMove(dir) {
 function slashBusy(name) {
   var c = slashCommand(name);
   if (!c || !c.idle) return null;
-  if (generating) return "正在生成中,请先按 Esc 停止再执行 /" + c.name;
+  if (generating) return "正在生成中,请先按 Ctrl+Alt+Esc 停止再执行 /" + c.name;
   if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") return "正在压缩中,请稍候";
   return null;
 }
@@ -6783,7 +6842,8 @@ function bindUI() {
   $("find-input").addEventListener("input", function () { runFind($("find-input").value); });
   $("find-input").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { e.preventDefault(); stepFind(e.shiftKey ? -1 : 1); }
-    if (e.key === "Escape") { e.preventDefault(); closeFind(); }
+    /* Ctrl/Cmd+Esc 放行给全局中断路径:查找栏不被它关掉 */
+    if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) { e.preventDefault(); closeFind(); }
   });
   $("find-next").addEventListener("click", function () { stepFind(1); });
   $("find-prev").addEventListener("click", function () { stepFind(-1); });
@@ -6817,7 +6877,7 @@ function bindUI() {
   });
   elInput.addEventListener("keydown", function (e) {
     /* 斜杠浮窗开着时先吃键盘:↑↓(与 Tab)移动、Enter 执行命令(不发送消息)。
-       Esc 交给全局 onKeyDown —— 那里要按「浮窗 → 弹层 → 停止生成」的顺序关 */
+       Esc 交给全局 onKeyDown —— 那里要按「浮窗 → 弹层 → 丢弃待发送缓冲」的顺序关(Ctrl+Alt+Esc 才是中断) */
     if ($("slash-menu").classList.contains("open") && slashItems.length) {
       if (e.key === "ArrowDown") { e.preventDefault(); slashMove(1); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); slashMove(-1); return; }
@@ -6945,7 +7005,8 @@ function bindUI() {
   modelInput.addEventListener("focus", function () { renderModelSuggest(); });
   modelInput.addEventListener("input", function () { renderModelSuggest(); });
   modelInput.addEventListener("keydown", function (e) {
-    if (e.key === "Escape") { hideModelSuggest(); return; }
+    /* Ctrl/Cmd+Esc 放行给全局中断路径:模型候选浮层不被它收掉 */
+    if (e.key === "Escape" && !e.ctrlKey && !e.metaKey) { hideModelSuggest(); return; }
     if (e.key === "Enter") {
       e.preventDefault();
       var v = modelInput.value.trim();
@@ -7191,8 +7252,21 @@ function onKeyDown(e) {
   var inField = e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA");
 
   if (key === "escape") {
+    /* 中断 = 主键 Ctrl+Alt+Esc(macOS 为 Cmd+Esc);**不带 alt** 的 Ctrl/Cmd+Esc 同样支持 ——
+       Windows 把 Ctrl+Esc 占为「打开开始菜单」(页面收不到该按键),故主键取无冲突的
+       Ctrl+Alt+Esc;这里只看 ctrl/meta,既不排除 alt 也不要求 alt。普通 Esc **不再**中断 ——
+       它只按「关浮层 → 关弹层 → 丢弃待发送缓冲」做事(用户 2026-09-15 指令) */
+    if (mod) {
+      e.preventDefault();          /* 拦掉浏览器对 Esc 的默认行为(如停止页面加载);中断是纯应用层动作 */
+      if (generating) { stopGenerating(); return; }
+      /* 手动压缩(generating=false)期间的中断:中止压缩运行(请求与退避 sleep 都会断)。
+         **不**调 stopGenerating —— 它会 denyAllToolWaits / killAllSandboxes / pvSuppressAutoLoop,
+         对手动取消过重且误伤(cxCompactNow 的 finally 会把状态行恢复为「已连接」) */
+      if (typeof cxRunActive === "function" && cxRunActive()) { cxAbortActive("用户取消压缩"); return; }
+      return;
+    }
     if (nselOpenId) { closeNsel(); return; }
-    /* 斜杠浮窗优先于弹层(在 `.modal-mask.open` 判定之前):再按一次才轮到关弹层 / 停止生成 */
+    /* 斜杠浮窗优先于弹层(在 `.modal-mask.open` 判定之前):再按一次才轮到关弹层 / 丢弃待发送缓冲 */
     if ($("slash-menu").classList.contains("open")) { slashClose(); return; }
     var anyOpen = $$(".modal-mask.open").length || popMenuEl.classList.contains("open")
       || $("params-pop").classList.contains("open") || lightboxEl.classList.contains("open")
@@ -7214,11 +7288,10 @@ function onKeyDown(e) {
     /* 浮窗 / 抽屉形态的右栏:Esc 与点遮罩一致地关掉它(列形态下不关,避免与既有习惯冲突) */
     if (!wsRailCollapsed() && wsRailVisible() && wsRailFormGet() !== "column") { wsRailClose(); return; }
     if ($("find-bar").classList.contains("open")) { closeFind(); return; }
-    if (generating) { stopGenerating(); return; }
-    /* 手动压缩(generating=false)期间的 Esc:中止压缩运行(请求与退避 sleep 都会断)。
-       **不**调 stopGenerating —— 它会 denyAllToolWaits / killAllSandboxes / pvSuppressAutoLoop,
-       对手动取消过重且误伤(cxCompactNow 的 finally 会把状态行恢复为「已连接」) */
-    if (typeof cxRunActive === "function" && cxRunActive()) { cxAbortActive("用户取消压缩"); return; }
+    /* 普通 Esc 的最后一步:丢弃待发送缓冲(不再停止生成 —— 中断已改为 Ctrl+Alt+Esc)。
+       判据用可见性/归属(I6,同 sqRender 的 show):缓冲属于别的会话时浮窗不可见,
+       别丢用户看不见的东西;缓冲为空则不再有其它动作 */
+    if (sqHasFor(conv && conv.id)) { sqDiscardAll(); toast("已丢弃待发送内容", "info", 2400); return; }
     return;
   }
   /* 有弹窗(任何 .modal-mask.open,含动态确认弹窗 #ask-modal-dyn)开着时,其余全局快捷键
@@ -8882,7 +8955,8 @@ function wsAskChoice(title, message, options) {
       resolve(options[i] ? options[i].v : null);
     }
     function onKey(e) {
-      if (e.key !== "Escape") return;
+      /* Ctrl/Cmd+Esc 放行给全局中断路径(停止生成 / 中止压缩):弹窗不接管,自己也不被它关掉 */
+      if (e.key !== "Escape" || e.ctrlKey || e.metaKey) return;
       e.stopImmediatePropagation();    /* 别让全局 Esc 顺手关掉后面的设置弹窗 */
       done(defIdx);
     }
@@ -9039,7 +9113,8 @@ function openAskDialog(spec) {
        没选「延迟 250ms 再聚焦 + 期间 disabled」:那条路会把用户已经决定的快速回车也一并吞掉,
        还要和 submit() 里 Promise 分支的 okBtn.disabled 状态纠缠,改动面反而更大 */
     if (e.key === "Enter" && e.repeat) { e.preventDefault(); return; }
-    if (e.key !== "Escape") return;
+    /* Ctrl/Cmd+Esc 放行给全局中断路径(停止生成 / 中止压缩):弹窗不接管,自己也不被它关掉 */
+    if (e.key !== "Escape" || e.ctrlKey || e.metaKey) return;
     e.stopImmediatePropagation();    /* 别让全局 Esc 顺手关掉后面的设置弹窗 */
     close();
   }

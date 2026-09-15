@@ -610,7 +610,7 @@ function toolStatusText(m) {
   if (askUserPending(m)) return "等待你回答";
   if (m.status === "running") return "运行中…";
   if (m.status === "denied") return "已拒绝";
-  /* 外部 MCP 调用可被 Esc 经 AbortSignal 中断:
+  /* 外部 MCP 调用可被 Ctrl+Alt+Esc 经 AbortSignal 中断:
      与「执行失败」区分开,否则用户会以为工具本身出错了 */
   if (m.status === "aborted") return "已中止" + (m.ms ? " · " + m.ms + " ms" : "");
   if (m.status === "error") return askUserCard(m) ? "提问未完成" + (m.ms ? " · " + m.ms + " ms" : "")
