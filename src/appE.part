@@ -451,7 +451,7 @@ var AGENT_TOOLS = [
         "**后台任务**",
         "- 长任务请用 `run_in_background=true`:立刻返回 `task_id`,执行在后台继续跑;完成时**会自动通知你**(空闲时自动回到对话),所以**不要反复轮询**。要看进度用 TaskOutput(task_id),要阻塞等它结束用 WaitFor(timeout_ms ≤60000,等超时**不是错误**),要停它用 TaskStop;后台任务有独立的超时上限(设置里可配,默认 30 分钟)。",
         "- 停止生成或超时都会直接销毁解释器:变量与导入全部丢失,下次执行要重新启动(约几秒);已经写进工作区的产物不受影响。",
-        "- TaskStop 与超时一样是直接销毁解释器:① 变量与已导入的包全丢;② 下次执行要重新启动并重装包;③ 未回写的产物丢失。停止生成(Ctrl+Alt+Esc)只中止前台执行,**不会**杀后台任务(除非在设置里打开「停止生成时也终止后台任务」);同时最多 2 个未完成任务,第 3 个会被拒绝(`EBUSY`),请先 TaskStop 或用 WaitFor。",
+        "- TaskStop 与超时一样是直接销毁解释器:① 变量与已导入的包全丢;② 下次执行要重新启动并重装包;③ 未回写的产物丢失。停止生成(Ctrl+X)只中止前台执行,**不会**杀后台任务(除非在设置里打开「停止生成时也终止后台任务」);同时最多 2 个未完成任务,第 3 个会被拒绝(`EBUSY`),请先 TaskStop 或用 WaitFor。",
         "- 任务只活在当前页面:刷新或关闭页面后任务与记录**全部消失**(没有失联历史);长任务请让脚本把中间结果写进工作区文件。"
       ].join("\n");
     },
@@ -648,7 +648,7 @@ var AGENT_TOOLS = [
      defaultPerm 有意取 "allow"(与其余内置工具一致,单独改成「询问」会让"提问"先要一次"放行"):
      用户随时可在 设置 → MCP 工具 把它单独设为「询问 / 禁止」。
      防滥用靠:每轮调用次数上限(toolRun 统一计数)、一次工具轮只可能有一张待答卡(调用侧顺序 await)、
-     用户可随时「跳过」、Ctrl+Alt+Esc/停止经 ctx.signal 结算为 aborted、刷新后由 askUserSweepStale() 收敛。
+     用户可随时「跳过」、Ctrl+X/停止经 ctx.signal 结算为 aborted、刷新后由 askUserSweepStale() 收敛。
      不设 cap:它不依赖 Worker / 网络,不参与 toolSupported 的能力降级。 */
   {
     name: "AskUser",
@@ -1167,7 +1167,7 @@ function denyAllToolWaits() {
    一次工具轮里只可能有一张待答卡(调用侧顺序 await toolRun,见 appD 的 for…await);
    结果契约与 Kimi 一致:{answers:{<问题原文>:<选项标签 / 用户自述>}};跳过 = 空 answers + note。
    防滥用上限:每轮调用次数受 toolLimits.maxCalls 约束(toolRun 统一计数,不另设专属上限)、
-   同会话同时只有一张待答卡、用户随时可「跳过」、Ctrl+Alt+Esc/停止经 ctx.signal 结算为 aborted、
+   同会话同时只有一张待答卡、用户随时可「跳过」、Ctrl+X/停止经 ctx.signal 结算为 aborted、
    刷新/关页后由 askUserSweepStale() 把没人等的残卡收敛掉。 */
 var ASK_WAITS = {};          /* msgId → resolve(out);空表 = 页面上没有任何人在等答案 */
 var ASK_DRAFT = {};          /* msgId → {sel:{i:idx|[idx]}, text:{i:string}, other:{i:bool}}(纯内存,结算即清) */
@@ -1613,7 +1613,7 @@ async function toolRun(call, tmsg, targetConv) {
   if (!out || typeof out !== "object") out = { ok: false, error: "工具没有返回结果", logs: [] };
   tmsg.ms = Date.now() - t0;
   tmsg.logs = out.logs || [];
-  /* 被中止(AbortSignal)与「执行失败」要分开显示:外部 MCP 调用可以被 Ctrl+Alt+Esc 中断 */
+  /* 被中止(AbortSignal)与「执行失败」要分开显示:外部 MCP 调用可以被 Ctrl+X 中断 */
   tmsg.status = out.ok ? "ok" : (out.aborted ? "aborted" : "error");
   tmsg.content = toolResultText(out, tool.name);
   /* 工具读取的图片等内联媒体:挂在消息上(m.media),不进 resultText(不复制字节) */
@@ -8506,7 +8506,7 @@ function pvTaskBlock(targetConv) {
   var text = pvTaskBlockText(targetConv);
   if (!text) return "";
   /* 登记循环:这里**只登记在途**,不直接置 notified —— buildBody 是在发起请求之前拼 sys 的,
-     若这次请求随后失败(网络错误 / 4xx / 用户立刻 Ctrl+Alt+Esc),模型根本没看到这条通知,
+     若这次请求随后失败(网络错误 / 4xx / 用户立刻 Ctrl+X),模型根本没看到这条通知,
      置真就等于把完成回流信息静默吞掉(「完成会自动通知你」的承诺就落空了)。
      真正的 notified:true 由本轮请求**解析成功**之后(不是 HTTP 2xx)的 pvNotifyCommit() 落,
      失败 / 中止 / 流内报错由 pvNotifyRollback() 回滚。
@@ -8755,7 +8755,7 @@ function cxElisionNote(tokens) {
    有 detail 时 ECOMPACT_FAIL 文案 = "摘要生成失败:" + detail + "(会话未改动)"
    (第二参 withSingleUserHint 的布尔语义保持不变,旧调用点无需迁移) */
 function cxCodeText(code, withSingleUserHint, detail) {
-  if (code === "ECOMPACT_BUSY") return "已有压缩在进行或正在生成中(生成中可先按 Ctrl+Alt+Esc 停止);请在这之后重试";
+  if (code === "ECOMPACT_BUSY") return "已有压缩在进行或正在生成中(生成中可先按 Ctrl+X 停止);请在这之后重试";
   if (code === "ECOMPACT_SMALL") return "当前上下文还很小,无需压缩";
   if (code === "ECOMPACT_NOSPACE") {
     var s = "可压缩的较早消息不足,压缩后仍可能超出窗口";
@@ -9291,7 +9291,7 @@ function cxClassifySummaryFailure(status, errText, finish, text) {
   /* ⑥ 其余 4xx(401/403/404/422 非超窗等)⇒ 直接失败 */
   return { kind: "http_fatal", note: "HTTP " + st + (raw ? ":" + safeJson(raw, 120) : "") };
 }
-/* Ctrl+Alt+Esc 接线的只读助手:压缩运行是否在进行(phase 非 idle = 请求中 / 退避中 / 应用段) */
+/* Ctrl+X 接线的只读助手:压缩运行是否在进行(phase 非 idle = 请求中 / 退避中 / 应用段) */
 function cxRunActive() { return CX_RUN.phase !== "idle"; }
 
 /* ---- 摘要输入投影:已随 batch-25 整体退役 ----
@@ -9646,7 +9646,7 @@ async function cxCompactNow(convObj, opts) {
   CX_RUN.source = source;
   CX_RUN.startedAt = Date.now();
   /* 运行级 AbortController:整段压缩运行(请求 + 退避 sleep + 应用前复检)共用 ——
-     CX_RUN.ctrl 的语义从「每次请求」改为「整段运行」,由 cxAbortActive(Ctrl+Alt+Esc / 停止生成)一键中止。
+     CX_RUN.ctrl 的语义从「每次请求」改为「整段运行」,由 cxAbortActive(Ctrl+X / 停止生成)一键中止。
      opts.signal(可选的外部 bridge)仍照旧接入:它 abort ⇒ 桥到运行级 ctrl */
   var runCtrl = new AbortController();
   CX_RUN.ctrl = runCtrl;
@@ -9781,7 +9781,7 @@ async function cxCompactTool(args, ctx) {
 async function cxCompactUIApply(convId, instruction) {
   var c = convId ? getConv(convId) : conv;
   if (!c) { toast("还没有对话,先发一条消息", "warn"); return; }
-  if (generating) { toast("正在生成中,请先按 Ctrl+Alt+Esc 停止再压缩", "warn", 3600); return; }
+  if (generating) { toast("正在生成中,请先按 Ctrl+X 停止再压缩", "warn", 3600); return; }
   if (CX_RUN.phase !== "idle") { toast("已有压缩在进行,请稍候", "warn", 3600); return; }
   var plan = cxPlanFor(c, "manual");
   if (!plan.ok) { toast("无法压缩:" + cxCodeText(plan.code, true), "warn", 6200); return; }
@@ -9794,8 +9794,8 @@ async function cxCompactUIApply(convId, instruction) {
   if (state.settings.ctxMsgs > 0) {
     msg += "★ 已开启「携带历史条数上限(" + state.settings.ctxMsgs + " 条)」:压缩后的摘要与尾部可能被条数截断。";
   }
-  /* R9:摘要输入 = 全量历史,长会话冷前缀可能数分钟;状态行有"已用 M 秒",Ctrl+Alt+Esc 可随时取消 */
-  msg += "长会话可能需要数分钟(状态行会显示已用时长,按 Ctrl+Alt+Esc 可随时取消)。";
+  /* R9:摘要输入 = 全量历史,长会话冷前缀可能数分钟;状态行有"已用 M 秒",Ctrl+X 可随时取消 */
+  msg += "长会话可能需要数分钟(状态行会显示已用时长,按 Ctrl+X 可随时取消)。";
   askConfirm({
     title: "压缩上下文", icon: "layers", okText: "压缩",
     message: msg
@@ -9823,7 +9823,7 @@ async function cxCompactUIApply(convId, instruction) {
   });
 }
 /* ---- 中止 / 账本收敛 ---- */
-/* Ctrl+Alt+Esc / 停止生成时中止进行中的压缩(**不读模块级 abortCtrl**:发送前窗口里它是 null);
+/* Ctrl+X / 停止生成时中止进行中的压缩(**不读模块级 abortCtrl**:发送前窗口里它是 null);
    待应用的压缩(pending)一并作废 —— 用户在压缩准备期间按了停止,就不该再改数据 */
 function cxAbortActive(reason) {
   if (CX_RUN.ctrl) { try { CX_RUN.ctrl.abort(); } catch (e) {} }

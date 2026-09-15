@@ -92,7 +92,7 @@ var CX_HEAD_TOK = 2000;         // 最早用户输入保留预算(= Kimi COMPACT
 var CX_KEEP_MAX_MSGS = 8;       // 保留尾部最多几条消息(我们的扩展预算,非 Kimi 原值)
 var CX_LOOP_TAIL_MIN = 2;       // 「单用户轮有界 tail 档」要求 tail 至少含这么多个完整工具循环
 var CX_RESERVE_MIN = 16384;     // 冗余触发项下限:reserve = min(max(本值, win*0.05), win*0.5)
-var CX_SUMMARY_TIMEOUT_MS = 900000;   // 摘要请求超时(ms);每次尝试各计。全量输入后 180s 会在长会话误杀 ⇒ 抬到 15 分钟(Ctrl+Alt+Esc 可随时取消)
+var CX_SUMMARY_TIMEOUT_MS = 900000;   // 摘要请求超时(ms);每次尝试各计。全量输入后 180s 会在长会话误杀 ⇒ 抬到 15 分钟(Ctrl+X 可随时取消)
 var CX_MIN_MSGS = 4;            // 少于这么多条消息时拒绝压缩(可压缩内容不足)
 /* ---- 摘要请求的预算 / 重试链(对齐 Kimi fullCompaction;口径见 shared/specs/compact-align-kimi-plan.md §3.2/§3.4) ---- */
 var CX_SUMMARY_OUT_CAP = 131072;        // 摘要输出预算封顶(= Kimi DEFAULT_COMPACTION_MAX_COMPLETION_TOKENS = 128*1024)
@@ -245,7 +245,7 @@ var SHORTCUTS = [
   ["Ctrl + Shift + L", "切换深色 / 浅色"],
   ["Ctrl + Alt + C", "复制最后一条回答"],
   ["Ctrl + O", "展开 / 折叠压缩总结"],
-  ["Ctrl + Alt + Esc", "停止生成 / 中止手动压缩"],
+  ["Ctrl + X", "停止生成 / 中止手动压缩"],
   ["Esc", "关闭弹层 / 丢弃待发送缓冲"],
   ["↑ / ↓(命令面板)", "选择条目"],
   ["PageUp / PageDown", "滚动对话"]

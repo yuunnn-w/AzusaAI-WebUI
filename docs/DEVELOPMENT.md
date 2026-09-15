@@ -310,7 +310,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | `CX_KEEP_MAX_MSGS` | 8 | 保留尾部最多几条消息（`auto` 向左扩展时的约束） |
 | `CX_LOOP_TAIL_MIN` | 2 | 「单用户轮有界 tail 档」要求尾部至少含这么多个**完整工具循环** |
 | `CX_MIN_MSGS` | 4 | 少于这么多条消息时拒绝压缩（`ECOMPACT_SMALL`） |
-| `CX_SUMMARY_TIMEOUT_MS` | 900000 | 摘要请求超时（**每次尝试各计**；全量输入后在长会话可能数分钟，`Ctrl+Alt+Esc` 可随时取消） |
+| `CX_SUMMARY_TIMEOUT_MS` | 900000 | 摘要请求超时（**每次尝试各计**；全量输入后在长会话可能数分钟，`Ctrl+X` 可随时取消） |
 | `CX_SUMMARY_OUT_CAP` / `CX_SUMMARY_OUT_MIN` / `CX_SUMMARY_FIT_MARGIN_RATIO` | 131072 / 4096 / 0.05 | 摘要输出预算：封顶（Kimi `128*1024`）/ 适配收窄下限 / 输入估算余量（配套下限 1024） |
 | `CX_SUMMARY_ATTEMPTS_MAX` / `CX_SUMMARY_SHRINK_RATIOS` / `CX_SUMMARY_SHRINK_MAX` | 5 / `[0.7,0.5,0.35]` / 3 | 重试链：总尝试上限 / 溢出缩窗比例 / 缩窗次数上限（Kimi 同值） |
 | `CX_SUMMARY_BACKOFF_BASE_MS` / `_MAX_MS` / `_JITTER` | 500 / 32000 / 0.25 | 可重试错误的指数退避（`min(500×2^i, 32s)`，+0~25% 抖动） |
@@ -329,7 +329,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 **释放后置与共享 blob 陷阱（改这块之前必读）**：被丢弃消息的附件**不在 splice 里删**——`cxDropMessages(conv, from, to)` 只做「收集键 + 估算 token + splice」，释放必须由调用方在**保留集重插回数组之后**执行 `cxReleasePlan(keys)`（`keep = cxSurvivingBlobKeys()` 是**全库引用重算**，因此 `duplicateConv` 副本共享的键、以及 head 保留消息自己引用的键都会被保护），唯一的异步出口是 `cxReleaseBlobs(todo)`。三条顺序契约：① 先移除 + 重插保留集，再释放；② `keep` 重算必须在同步块结束、head 回位之后取；③ 同步块内不得 `await`（双标签页的 `pullConvsFromIdb`/`mergeConvs*` 可能在整个 await 之后替换数组）。
 **统一口径的五个调用点**（此前四处既有缺陷 + 一处同源）：`clearConvMessagesNow`、`trimConversation`、`compressOneConv`、清理空间的内联 80 条裁剪、`stripAttachmentData` —— 一律 `var p = cxReleasePlan(keys); if (p.todo.length) cxReleaseBlobs(p.todo);`。
 
-**失败/取消零改动**：摘要成功后才动数据；动数据前过两道闸（非工具路径 = `cxHistoryHash` 相等 **且** `cxHistoryPrefixIntact`；工具路径 = 前缀完整、允许尾部增长）；`cxApplyCompaction` 先按 id 重取会话（`getConv(conv.id)`），其后只用重取到的对象。工具路径「只算不落」（`CX_RUN.pending`），应用点是**本轮所有工具调用结束后**的唯一一处（`await cxApplyPending(tf)`，漏 `await` 会让被删消息继续发给模型）。**取消通道 = 运行级 `AbortController`**：`CX_RUN.ctrl` 在整段压缩运行期间持有（请求与退避 `cxSummarySleep` 共用同一 signal；`cxCallSummary` 把它桥进本次请求的局部 ctrl，不再自设/自清 `CX_RUN.ctrl`）；`Ctrl+Alt+Esc`（macOS `Cmd+Esc`）在生成中走 `stopGenerating → cxAbortActive`（既有链路），手动压缩（`generating=false`）走 `cxRunActive → cxAbortActive`（**不**调 `stopGenerating`，避免误杀沙箱 / 工具等待 / 自动续跑）；ladder 另有「成功前 abort 复检」关闭「响应已到、应用未开始」的窄窗。
+**失败/取消零改动**：摘要成功后才动数据；动数据前过两道闸（非工具路径 = `cxHistoryHash` 相等 **且** `cxHistoryPrefixIntact`；工具路径 = 前缀完整、允许尾部增长）；`cxApplyCompaction` 先按 id 重取会话（`getConv(conv.id)`），其后只用重取到的对象。工具路径「只算不落」（`CX_RUN.pending`），应用点是**本轮所有工具调用结束后**的唯一一处（`await cxApplyPending(tf)`，漏 `await` 会让被删消息继续发给模型）。**取消通道 = 运行级 `AbortController`**：`CX_RUN.ctrl` 在整段压缩运行期间持有（请求与退避 `cxSummarySleep` 共用同一 signal；`cxCallSummary` 把它桥进本次请求的局部 ctrl，不再自设/自清 `CX_RUN.ctrl`）；`Ctrl+X`（macOS `Cmd+X`）在生成中走 `stopGenerating → cxAbortActive`（既有链路），手动压缩（`generating=false`）走 `cxRunActive → cxAbortActive`（**不**调 `stopGenerating`，避免误杀沙箱 / 工具等待 / 自动续跑）；ladder 另有「成功前 abort 复检」关闭「响应已到、应用未开始」的窄窗。
 
 **摘要与用量环**：摘要请求的 token 消耗**不进**用量环与累计统计（它是管理开销）；压缩成功后目标会话的实测锚点作废（`usage.exact = false`、`lastMsgId = ""`，累计量不动），否则用量环不下降、去重与触发判定失真。
 
