@@ -1,0 +1,34 @@
+# ── 上游发行版（约 140MB）：只在重新生成 src/*.part 时才需要，可随时重新获取 ──
+#    保留在磁盘上供本地构建/再生成使用，但不进版本库（再生成步骤见 docs/PDFJS-NOTES.md、docs/TESS-NOTES.md）
+vendor/
+
+# 依赖目录（本项目不使用 npm 构建；目录一旦出现一律忽略）
+node_modules/
+
+# 轻档载荷（normal / minimal）：本地生成、按需分发，不进版本库
+#   （src/pyodide.part = 完整版载荷，仍入库；下面的通配不匹配它）
+src/pyodide-*.part
+
+# 三档分发产物（代码目录根 AzusaAI-WebUI-{full,normal,minimal}.html）：本地构建生成，
+#   只在分发时拷出去（外层工作区留档 / 传 Release 附件），不进版本库
+/AzusaAI-WebUI-*.html
+
+# 构建暂存文件（build.js 先写 <final>.tmp-<pid>、全部成功后才 rename；
+#   进程被杀留下的残渣别误入库）
+*.html.tmp-*
+
+# 旧产物名（防误写误入库）：防旧脚本 / `--out=index.html` 重新写出后被 git add 误入库
+/index.html
+
+# 旧分档输出目录（旧 dist/ 布局已弃用；条目保留，防旧脚本写出的产物被误提交）
+dist/
+
+# 编辑器 / 系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.log
+*.swp
+*~

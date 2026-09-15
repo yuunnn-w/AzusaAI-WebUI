@@ -1,0 +1,4 @@
+# 本仓库对行尾敏感（构建产物与源码按 LF 逐行校验/比对），禁止任何自动行尾转换。
+# 无论克隆到哪个平台，工作区文件与库内存储都保持提交时的原始字节（LF）。
+* -text
+src/pyodide.part filter=lfs diff=lfs merge=lfs -text

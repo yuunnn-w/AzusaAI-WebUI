@@ -1,0 +1,110 @@
+{
+  "schema": 1,
+  "pyodideVersion": "314.0.6",
+  "catalog": "vendor/pyodide-src/packages.json",
+  "unavailable": ["img2pdf", "sectionproperties", "lifelines", "reliability", "micropip"],
+  "cullGroups": {
+    "dataeng": { "zh": "数据工程/大数据格式与引擎" },
+    "vertical": { "zh": "行业垂直专业件" },
+    "science": { "zh": "科学计算与信号/统计" },
+    "ml": { "zh": "机器学习" },
+    "vision": { "zh": "图像与视觉" },
+    "dev": { "zh": "网络与开发工具" },
+    "viz": { "zh": "交互可视化" },
+    "office": { "zh": "办公文档" },
+    "dup": { "zh": "重复能力(已有替代)" },
+    "dep": { "zh": "随上游一起裁掉的依赖" }
+  },
+  "profiles": [
+    {
+      "id": "full",
+      "label": "完整版",
+      "partFile": "src/pyodide.part",
+      "outFile": "AzusaAI-WebUI-full.html",
+      "tracked": true,
+      "profileSection": false,
+      "topLevel": [
+        "numpy", "sympy", "pandas", "matplotlib", "pillow", "lxml", "beautifulsoup4", "regex",
+        "requests", "pyodide-http", "jsonschema", "python-dateutil", "pytz", "tzdata",
+        "scipy", "scikit-learn", "statsmodels", "xgboost",
+        "scikit-image", "opencv-python", "imageio", "shapely", "networkx", "pywavelets", "soundfile", "uncertainties", "wordcloud",
+        "httpx", "aiohttp", "jinja2", "more-itertools", "toolz", "sortedcontainers", "pyyaml", "tomli-w", "pytest", "coverage", "pytest-asyncio", "altair",
+        "openpyxl", "python-docx", "python-pptx", "pypdf", "reportlab", "xlsxwriter", "docxtpl", "markdown", "tabulate", "tenacity", "pint", "imagehash", "qrcode",
+        "pyarrow", "duckdb", "h5py", "sqlalchemy", "xarray", "zarr", "fsspec", "msgpack", "lz4", "zstandard",
+        "pyproj", "coolprop",
+        "ipython", "bokeh",
+        "pdfplumber", "fpdf2", "ezdxf", "trimesh", "meshio", "numpy-stl", "laspy", "control", "rainflow", "fatpack", "fluids", "ambiance", "pyloudnorm", "pyuff", "pingouin"
+      ],
+      "expect": {
+        "sections": 156,
+        "textSections": 3,
+        "wheels": 151,
+        "embeddedBytes": 186333848,
+        "lockBytes": 45212,
+        "partBytes": 195811297
+      }
+    },
+    {
+      "id": "normal",
+      "label": "正常版",
+      "partFile": "src/pyodide-normal.part",
+      "outFile": "AzusaAI-WebUI-normal.html",
+      "tracked": false,
+      "profileSection": true,
+      "topLevel": [
+        "numpy", "sympy", "pandas", "matplotlib", "pillow", "lxml", "beautifulsoup4", "regex",
+        "requests", "pyodide-http", "jsonschema", "python-dateutil", "pytz", "tzdata",
+        "scipy", "scikit-learn", "statsmodels", "xgboost",
+        "scikit-image", "opencv-python", "imageio", "shapely", "networkx", "pywavelets", "soundfile", "uncertainties", "wordcloud",
+        "httpx", "aiohttp", "jinja2", "more-itertools", "toolz", "sortedcontainers", "pyyaml", "tomli-w", "pytest", "coverage", "pytest-asyncio", "altair",
+        "openpyxl", "python-docx", "python-pptx", "pypdf", "reportlab", "xlsxwriter", "docxtpl", "markdown", "tabulate", "tenacity", "pint", "imagehash", "qrcode"
+      ],
+      "culled": {
+        "dataeng": ["pyarrow", "duckdb", "h5py", "sqlalchemy", "xarray", "zarr", "fsspec", "msgpack", "lz4", "zstandard"],
+        "vertical": ["pyproj", "coolprop", "ezdxf", "trimesh", "numpy-stl", "meshio", "laspy", "control", "rainflow", "fatpack", "fluids", "ambiance", "pyloudnorm", "pyuff"],
+        "dup": ["fpdf2", "pingouin", "pdfplumber"],
+        "viz": ["bokeh"],
+        "dev": ["ipython"]
+      },
+      "expect": {
+        "sections": 105,
+        "textSections": 4,
+        "wheels": 99,
+        "embeddedBytes": 114302412,
+        "lockBytes": 29764,
+        "partBytes": 123762373
+      }
+    },
+    {
+      "id": "minimal",
+      "label": "极简版",
+      "partFile": "src/pyodide-minimal.part",
+      "outFile": "AzusaAI-WebUI-minimal.html",
+      "tracked": false,
+      "profileSection": true,
+      "topLevel": [
+        "numpy", "sympy", "pandas", "matplotlib", "pillow", "lxml", "beautifulsoup4", "regex",
+        "requests", "pyodide-http", "jsonschema", "python-dateutil", "pytz", "tzdata"
+      ],
+      "culled": {
+        "dataeng": ["pyarrow", "duckdb", "h5py", "sqlalchemy", "xarray", "zarr", "fsspec", "msgpack", "lz4", "zstandard"],
+        "vertical": ["pyproj", "coolprop", "ezdxf", "trimesh", "numpy-stl", "meshio", "laspy", "control", "rainflow", "fatpack", "fluids", "ambiance", "pyloudnorm", "pyuff"],
+        "science": ["scipy", "statsmodels", "pywavelets", "soundfile", "uncertainties", "pint", "networkx", "shapely"],
+        "ml": ["scikit-learn", "xgboost"],
+        "vision": ["scikit-image", "opencv-python", "imageio", "imagehash", "wordcloud"],
+        "dev": ["ipython", "httpx", "aiohttp", "jinja2", "more-itertools", "toolz", "sortedcontainers", "pyyaml", "tomli-w", "pytest", "coverage", "pytest-asyncio"],
+        "viz": ["bokeh", "altair"],
+        "office": ["openpyxl", "python-docx", "python-pptx", "pypdf", "reportlab", "xlsxwriter", "docxtpl", "markdown", "tabulate", "tenacity", "qrcode"],
+        "dup": ["fpdf2", "pingouin", "pdfplumber"]
+      },
+      "expect": {
+        "sections": 39,
+        "textSections": 4,
+        "wheels": 33,
+        "embeddedBytes": 32827748,
+        "lockBytes": 10134,
+        "partBytes": 42265436
+      }
+    }
+  ]
+}

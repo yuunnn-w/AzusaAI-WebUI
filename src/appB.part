@@ -1,0 +1,98 @@
+
+/* ---------------------------------------------------------------------------
+   8. 数学公式(KaTeX,已随本文件内嵌,不联网)
+
+   做法:先把公式从 Markdown 源文本里"挖"出来换成占位符,交给 marked 处理,
+   处理完再把占位符替换成 KaTeX 的渲染结果。
+   这样公式里的 \\ (换行)、\{ \} \& \, 等就不会被 Markdown 的转义规则吃掉
+   —— 直接把 $$…$$ 交给 marked 时,`\\` 会被当成"转义的反斜杠"变成一个 `\`,
+   矩阵、cases、align 全都会塌成一行。
+--------------------------------------------------------------------------- */
+var hasKatex = typeof window.katex !== "undefined";
+var MATH_TOKEN = "@@KWMATH";
+var MATH_MACROS = {
+  "\\RR": "\\mathbb{R}", "\\NN": "\\mathbb{N}", "\\ZZ": "\\mathbb{Z}", "\\QQ": "\\mathbb{Q}",
+  "\\CC": "\\mathbb{C}", "\\deg": "^{\\circ}", "\\d": "\\mathrm{d}", "\\eps": "\\varepsilon"
+};
+
+/* 按围栏代码块把文本切成若干段,标出哪些段属于代码(代码里不解析公式) */
+function splitCodeSegments(text) {
+  var lines = String(text).split("\n");
+  var segs = [], buf = [], curCode = false, inFence = false, fenceCh = "";
+  function flush() {
+    if (buf.length) segs.push({ code: curCode, text: buf.join("\n") });
+    buf = [];
+  }
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i], isFenceLine = false;
+    var m = /^[ \t]*(`{3,}|~{3,})/.exec(line);
+    if (m) {
+      var c = m[1].charAt(0);
+      if (!inFence) { inFence = true; fenceCh = c; }
+      else if (c === fenceCh) { inFence = false; }
+      isFenceLine = true;
+    }
+    var code = isFenceLine || inFence;
+    if (code !== curCode) { flush(); curCode = code; }
+    buf.push(line);
+  }
+  flush();
+  return segs;
+}
+
+/* 行内公式:跳过 `行内代码`,`$…$` 要求首尾不贴空格 */
+function protectInlineMath(seg, spans) {
+  return String(seg)
+    .replace(/\\\(([\s\S]*?)\\\)/g, function (m, tex) { return mathPlaceholder(tex, false, spans); })
+    .replace(/\$([^$\n]+?)\$/g, function (m, tex) {
+      if (/^\s/.test(tex) || /\s$/.test(tex)) return m;
+      return mathPlaceholder(tex, false, spans);
+    });
+}
+function protectLineMath(line, spans) {
+  var re = /(`+)([^`\n]*?)\1/g, out = "", last = 0, m;
+  while ((m = re.exec(line))) {
+    out += protectInlineMath(line.slice(last, m.index), spans) + m[0];
+    last = m.index + m[0].length;
+  }
+  return out + protectInlineMath(line.slice(last), spans);
+}
+function mathPlaceholder(tex, display, spans) {
+  spans.push({ tex: tex, display: !!display });
+  return MATH_TOKEN + (spans.length - 1) + "@@";
+}
+function protectMath(text, spans) {
+  var segs = splitCodeSegments(text), out = [];
+  for (var i = 0; i < segs.length; i++) {
+    if (segs[i].code) { out.push(segs[i].text); continue; }
+    var seg = segs[i].text
+      .replace(/\$\$([\s\S]*?)\$\$/g, function (m, tex) { return mathPlaceholder(tex, true, spans); })
+      .replace(/\\\[([\s\S]*?)\\\]/g, function (m, tex) { return mathPlaceholder(tex, true, spans); });
+    var lines = seg.split("\n");
+    for (var k = 0; k < lines.length; k++) lines[k] = protectLineMath(lines[k], spans);
+    out.push(lines.join("\n"));
+  }
+  return out.join("\n");
+}
+
+/* 把占位符换成 KaTeX 输出;失败时退化为可读的原文 */
+function substituteMath(html, spans) {
+  if (!spans || !spans.length) return html;
+  var re = new RegExp(MATH_TOKEN + "(\\d+)@@", "g");
+  return String(html).replace(re, function (m, idx) {
+    var sp = spans[Number(idx)];
+    if (!sp) return "";
+    if (!hasKatex) return '<span class="katex-error">' + escapeHtml(sp.tex) + "</span>";
+    try {
+      return katex.renderToString(sp.tex, {
+        displayMode: !!sp.display,
+        throwOnError: false,
+        strict: false,
+        trust: false,
+        macros: MATH_MACROS
+      });
+    } catch (e) {
+      return '<span class="katex-error">' + escapeHtml(sp.tex) + "</span>";
+    }
+  });
+}

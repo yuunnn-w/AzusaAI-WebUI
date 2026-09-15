@@ -1,0 +1,11 @@
+# 本项目对行尾敏感：产物与源码按 LF 逐行校验/比对，CR 会让载荷段错位。
+# 统一 UTF-8 + LF + 文件尾空行；缩进宽度不强制（markdown / JS 沿用文件既有风格）。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+[*.{md,js,json}]
+indent_style = space

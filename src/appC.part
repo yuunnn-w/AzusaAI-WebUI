@@ -1,0 +1,1139 @@
+
+/* ---------------------------------------------------------------------------
+   9. 代码块增强
+--------------------------------------------------------------------------- */
+var hasHljs = typeof window.hljs !== "undefined";
+/* 代码块在气泡内最多显示的行数(直接读 CSS 变量 --code-lines,避免两处定义不一致) */
+var CODE_LINES = (function () {
+  try {
+    var v = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--code-lines"), 10);
+    return v > 0 ? v : 10;
+  } catch (e) { return 10; }
+})();
+function enhanceBlocks(root, streaming) {
+  var pres = root.querySelectorAll("pre");
+  for (var i = 0; i < pres.length; i++) {
+    var pre = pres[i];
+    if (pre.getAttribute("data-enhanced") === "1") continue;
+    var code = pre.querySelector("code");
+    if (!code) continue;
+    var m = /language-([\w+#.-]+)/.exec(code.className || "");
+    var lang = m ? m[1] : "";
+    if (hasHljs && !code.getAttribute("data-hl")) {
+      code.setAttribute("data-hl", "1");
+      try { hljs.highlightElement(code); } catch (e) {}
+    }
+    var plain = String(code.textContent == null ? "" : code.textContent);
+    var lines = plain.split(String.fromCharCode(10)).length;
+    if (lines > 1 && plain.charAt(plain.length - 1) === String.fromCharCode(10)) lines--;
+    /* 新增的代码块在流式输出期间默认粘底(跟随最新一行);
+       用户手动滚动后由 restoreScrollState 用记录值覆盖 */
+    if (streaming) code.setAttribute("data-stick", "1");
+    var runnable = /^(html|htm|svg)$/i.test(lang);
+    var head = document.createElement("div");
+    head.className = "code-head";
+    head.innerHTML = '<span class="ch-lang"><span class="ch-dot"></span>' + escapeHtml(lang || "code") +
+      '<span class="ch-lines">· ' + lines + " 行</span></span>" +
+      '<span class="ch-ops">' +
+      (runnable ? '<button type="button" data-code="run" data-mime="' +
+        (/^svg$/i.test(lang) ? "image/svg+xml" : "text/html") + '" title="在新标签页运行">' +
+        icon("play", "sm") + " 运行</button>" : "") +
+      (lines > CODE_LINES ? '<button type="button" data-code="expand">展开全部</button>' : "") +
+      '<button type="button" data-code="wrap">' + (state.settings.codeWrap ? "不换行" : "自动换行") + "</button>" +
+      '<button type="button" data-code="copy">' + icon("copy", "sm") + " 复制</button></span>";
+    pre.insertBefore(head, code);
+    pre.setAttribute("data-enhanced", "1");
+    if (state.settings.codeWrap) pre.classList.add("wrapped");
+  }
+}
+
+/* 在新标签页里运行 HTML / SVG 代码块(用 Blob URL,不依赖任何服务) */
+function openCodeRun(code, mime) {
+  if (!CAP.objectUrl) { toast("当前浏览器不支持本地预览(缺少 URL.createObjectURL)", "warn", 4000); return; }
+  var url;
+  try {
+    url = URL.createObjectURL(new Blob([code], { type: (mime || "text/html") + ";charset=utf-8" }));
+  } catch (e) { toast("无法创建预览:" + ((e && e.message) || e), "error"); return; }
+  var w = window.open(url, "_blank");
+  if (!w) toast("浏览器拦截了新标签页,请允许本站弹出窗口后重试", "warn", 4600);
+  setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+}
+
+/* ---------------------------------------------------------------------------
+   10. 消息渲染
+--------------------------------------------------------------------------- */
+/* ---- Markdown 预处理(思考内容 / 流式正文) ----
+   围栏扫描器:返回每一行是否位于 ``` / ~~~ 围栏内部 */
+function scanFences(text) {
+  var lines = String(text == null ? "" : text).split("\n");
+  var flags = [], inFence = false, fenceCh = "", fenceLen = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(lines[i]);
+    if (m) {
+      var ch = m[1].charAt(0);
+      if (!inFence) { inFence = true; fenceCh = ch; fenceLen = m[1].length; }
+      else if (ch === fenceCh && m[1].length >= fenceLen) { inFence = false; }
+    }
+    flags.push(inFence);
+  }
+  return flags;
+}
+/* 把围栏外的 4 空格缩进压掉:否则模型的缩进段落会被当成缩进代码块,
+   人类可读的思考文本会整段变成 <pre>,看起来就像「只有代码块输出」 */
+function deindentOutsideFences(text) {
+  var src = String(text == null ? "" : text);
+  if (src.indexOf("\n") < 0) return src;
+  var lines = src.split("\n"), flags = scanFences(src);
+  for (var i = 0; i < lines.length; i++) {
+    if (flags[i]) continue;
+    var guard = 0;
+    while (guard++ < 20 && /^[ \t]{4,}/.test(lines[i])) lines[i] = lines[i].replace(/^[ \t]{1,4}/, "");
+  }
+  return lines.join("\n");
+}
+/* 流式过程中围栏可能还没闭合,marked 会把后面的正文全部当成代码块,
+   这里补一个结束围栏(补出来的内容不会进入会话数据) */
+function closeOpenFence(text) {
+  var src = String(text == null ? "" : text);
+  if (src.indexOf("```") < 0 && src.indexOf("~~~") < 0) return src;
+  var lines = src.split("\n"), inFence = false, fenceCh = "", fenceLen = 3;
+  for (var i = 0; i < lines.length; i++) {
+    var m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(lines[i]);
+    if (!m) continue;
+    var ch = m[1].charAt(0);
+    if (!inFence) { inFence = true; fenceCh = ch; fenceLen = m[1].length; }
+    else if (ch === fenceCh && m[1].length >= fenceLen) { inFence = false; }
+  }
+  if (!inFence) return src;
+  var close = "";
+  for (var k = 0; k < fenceLen; k++) close += fenceCh;
+  return src + "\n" + close + "\n";
+}
+/* 正文流式渲染:只补未闭合围栏 */
+function streamMarkdown(text, streaming) {
+  return renderMarkdown(streaming ? closeOpenFence(text) : text);
+}
+/* 思考内容:先去掉缩进代码块,再补围栏 */
+function reasoningMarkdown(text, streaming) {
+  var src = deindentOutsideFences(text);
+  return renderMarkdown(streaming ? closeOpenFence(src) : src);
+}
+
+function makeReasoningEl(msg) {
+  var div = document.createElement("div");
+  var streaming = !!msg.streaming;
+  var open = msg.reasoningOpen !== false;   // 默认展开,用户折叠过才收起来
+  div.className = "reasoning " + (open ? "open" : "collapsed");
+  div.setAttribute("data-rid", msg.id);
+  div.innerHTML =
+    '<button class="reasoning-head" type="button">' + icon("brain", "sm") +
+    '<span class="r-title">' + (streaming ? "正在思考…" : "思考过程") + "</span>" +
+    '<span class="r-time"></span><span class="r-arrow">' + icon("down", "sm") + "</span></button>" +
+    '<div class="reasoning-body"><div class="msg-content"></div></div>';
+  var rb = div.querySelector(".reasoning-body");
+  var rc = rb.querySelector(".msg-content");
+  rc.innerHTML = reasoningMarkdown(msg.reasoning || "", streaming);
+  enhanceBlocks(rc, streaming);
+  div.__rtext = msg.reasoning || "";
+  if (streaming) rb.setAttribute("data-stick", "1");
+  if (!streaming && msg.thinkMs) div.querySelector(".r-time").textContent = (msg.thinkMs / 1000).toFixed(1) + "s";
+  return div;
+}
+/* 思考块归属(缺陷修复):按消息身份精确匹配,不取"组内第一个"。
+   同一个 turnId 的多条 assistant 消息会被渲染进同一个 .msg-body(一个气泡里可以有 N 个
+   .reasoning)—— 续轮的思考必须写进**它自己**的块,删除分支同理(否则续轮无思考时会误删上一轮的)。
+   兼容:makeReasoningEl 一直写 data-rid;旧会话数据无需迁移。 */
+function updateReasoningEl(msgEl, msg, contentEl) {
+  var body = msgEl.querySelector(".msg-body");
+  if (!body) return;
+  /* 思考块内部也有一层 .msg-content,这里必须只取消息正文那一层(调用方已按 data-mid 选好则直接用) */
+  var content = contentEl ||
+    body.querySelector('.msg-body > .msg-content[data-mid="' + cssEscape(msg.id) + '"]') ||
+    body.querySelector(".msg-body > .msg-content");
+  var r = body.querySelector('.reasoning[data-rid="' + cssEscape(msg.id) + '"]');
+  if (!msg.reasoning || !state.settings.showReasoning) {
+    if (r) r.parentNode.removeChild(r);
+    return;
+  }
+  if (!r) {
+    r = makeReasoningEl(msg);
+    if (content) body.insertBefore(r, content);          /* 锚点 = 本条消息自己的正文 */
+    else body.insertBefore(r, body.querySelector(".gen-line"));
+  }
+  /* 思考内容同样走 Markdown 渲染;只在原文本变化时重建,避免每帧重排 */
+  var rb = r.querySelector(".reasoning-body");
+  var rc = rb ? rb.querySelector(".msg-content") : null;
+  if (rc && r.__rtext !== (msg.reasoning || "")) {
+    rc.innerHTML = reasoningMarkdown(msg.reasoning || "", !!msg.streaming);
+    enhanceBlocks(rc, !!msg.streaming);
+    r.__rtext = msg.reasoning || "";
+  }
+  var open = msg.reasoningOpen !== false;   // 默认展开,生成结束后不自动折叠
+  r.classList.toggle("collapsed", !open);
+  r.classList.toggle("open", open);
+  r.querySelector(".r-title").textContent = msg.streaming ? "正在思考…" : "思考过程";
+  r.querySelector(".r-time").textContent =
+    (!msg.streaming && msg.thinkMs) ? (msg.thinkMs / 1000).toFixed(1) + "s" : "";
+}
+function statChips(msg, toolCallsInGroup) {
+  var out = "";
+  if (msg.role === "assistant" && msg.model) {
+    out += '<span class="chip model" title="' + escAttr(msg.model) + '">' + escapeHtml(msg.model) + "</span>";
+  }
+  var calls = toolCallsInGroup || 0;
+  if (!calls && msg.role === "assistant" && msg.toolCalls && msg.toolCalls.length) calls = msg.toolCalls.length;
+  if (calls) {
+    out += '<span class="chip" title="这一轮里模型调用了工具">' + icon("plug", "sm") + " " +
+      calls + " 次工具调用</span>";
+  }
+  if (msg.createdAt) out += '<span class="chip">' + fmtTime(msg.createdAt) + "</span>";
+  var st = [];
+  if (msg.streaming) {
+    if (msg.speed) st.push("≈" + msg.speed.toFixed(1) + " tok/s");
+  } else {
+    if (msg.tokens != null) st.push((msg.exactTokens ? "" : "≈") + msg.tokens + " tok");
+    if (msg.speed) st.push((msg.exactSpeed ? "" : "≈") + msg.speed.toFixed(1) + " tok/s");
+    if (msg.duration) st.push(msg.duration.toFixed(1) + "s");
+  }
+  if (st.length) out += '<span class="chip' + (msg.streaming ? " live" : "") + '">' + escapeHtml(st.join(" · ")) + "</span>";
+  if (msg.stopped) out += '<span class="chip warn">已停止</span>';
+  if (msg.truncated) out += '<span class="chip warn">已截断历史</span>';
+  return out;
+}
+/* 复制纯文本用:先渲染 Markdown,再按块级结构抽取纯文本,
+   这样「复制」得到的是可读文本,「复制 MD」才是 Markdown 源码 */
+var COPY_BLOCK_TAGS = { P: 1, DIV: 1, LI: 1, UL: 1, OL: 1, PRE: 1, BLOCKQUOTE: 1,
+  TABLE: 1, TR: 1, H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1, DETAILS: 1, SUMMARY: 1 };
+function blockAwareText(root) {
+  var out = "";
+  (function walk(node) {
+    for (var n = node.firstChild; n; n = n.nextSibling) {
+      if (n.nodeType === 3) { out += n.nodeValue; continue; }
+      if (n.nodeType !== 1) continue;
+      var tag = n.tagName;
+      if (tag === "BR") { out += "\n"; continue; }
+      if (tag === "HR") { out += "\n---\n"; continue; }
+      var block = !!COPY_BLOCK_TAGS[tag];
+      if (block && out && out.charAt(out.length - 1) !== "\n") out += "\n";
+      if (tag === "LI" && out.charAt(out.length - 1) === "\n") out += "- ";
+      walk(n);
+      if (block) out += "\n";
+    }
+  })(root);
+  return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function messagePlainText(msg) {
+  if (!msg) return "";
+  var src = contentToDisplay(msg.content);
+  if (!src) return "";
+  var html;
+  try { html = renderMarkdown(src); } catch (e) { return src; }
+  var d = document.createElement("div");
+  d.innerHTML = html;
+  /* 公式:用 annotation 里的 LaTeX 源码取代 KaTeX 的渲染结果,纯文本里更好读 */
+  var kxs = d.querySelectorAll(".katex");
+  for (var i = 0; i < kxs.length; i++) {
+    var ann = kxs[i].querySelector('annotation[encoding="application/x-tex"]');
+    var rep = document.createElement("span");
+    rep.textContent = ann ? (ann.textContent || "") : (kxs[i].textContent || "");
+    if (kxs[i].parentNode) kxs[i].parentNode.replaceChild(rep, kxs[i]);
+  }
+  /* 表格:每行转成 "a | b | c" 的一行 */
+  var trs = d.querySelectorAll("tr");
+  for (var j = 0; j < trs.length; j++) {
+    var cells = trs[j].children, parts = [];
+    for (var k = 0; k < cells.length; k++) parts.push((cells[k].textContent || "").trim());
+    var line = document.createElement("div");
+    line.textContent = parts.join(" | ");
+    if (trs[j].parentNode) trs[j].parentNode.replaceChild(line, trs[j]);
+  }
+  return blockAwareText(d);
+}
+
+/* 取一个图片部件的可用地址:内联的直接用,外置的从内存缓存拼 */
+function uploadedSrc(c) {
+  if (!c) return "";
+  var a = c.attach || null;
+  var inline = c.type === "image_url"
+    ? ((c.image_url && c.image_url.url) || "")
+    : (c.source && c.source.data
+      ? ("data:" + (c.source.media_type || "image/png") + ";base64," + c.source.data)
+      : "");
+  if (inline) return inline;
+  if (a && a.blob) {
+    var rec = blobMemo(a.blob);
+    if (rec && rec.data) return "data:" + (rec.mime || a.mime || "image/png") + ";base64," + rec.data;
+  }
+  return "";
+}
+/* 用户消息同样走 Markdown 渲染(保留换行);附件在前、问题在后 */
+function fileCardEl(meta, payload) {
+  var btn = document.createElement("div");
+  btn.className = "file-card";
+  btn.setAttribute("role", "button");
+  btn.setAttribute("tabindex", "0");
+  var sub;
+  if (meta.kind === "pdf") {
+    sub = "PDF · " + (meta.pages || 1) + " 页 · " + (meta.mode === "image" ? "图片模式" : "文本模式") +
+      (meta.clipped ? " · 已截断" : "");
+  } else if (meta.kind === "office") {
+    sub = officeBrief(meta) + (meta.degraded ? " · " + meta.degraded : "");
+  } else {
+    sub = "纯文本 · " + fmtBytes(meta.size || 0) +
+      (meta.enc ? " · " + wsEncName(meta.enc) + "(已转码显示)" : "") +
+      (meta.clipped ? " · 已截断" : "");
+  }
+  btn.innerHTML = '<span class="fc-ico">' + icon("file", "sm") + "</span>" +
+    '<span class="fc-main"><span class="fc-name" title="' + escAttr(meta.name || "附件") + '">' +
+    escapeHtml(meta.name || "附件") + '</span><span class="fc-sub">' + escapeHtml(sub) + "</span></span>" +
+    '<span class="fc-open">查看</span>';
+  btn.title = "点击预览内容(内容已随消息发给模型)";
+  btn.addEventListener("click", function () { previewAttachmentPayload(meta, payload); });
+  return btn;
+}
+function renderUserContent(el, content) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+  var parts;
+  if (typeof content === "string") parts = [{ type: "text", text: content }];
+  else if (Array.isArray(content)) parts = content;
+  else parts = [{ type: "text", text: String(content == null ? "" : content) }];
+  /* 同一附件(同一 id)的部件归拢起来,卡片预览时能拿到正文 / 各页图片 */
+  var byId = {}, order = [], i;
+  for (i = 0; i < parts.length; i++) {
+    var p = parts[i];
+    if (!p || !p.attach || !p.attach.id) continue;
+    var id = p.attach.id;
+    if (!byId[id]) { byId[id] = { meta: p.attach, texts: [], imgs: [], stubs: [] }; order.push(id); }
+    if (p.type === "text" && p.text) byId[id].texts.push(p.text);
+    if (p.type === "image_url" || p.type === "image") {
+      byId[id].imgs.push(p);
+      if (p.attach.blob) byId[id].stubs.push(p.attach.blob);
+    }
+  }
+  var media = null, cards = null, seen = {};
+  function mediaBox() {
+    if (!media) { media = document.createElement("div"); media.className = "msg-media"; el.appendChild(media); }
+    return media;
+  }
+  function cardBox() {
+    if (!cards) { cards = document.createElement("div"); cards.className = "msg-attach"; el.appendChild(cards); }
+    return cards;
+  }
+  for (i = 0; i < parts.length; i++) {
+    var c = parts[i];
+    if (!c) continue;
+    var a = c.attach || null;
+    if (c.type === "image_url" || c.type === "image") {
+      var src = uploadedSrc(c);
+      /* 旧版 PDF 是整文件内联的:老的 PDF 部件没法当图片显示,给一张卡片兜底 */
+      if (!a && /^data:application\/pdf/i.test(src)) {
+        cardBox().appendChild(fileCardEl({ id: "legacy-pdf-" + i, kind: "pdf", name: "PDF 附件(旧版内联)", pages: 1 }, null));
+        continue;
+      }
+      if (a && (a.kind === "pdf" || a.kind === "office")) {
+        /* PDF 图片模式 / 办公文档的图像:气泡里只放一张卡片,图片在预览弹窗与灯箱里看 */
+        if (seen[a.id]) continue;
+        seen[a.id] = 1;
+        cardBox().appendChild(fileCardEl(a, byId[a.id]));
+        continue;
+      }
+      var img = document.createElement("img");
+      img.alt = (a && a.name) || "上传的图片";
+      img.className = "inline-thumb";
+      if (src) img.src = src;
+      else if (a && a.blob) {
+        /* payload 在 IndexedDB 里:异步取回来自己填上,不必整屏重绘 */
+        img.className += " loading";
+        img.title = "正在从本机附件库读取…";
+        (function (node, key, mime) {
+          blobGet(key).then(function (rec) {
+            node.className = node.className.replace(/\s*loading/, "");
+            if (rec && rec.data) node.src = "data:" + (rec.mime || mime || "image/png") + ";base64," + rec.data;
+            else {
+              node.className += " missing";
+              node.title = "附件数据不在本机了(可能被清理或换过浏览器)";
+            }
+          });
+        })(img, a.blob, a.mime);
+      }
+      mediaBox().appendChild(img);
+      if (a && a.ocrOnly) {
+        var note = document.createElement("div");
+        note.className = "ocr-note";
+        note.textContent = "该模型不支持图像输入,以上文字仅通过 OCR 技术提取(原图未发送)";
+        note.style.flex = "0 0 100%";
+        mediaBox().appendChild(note);
+        if (a.ocrText) {
+          var pre = document.createElement("pre");
+          pre.className = "ocr-text";
+          pre.style.flex = "0 0 100%";
+          pre.textContent = a.ocrText;
+          mediaBox().appendChild(pre);
+        }
+      }
+      continue;
+    }
+    if (c.type === "text" && a && a.kind) {
+      if (seen[a.id]) continue;
+      seen[a.id] = 1;
+      cardBox().appendChild(fileCardEl(a, byId[a.id]));
+      continue;
+    }
+    if (c.type === "text" && c.text) {
+      var holder = document.createElement("div");
+      holder.innerHTML = renderMarkdown(c.text, true);
+      enhanceBlocks(holder);
+      while (holder.firstChild) el.appendChild(holder.firstChild);
+    }
+  }
+}
+/* 一轮对话里模型可能「正文 → 调工具 → 正文 → 再调工具 → 正文」:
+   这些消息共享同一个 turnId,渲染时**合并成同一个气泡、同一个头像**,不会看起来像 AI 又发了一条。
+   （数据层仍是多条消息,协议回填与历史裁剪都不用改。） */
+function groupOfMsg(id) {
+  if (!conv) return null;
+  var idx = -1, i;
+  for (i = 0; i < conv.messages.length; i++) if (conv.messages[i].id === id) { idx = i; break; }
+  if (idx < 0) return null;
+  var first = conv.messages[idx];
+  if (!first.turnId) return null;
+  var a = idx, b = idx;
+  while (a - 1 >= 0 && conv.messages[a - 1].turnId === first.turnId) a--;
+  while (b + 1 < conv.messages.length && conv.messages[b + 1].turnId === first.turnId) b++;
+  if (b <= a) return null;
+  return conv.messages.slice(a, b + 1);
+}
+function groupToolCount(list) {
+  var n = 0;
+  for (var i = 0; i < list.length; i++) if (list[i].role === "tool") n++;
+  return n;
+}
+/* 一组消息合成一个气泡 */
+function makeGroupEl(list) {
+  var lastAsst = null, first = list[0], i;
+  for (i = list.length - 1; i >= 0; i--) if (list[i].role === "assistant") { lastAsst = list[i]; break; }
+  if (!lastAsst) lastAsst = list[list.length - 1];
+  var streaming = !!lastAsst.streaming;
+  var wrap = document.createElement("div");
+  wrap.className = "msg assistant";
+  wrap.setAttribute("data-id", lastAsst.id);
+  wrap.setAttribute("data-msg-last", lastAsst.id);
+  wrap.setAttribute("data-msg-first", first.id);
+  wrap.setAttribute("data-group", "1");
+
+  var avatar = document.createElement("div");
+  avatar.className = "avatar assistant" + (streaming ? " thinking" : "");
+  avatar.innerHTML = icon("robot");
+  wrap.appendChild(avatar);
+
+  var body = document.createElement("div");
+  body.className = "msg-body";
+
+  var meta = document.createElement("div");
+  meta.className = "msg-meta";
+  var chipMsg = {};
+  for (var k in lastAsst) if (Object.prototype.hasOwnProperty.call(lastAsst, k)) chipMsg[k] = lastAsst[k];
+  chipMsg.createdAt = first.createdAt || lastAsst.createdAt;   // 时间用这一轮开始的时间
+  meta.innerHTML = '<span class="who">AI</span>' + statChips(chipMsg, groupToolCount(list));
+  body.appendChild(meta);
+
+  for (i = 0; i < list.length; i++) {
+    var m = list[i];
+    if (m.role === "tool") {
+      m.inReasoning = false;
+      body.appendChild(makeToolSlot(m));
+      continue;
+    }
+    if (m.reasoning && state.settings.showReasoning) body.appendChild(makeReasoningEl(m));
+    var c = document.createElement("div");
+    c.className = "msg-content";
+    c.setAttribute("data-mid", m.id);
+    c.innerHTML = streamMarkdown(m.content, !!m.streaming);
+    enhanceBlocks(c, !!m.streaming);
+    body.appendChild(c);
+  }
+
+  var genLine = document.createElement("div");
+  genLine.className = "gen-line";
+  genLine.innerHTML = '<span class="cursor"></span><span class="gen-txt">正在生成…</span>';
+  if (!streaming) genLine.style.display = "none";
+  body.appendChild(genLine);
+
+  if (lastAsst.error) body.appendChild(makeErrorEl(lastAsst));
+  body.appendChild(makeActionsEl(lastAsst));
+  wrap.appendChild(body);
+  return wrap;
+}
+function makeToolSlot(m) {
+  var slot = document.createElement("div");
+  slot.className = "tool-slot";
+  slot.setAttribute("data-mid", m.id);
+  renderToolCard(slot, m);
+  return slot;
+}
+/* 压缩产物气泡(§5.2;conv.messages 里 compact:"summary"/"elision" 的条目):
+   · 元素形态必须满足既有定位:class 带 `msg` + data-id ⇒ msgElementFor 的第三条选择器命中,
+     查找栏 / 滚动定位 / redrawMessage 都不需要另走一套;
+   · 摘要正文是**模型输出(不可信)**:必须复用净化链 streamMarkdown + enhanceBlocks(DOMPurify 在内),
+     禁止 innerHTML 直插未净化文本;chips 与时间等动态文本一律 textContent。 */
+function makeCompactEl(m) {
+  var isSum = m.compact === "summary";
+  var meta = m.compactMeta || {};
+  var wrap = document.createElement("div");
+  wrap.className = "msg compact-card";
+  wrap.setAttribute("data-id", m.id);
+  wrap.setAttribute("data-msg-last", m.id);
+
+  var body = document.createElement("div");
+  body.className = "msg-body";
+
+  var head = document.createElement("div");
+  head.className = "cc-head";
+  head.innerHTML = icon("layers", "sm") + '<span class="cc-title"></span>';
+  head.querySelector(".cc-title").textContent = isSum ? "上下文已压缩" : "上下文省略说明";
+  function chip(txt) {
+    var s = document.createElement("span");
+    s.className = "cc-chip";
+    s.textContent = txt;
+    return s;
+  }
+  if (isSum) {
+    if (meta.dropped) {
+      head.appendChild(chip("丢弃 " + num(meta.dropped) + " 条"));
+      head.appendChild(chip("≈" + fmtCtxNum(meta.before) + " → " + fmtCtxNum(meta.after) + " tok" +
+        (Number(meta.after) > Number(meta.before) ? "（本次摘要比被丢弃内容更长，属正常）" : "")));
+    }
+    if (meta.released) {
+      head.appendChild(chip("释放 " + num(meta.released) + " 个附件" + (meta.freedBytes ? " · " + fmtBytes(meta.freedBytes) : "")));
+    }
+    head.appendChild(chip(meta.source === "auto" ? "自动" : (meta.source === "tool" ? "模型调用" : "手动")));
+    if (meta.at) head.appendChild(chip(fmtTime(meta.at)));
+  }
+  var more = document.createElement("span");
+  more.className = "cc-more";
+  more.textContent = "展开";
+  head.appendChild(more);
+  body.appendChild(head);
+
+  var box = document.createElement("div");
+  box.className = "cc-body";
+  var content = document.createElement("div");
+  content.className = "msg-content";
+  content.setAttribute("data-mid", m.id);
+  content.innerHTML = streamMarkdown(m.content, false);
+  enhanceBlocks(content, false);
+  box.appendChild(content);
+  body.appendChild(box);
+
+  wrap.appendChild(body);
+  return wrap;
+}
+function makeMsgEl(msg, animate, toolMsgs) {
+  var wrap = document.createElement("div");
+  wrap.className = "msg " + msg.role + (animate ? " enter" : "");
+  wrap.setAttribute("data-id", msg.id);
+  wrap.setAttribute("data-msg-last", msg.id);
+
+  var avatar = document.createElement("div");
+  avatar.className = "avatar " + msg.role + (msg.streaming && msg.role === "assistant" ? " thinking" : "");
+  avatar.innerHTML = icon(msg.role === "user" ? "user" : (msg.role === "tool" ? "terminal" : "robot"));
+  wrap.appendChild(avatar);
+
+  var body = document.createElement("div");
+  body.className = "msg-body";
+
+  var meta = document.createElement("div");
+  meta.className = "msg-meta";
+  meta.innerHTML = '<span class="who">' + (msg.role === "user" ? "你" : (msg.role === "tool" ? "工具" : "AI")) +
+    "</span>" + statChips(msg, toolMsgs ? groupToolCount(toolMsgs) : 0);
+  body.appendChild(meta);
+
+  if (msg.role === "assistant" && msg.reasoning && state.settings.showReasoning) {
+    body.appendChild(makeReasoningEl(msg));
+  }
+
+  var content = document.createElement("div");
+  content.className = "msg-content";
+  content.setAttribute("data-mid", msg.id);
+  if (msg.role === "tool") renderToolCard(content, msg);
+  else if (msg.role === "user") renderUserContent(content, msg.content);
+  else {
+    content.innerHTML = streamMarkdown(msg.content, !!msg.streaming);
+    enhanceBlocks(content, !!msg.streaming);
+  }
+  body.appendChild(content);
+
+  /* 没有 turnId 的旧数据 / 单条消息:后面紧跟的工具消息仍然贴进来 */
+  if (toolMsgs && toolMsgs.length) {
+    for (var ti = 0; ti < toolMsgs.length; ti++) {
+      toolMsgs[ti].inReasoning = !contentToText(msg.content).trim() && !!msg.reasoning;
+      body.appendChild(makeToolSlot(toolMsgs[ti]));
+    }
+  }
+
+  /* 光标与「正在生成」独立成行放在消息下方:元素不被重绘替换,动画才能连续播放 */
+  if (msg.role === "assistant") {
+    var genLine = document.createElement("div");
+    genLine.className = "gen-line";
+    genLine.innerHTML = '<span class="cursor"></span><span class="gen-txt">正在生成…</span>';
+    if (!msg.streaming) genLine.style.display = "none";
+    body.appendChild(genLine);
+  }
+
+  if (msg.error) body.appendChild(makeErrorEl(msg));
+  body.appendChild(makeActionsEl(msg));
+  wrap.appendChild(body);
+  return wrap;
+}
+function makeErrorEl(msg) {
+  var err = document.createElement("div");
+  err.className = "msg-error";
+  var retryBtn = '<button class="btn sm retry-btn" data-act="retry">' + icon("refresh", "sm") + " 重新请求</button>";
+  err.innerHTML = '<div class="err-title">' + icon("warn", "sm") + " 请求失败</div><div>" +
+    escapeHtml(msg.error) + "</div>" + retryBtn;
+  return err;
+}
+/* ---- 工具调用卡片(模型调用 MCP 工具时显示)
+   默认折叠,点标题栏展开 / 再点收起;展开后能看到传入的参数与返回值。
+   参数与返回值都用代码块渲染(自带独立滚动 + 复制按钮)。 ---- */
+function toolStatusText(m) {
+  if (m.needsApproval) return "等待你放行";
+  /* AskUser 的「等待」等的是作答,不是放行 —— 判据必须排在 needsApproval 之后 */
+  if (askUserPending(m)) return "等待你回答";
+  if (m.status === "running") return "运行中…";
+  if (m.status === "denied") return "已拒绝";
+  /* 外部 MCP 调用可被 Esc 经 AbortSignal 中断:
+     与「执行失败」区分开,否则用户会以为工具本身出错了 */
+  if (m.status === "aborted") return "已中止" + (m.ms ? " · " + m.ms + " ms" : "");
+  if (m.status === "error") return askUserCard(m) ? "提问未完成" + (m.ms ? " · " + m.ms + " ms" : "")
+                                                 : "执行失败" + (m.ms ? " · " + m.ms + " ms" : "");
+  if (m.status === "ok") {
+    if (askUserCard(m)) return (m.askAnswers && m.askAnswers.length) ? "已回答" : "已跳过";
+    return "执行成功" + (m.ms ? " · " + m.ms + " ms" : "");
+  }
+  return "准备中…";
+}
+function toolStatusIcon(m) {
+  if (m.needsApproval) return "clock";
+  if (askUserPending(m)) return "chat";
+  if (m.status === "running") return "activity";
+  if (m.status === "ok") return "check";
+  if (m.status === "denied") return "power";
+  if (m.status === "aborted") return "power";
+  if (m.status === "error") return "warn";
+  return "terminal";
+}
+/* 折叠状态:用户手动开过就听用户的;等待放行 / 等待作答时自动展开(必须看到要跑的代码或要答的问题) */
+function toolCardOpen(m) {
+  if (typeof m.toolOpen === "boolean") return m.toolOpen;
+  if (askUserPending(m)) return true;
+  return !!m.needsApproval;
+}
+function toolCardSummary(m) {
+  if (m.needsApproval) return "需要你确认后才能执行";
+  if (askUserPending(m)) return "请选择或填写后提交";
+  if (askUserCard(m) && m.status === "ok") {
+    var n = (m.askAnswers || []).length;
+    return n ? ("已提交 " + n + " 个回答") : "已跳过提问";
+  }
+  if (m.status === "running") return "正在执行…";
+  if (m.status === "denied") return "已按你的选择拒绝执行";
+  if (m.status === "aborted") return safeJson(String(m.content || "").replace(/\s+/g, " "), 110) || "已中止";
+  if (m.status === "error") return safeJson(String(m.resultText || m.content || "").replace(/\s+/g, " "), 110);
+  if (m.status === "ok") return safeJson(String(m.resultText || "").replace(/\s+/g, " "), 110) || "执行完成";
+  return "准备中…";
+}
+function makeCodeEl(lang, text) {
+  var pre = document.createElement("pre");
+  var code = document.createElement("code");
+  code.className = "language-" + lang;
+  code.textContent = text == null ? "" : String(text);
+  pre.appendChild(code);
+  return pre;
+}
+function renderToolCard(host, m) {
+  while (host.firstChild) host.removeChild(host.firstChild);
+  var st = (m.needsApproval || askUserPending(m)) ? "wait" : (m.status === "ok" ? "ok" :
+    (m.status === "error" || m.status === "denied" || m.status === "aborted") ? "err" : "");
+  var open = toolCardOpen(m);
+  var card = document.createElement("div");
+  card.className = "tool-card" + (st ? " " + st : "") + (open ? " expanded" : "") +
+    (m.role === "tool" && m.inReasoning ? " in-reasoning" : "");
+  card.setAttribute("data-id", m.id);
+
+  var head = document.createElement("button");
+  head.type = "button";
+  head.className = "tc-head";
+  head.setAttribute("data-tool-toggle", m.id);
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  head.innerHTML = icon(toolStatusIcon(m), "sm") +
+    '<span class="tc-name">' + escapeHtml(toolDisplayName(m.toolName)) + "</span>" +
+    '<span class="tc-status">' + escapeHtml(toolStatusText(m)) + "</span>" +
+    '<span class="tc-sum">' + escapeHtml(toolCardSummary(m)) + "</span>" +
+    '<span class="tc-arrow">' + icon("down", "sm") + "</span>";
+  card.appendChild(head);
+
+  var ops = "";
+  if (m.needsApproval) {
+    ops = '<button class="primary" data-tool-act="once">允许一次</button>' +
+      '<button data-tool-act="always">总是允许</button>' +
+      '<button class="danger" data-tool-act="deny">拒绝</button>';
+  }
+  if (ops) {
+    var opRow = document.createElement("div");
+    opRow.className = "tc-ops";
+    opRow.innerHTML = ops;
+    card.appendChild(opRow);
+  }
+
+  var body = document.createElement("div");
+  body.className = "tc-body";
+  /* AskUser 卡片没有"参数 JSON 块":待答时那是一大段问题 JSON(与逐题表单重复且更难读),
+     已答时问答由 .ask-recap 承载,出错时的错误文本在"返回值"块里 */
+  if (!askUserCard(m)) {
+    /* 参数区:按工具名决定「这段东西是代码还是参数」与高亮语言,
+       不再写死「有 code 字段就是 JavaScript」—— 否则文件工具的参数会被按 JS 高亮 */
+    var lang = toolArgLang(m.toolName);
+    var isCode = lang !== "json" && !!(m.args && typeof m.args.code === "string");
+    var codeText = isCode ? m.args.code
+      : (m.argsText || (m.args ? JSON.stringify(m.args, null, 2) : ""));
+    var lab1 = document.createElement("div");
+    lab1.className = "tc-lab";
+    lab1.textContent = isCode ? "代码" : "参数";
+    body.appendChild(lab1);
+    body.appendChild(makeCodeEl(isCode ? lang : "json", codeText));
+  }
+
+  if (m.status === "ok" || m.status === "error") {
+    var lab2 = document.createElement("div");
+    lab2.className = "tc-lab";
+    lab2.textContent = "返回值";
+    body.appendChild(lab2);
+    body.appendChild(makeCodeEl("json", m.content || (m.status === "ok" ? "(没有输出)" : "(无错误信息)")));
+  } else if (m.status === "denied" || m.status === "aborted") {
+    var d = document.createElement("div");
+    d.className = "tc-note";
+    d.textContent = m.content || (m.status === "aborted" ? "已中止" : "已拒绝执行");
+    body.appendChild(d);
+  } else if (m.status === "running" || (m.status === "wait" && !askUserPending(m))) {
+    /* running 必须留在这一支:它和执行中的说明行是同一条分支服务两态,条件里丢掉 running
+       会让所有"正在执行…"的卡片失去说明行。AskUser 的待答卡片改由表单承载,不要放行文案 */
+    var w = document.createElement("div");
+    w.className = "tc-note";
+    /* 审批/执行中的说明文案按工具名取:文件工具绝不能再出现「浏览器沙箱」字样 */
+    w.textContent = m.status === "wait"
+      ? toolApprovalNote(m.toolName)
+      : "正在执行…";
+    body.appendChild(w);
+  }
+  if (askUserCard(m)) appendAskBody(body, m);
+  card.appendChild(body);
+  /* 提交/跳过那一行放在正文之后(独立类 .tc-ask-foot:.tc-ops 没有上内边距,复用它会让按钮贴着正文) */
+  if (askUserPending(m)) card.appendChild(makeAskFoot(m));
+  /* 任务行 —— 这张卡片对应的 Python 任务(前台/后台)还没"在结果里说完"时补一行:
+     status 徽标 + task_id + 已用时 + 输出尾部(≤6 行)+ 停止按钮。running 时由 appE 的 1s 节拍就地更新 */
+  var tk = (typeof pvTaskForMsg === "function") ? pvTaskForMsg(m.id) : null;
+  if (tk && (tk.status === "running" || tk.background)) {
+    var trow = document.createElement("div");
+    trow.className = "tc-task";
+    trow.setAttribute("data-task", tk.id);
+    /* 首建走 Ensure(与 appE 的 1s 节拍同一套"建一次 + 就地更新"语义;
+       保留 typeof 守卫形式,与 pvTaskForMsg 的调用风格一致) */
+    if (typeof pvTaskRowEnsure === "function") pvTaskRowEnsure(trow, tk);
+    else trow.innerHTML = pvTaskRowHtml(tk);
+    card.appendChild(trow);
+  }
+  host.appendChild(card);
+  enhanceBlocks(card, false);
+}
+
+/* ---- AskUser 卡片的正文:待答 = 逐题表单;已答/已跳过 = 逐题回显 ----
+   题面文本来自模型(用户可见),一律 textContent / 静态 innerHTML,不走未净化插值;
+   选项与自定义输入的选中态由 ASK_DRAFT 驱动,交互只做局部 DOM 更新(见 appE 的 askUserSyncQ) */
+function makeAskOpt(i, j, label, desc) {
+  var b = document.createElement("button");
+  b.type = "button";
+  b.className = "ask-opt";
+  b.setAttribute("data-ask-opt", i + ":" + j);
+  var mark = document.createElement("span");
+  mark.className = "ao-mark";
+  var main = document.createElement("span");
+  main.className = "ao-main";
+  var lb = document.createElement("span");
+  lb.className = "ao-label";
+  lb.textContent = label;
+  main.appendChild(lb);
+  if (desc) {
+    var de = document.createElement("span");
+    de.className = "ao-desc";
+    de.textContent = desc;
+    main.appendChild(de);
+  }
+  b.appendChild(mark);
+  b.appendChild(main);
+  return b;
+}
+function makeAskQ(m, q, i, d) {
+  var wrap = document.createElement("div");
+  wrap.className = "ask-q";
+  wrap.setAttribute("data-ask-q", String(i));
+  if (q.header) {
+    var h = document.createElement("div");
+    h.className = "ask-h";
+    h.textContent = q.header;
+    wrap.appendChild(h);
+  }
+  var t = document.createElement("div");
+  t.className = "ask-t";
+  t.textContent = q.question;
+  wrap.appendChild(t);
+  var sel = d.sel[i];
+  var opts = document.createElement("div");
+  opts.className = "ask-opts" + (q.multi ? " multi" : "");
+  for (var j = 0; j < q.options.length; j++) {
+    var on = q.multi
+      ? !!(sel && typeof sel === "object" && sel.indexOf(j) > -1)
+      : sel === j;
+    var ob = makeAskOpt(i, j, q.options[j].label, q.options[j].description);
+    if (on) ob.classList.add("on");
+    opts.appendChild(ob);
+  }
+  /* 「其他」由系统提供:模型不得自带(输入内容优先于所选项,见 askUserAnswerOf) */
+  var otherOn = !!d.other[i] || !!String(d.text[i] || "").trim();
+  var oo = document.createElement("button");
+  oo.type = "button";
+  oo.className = "ask-opt other" + (otherOn ? " on" : "");
+  oo.setAttribute("data-ask-opt", i + ":other");
+  oo.innerHTML = '<span class="ao-mark"></span><span class="ao-main"><span class="ao-label">其他(自己输入)</span></span>';
+  opts.appendChild(oo);
+  wrap.appendChild(opts);
+  var ta = document.createElement("textarea");
+  ta.className = "ask-ta";
+  ta.setAttribute("data-ask-ta", String(i));
+  ta.setAttribute("rows", "2");
+  ta.setAttribute("placeholder", "自己输入…");
+  ta.value = String(d.text[i] || "");
+  ta.hidden = !otherOn;
+  wrap.appendChild(ta);
+  return wrap;
+}
+function makeAskFoot() {
+  var foot = document.createElement("div");
+  foot.className = "tc-ask-foot";
+  var sub = document.createElement("button");
+  sub.type = "button";
+  sub.className = "primary";
+  sub.setAttribute("data-ask-act", "submit");
+  sub.textContent = "提交回答";
+  var sk = document.createElement("button");
+  sk.type = "button";
+  sk.setAttribute("data-ask-act", "skip");
+  sk.textContent = "跳过";
+  sk.title = "不回答这次提问,让模型直接继续(它会收到一个空回答)";
+  foot.appendChild(sub);
+  foot.appendChild(sk);
+  return foot;
+}
+function appendAskBody(body, m) {
+  var i, list;
+  if (askUserPending(m)) {
+    var qs = askUserQsOf(m), d = askUserDraftOf(m.id);
+    for (i = 0; i < qs.length; i++) body.appendChild(makeAskQ(m, qs[i], i, d));
+    var hint = document.createElement("div");
+    hint.className = "ask-hint";
+    body.appendChild(hint);
+    askUserHintInto(body, m);
+    return;
+  }
+  list = m.askAnswers;
+  if (!list || !list.length) return;      /* 跳过 / 中止 / 出错:正文在说明行或"返回值"里 */
+  var recap = document.createElement("div");
+  recap.className = "ask-recap";
+  recap.title = askUserAnswersText(m);
+  for (i = 0; i < list.length; i++) {
+    var row = document.createElement("div");
+    var q = document.createElement("span");
+    q.className = "ar-q";
+    q.textContent = list[i].q + " → ";
+    var a = document.createElement("span");
+    a.className = "ar-a";
+    a.textContent = list[i].answer || "未作答";
+    row.appendChild(q);
+    row.appendChild(a);
+    recap.appendChild(row);
+  }
+  body.appendChild(recap);
+}
+/* 工具卡片可能嵌在助手消息里,重绘要找到它真正所在的容器 */
+function redrawToolCard(m) {
+  var el = document.querySelector('#chat-inner .tool-card[data-id="' + cssEscape(m.id) + '"]');
+  if (!el || !el.parentNode) { renderChat(); return; }
+  renderToolCard(el.parentNode, m);
+}function makeActionsEl(msg) {
+  var a = document.createElement("div");
+  a.className = "msg-actions";
+  var h = "";
+  if (msg.role === "assistant" && Array.isArray(msg.alternates) && msg.alternates.length > 1) {
+    h += '<span class="alt-nav">' +
+      '<button data-act="alt-prev" title="上一个分支">' + icon("left") + "</button>" +
+      '<span class="alt-idx">' + ((msg.altIndex || 0) + 1) + " / " + msg.alternates.length + "</span>" +
+      '<button data-act="alt-next" title="下一个分支">' + icon("right") + "</button></span>";
+  }
+  h += '<button data-act="copy" title="复制为纯文本(去掉 Markdown 记号)">' + icon("copy") + " 复制</button>";
+  h += '<button data-act="copy-md" title="复制 Markdown 源码">' + icon("copy") + " MD</button>";
+  h += '<button data-act="quote" title="引用到输入框">' + icon("quote") + " 引用</button>";
+  if (msg.role === "assistant") {
+    h += '<button data-act="speak" title="朗读">' + icon("volume") + "</button>";
+    h += '<button data-act="regenerate" title="重新生成(新建分支)">' + icon("regen") + "</button>";
+  } else {
+    h += '<button data-act="edit" title="编辑并重新发送">' + icon("edit") + "</button>";
+  }
+  h += '<button data-act="cut" title="删除此条及其后的全部消息">' + icon("scissors") + "</button>";
+  h += '<button data-act="delete" class="danger" title="删除这一条">' + icon("trash") + "</button>";
+  a.innerHTML = h;
+  return a;
+}
+
+var elChat = $("chat"), elChatInner = $("chat-inner");
+var pendingScrollBottom = false;
+
+/* 取某条助手消息后面紧跟着的工具结果消息(仅用于没有 turnId 的旧数据) */
+function followingToolMsgs(msg) {
+  if (!conv || !msg || msg.role !== "assistant" || !msg.toolCalls || !msg.toolCalls.length) return null;
+  var idx = -1, i;
+  for (i = 0; i < conv.messages.length; i++) if (conv.messages[i].id === msg.id) { idx = i; break; }
+  if (idx < 0) return null;
+  var out = [];
+  for (i = idx + 1; i < conv.messages.length; i++) {
+    if (conv.messages[i].role !== "tool") break;
+    out.push(conv.messages[i]);
+  }
+  return out.length ? out : null;
+}
+function renderChat() {
+  var keepTop = elChat.scrollTop;
+  while (elChatInner.firstChild) elChatInner.removeChild(elChatInner.firstChild);
+  /* 没有会话、或会话还是空的(刚新建):都渲染欢迎页(Logo + 问候 + 推荐问题) */
+  if (!conv || !conv.messages.length) { renderWelcome(); return; }
+  for (var i = 0; i < conv.messages.length; i++) {
+    var m = conv.messages[i];
+    /* 压缩产物(交接总结 / 省略说明)不是真实对话:走独立的摘要气泡,不参与 turnId 合泡 */
+    if (m.compact) { elChatInner.appendChild(makeCompactEl(m)); continue; }
+    /* 同一 turnId 的消息(工具调用轮 + 工具结果 + 后续正文)合并成一个气泡 */
+    var group = m.turnId ? groupOfMsg(m.id) : null;
+    if (group) {
+      elChatInner.appendChild(makeGroupEl(group));
+      i += group.length - 1;
+      continue;
+    }
+    var attached = m.turnId ? null : followingToolMsgs(m);
+    if (attached) i += attached.length;
+    elChatInner.appendChild(makeMsgEl(m, false, attached));
+  }
+  applyCodeWrap();
+  elChat.scrollTop = keepTop;
+  if (!conv.messages.length) scrollToBottom(true);
+  if (typeof findState !== "undefined" && findState && findState.kw && !generating) runFind(findState.kw, true);
+}
+function welcomeEnvChips() {
+  function chip(label, on) {
+    return '<span class="' + (on ? "on" : "off") + '">' + (on ? "● " : "○ ") + escapeHtml(label) + "</span>";
+  }
+  return chip("流式输出", CAP.stream) + chip("剪贴板", CAP.clipboard) + chip("语音朗读", CAP.speech)
+    + chip("语音输入", CAP.recognition) + chip("跨标签页", CAP.broadcast)
+    + chip("离线可用", true);
+}
+function renderWelcome() {
+  var root = document.createElement("div");
+  root.id = "welcome";
+  root.innerHTML =
+    '<div class="w-logo">' + icon("cat") + "</div>" +
+    "<h1>你好,我是 <em>AzusaAI WebUI</em></h1>" +
+    '<div class="w-sub">单文件 · 零外部依赖 · 数据只留在本机 · 内置 MCP 工具服务</div>' +
+    '<div class="w-env">' + welcomeEnvChips() + "</div>" +
+    '<div class="w-group-title">试试这些</div>' +
+    '<div class="tips">' + WELCOME_TIPS.map(function (t) {
+      return '<div class="tip" data-tip="' + escAttr(t.text) + '"><span class="tip-icon">' + icon(t.icon) + "</span><span>" + escapeHtml(t.text) + "</span></div>";
+    }).join("") + "</div>";
+  elChatInner.appendChild(root);
+}
+elChatInner.addEventListener("click", function (e) {
+  var tip = e.target.closest ? e.target.closest(".tip") : null;
+  if (tip) {
+    var text = tip.getAttribute("data-tip");
+    elInput.value = text;
+    elInput.focus();
+    autoResize();
+    updateCtxMeter();
+    return;
+  }
+  /* 摘要气泡:点标题栏展开 / 收起(Ctrl+O 亦可,见 appD 的 onKeyDown) */
+  var cc = e.target.closest ? e.target.closest(".compact-card") : null;
+  if (cc) {
+    cc.classList.toggle("expanded");
+    var tg = cc.querySelector(".cc-more");
+    if (tg) tg.textContent = cc.classList.contains("expanded") ? "收起" : "展开";
+  }
+});
+
+/* ---------------------------------------------------------------------------
+   11. 滚动
+--------------------------------------------------------------------------- */
+var elScrollBottom = $("btn-scroll-bottom"), elScrollTop = $("btn-scroll-top");
+var chatStick = true;   // 主区是否粘底:用户手动往上滚后自动置 false
+function nearBottom(px) {
+  return elChat.scrollHeight - elChat.scrollTop - elChat.clientHeight < (px || 140);
+}
+function scrollToBottom(force) {
+  if (force) chatStick = true;
+  else if (!state.settings.autoscroll || !chatStick) return;
+  elChat.scrollTop = elChat.scrollHeight - elChat.clientHeight;
+}
+elChat.addEventListener("scroll", function () {
+  var nb = nearBottom();
+  chatStick = nb;
+  elScrollBottom.classList.toggle("show", !nb);
+  elScrollTop.classList.toggle("show", elChat.scrollTop > 600);
+}, { passive: true });
+
+/* ---- 子容器(思考块 / 代码块)的粘底与程序化滚动标记 ---- */
+function isScrollBox(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.classList && el.classList.contains("reasoning-body")) return true;
+  return el.tagName === "CODE" && el.parentNode && el.parentNode.tagName === "PRE";
+}
+function getStick(el) {
+  var v = el.getAttribute("data-stick");
+  if (v === "1") return true;
+  if (v === "0") return false;
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
+}
+function setStick(el, on) { el.setAttribute("data-stick", on ? "1" : "0"); }
+/* 记录程序化设置的 scrollTop,避免它被当成「用户手动滚动」 */
+function setScrollTop(el, v) {
+  v = Math.max(0, Math.round(v));
+  if (el.scrollTop === v) return;
+  el.__progTop = v;
+  try { el.scrollTop = v; } catch (e) {}
+}
+var lastInteractAt = 0, INTERACT_GRACE = 420;
+function markInteract() { lastInteractAt = Date.now(); }
+elChatInner.addEventListener("scroll", function (e) {
+  var el = e.target;
+  if (!isScrollBox(el)) return;
+  if (el.__progTop != null && Math.abs(el.scrollTop - el.__progTop) < 2) { el.__progTop = null; return; }
+  el.__progTop = null;
+  setStick(el, (el.scrollHeight - el.scrollTop - el.clientHeight) < 40);
+  markInteract();
+}, true);
+["wheel", "touchmove", "touchstart", "mousedown", "pointerdown"].forEach(function (evt) {
+  elChatInner.addEventListener(evt, markInteract, { passive: true });
+});
+/* 重绘前记录、重绘后恢复所有可滚动子容器的位置与粘底状态 */
+function collectScrollState(root) {
+  var out = [], els = root.querySelectorAll(".reasoning-body, pre code");
+  for (var i = 0; i < els.length; i++) out.push({ top: els[i].scrollTop, stick: getStick(els[i]) });
+  return out;
+}
+function restoreScrollState(root, prev) {
+  if (!prev) return;
+  var els = root.querySelectorAll(".reasoning-body, pre code");
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i], max = el.scrollHeight - el.clientHeight, p = prev[i];
+    if (!p) {                       // 本次重绘新增的容器:流式输出时跟随到底部
+      if (max > 0) { setStick(el, true); setScrollTop(el, max); }
+      continue;
+    }
+    if (max <= 0) { setStick(el, true); continue; }
+    if (p.stick) { setStick(el, true); setScrollTop(el, max); }
+    else { setStick(el, false); setScrollTop(el, Math.min(p.top, max)); }
+  }
+}
+elScrollBottom.addEventListener("click", function () { scrollToBottom(true); });
+elScrollTop.addEventListener("click", function () { elChat.scrollTop = 0; });
+
+/* ---------------------------------------------------------------------------
+   12. 流式渲染调度(按帧合并,长文本降频以避免卡顿)
+--------------------------------------------------------------------------- */
+var RENDER_MIN_GAP = 48;      // 普通内容:最快约 1 帧
+var RENDER_HEAVY_GAP = 120;   // 长内容:降低重排频率,避免长回答卡顿
+var HEAVY_LEN = 9000;
+var renderPending = false, pendingMsgEl = null, lastRenderAt = 0, renderTimer = null;
+function scheduleRender(msgEl) {
+  pendingMsgEl = msgEl || pendingMsgEl;
+  if (renderPending) return;
+  renderPending = true;
+  var since = Date.now() - lastInteractAt;
+  var wait = since < INTERACT_GRACE
+    ? (INTERACT_GRACE - since)
+    : Math.max(0, RENDER_MIN_GAP - (Date.now() - lastRenderAt));
+  renderTimer = setTimeout(function () {
+    renderTimer = null;
+    raf(function () {
+      renderPending = false;
+      var m = pendingMsgEl; pendingMsgEl = null;
+      if (!m || !document.body.contains(m)) return;
+      // 用户正在滚动 / 拖动滚动条时再等一会儿,避免内部重排打断拖拽
+      if (Date.now() - lastInteractAt < INTERACT_GRACE) { scheduleRender(m); return; }
+      lastRenderAt = Date.now();
+      paintMsg(m);
+      // 若内容仍在增长且很长,延长下一次渲染间隔
+      if (m && m.dataset && contentLen(m) > HEAVY_LEN) {
+        lastRenderAt = Date.now() + RENDER_HEAVY_GAP - RENDER_MIN_GAP;
+      }
+    });
+  }, wait);
+}
+function cancelRender() {
+  if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+  renderPending = false; pendingMsgEl = null;
+}
+function contentLen(m) {
+  if (!m) return 0;
+  var cs = m.querySelectorAll(".msg-body > .msg-content");
+  var n = 0;
+  for (var i = 0; i < cs.length; i++) n += cs[i].textContent.length;
+  return n;
+}
+/* 找到某条消息所对应的 DOM(可能被合并在一个气泡里) */
+function msgElementFor(id) {
+  return elChatInner.querySelector('.msg[data-msg-last="' + cssEscape(id) + '"]') ||
+    elChatInner.querySelector('.tool-slot[data-mid="' + cssEscape(id) + '"]') ||
+    elChatInner.querySelector('.msg[data-id="' + cssEscape(id) + '"]');
+}
+function paintMsg(msgEl) {
+  if (!msgEl || !conv) return;
+  var lastId = msgEl.getAttribute("data-msg-last") || msgEl.getAttribute("data-id");
+  var msg = findMsg(lastId);
+  if (!msg) return;
+  var prevScroll = collectScrollState(msgEl);
+  var contentEl = msgEl.querySelector('.msg-body > .msg-content[data-mid="' + cssEscape(msg.id) + '"]')
+    || msgEl.querySelector(".msg-body > .msg-content");
+  if (!contentEl) return;
+  if (msg.role === "user") renderUserContent(contentEl, msg.content);
+  else if (msg.role === "tool") {
+    var m2 = msgEl.querySelector(".msg-meta");
+    if (m2) m2.innerHTML = '<span class="who">工具</span>' + statChips(msg);
+    renderToolCard(contentEl, msg);
+  } else {
+    updateReasoningEl(msgEl, msg, contentEl);
+    var meta = msgEl.querySelector(".msg-meta");
+    if (meta) meta.innerHTML = '<span class="who">AI</span>' + statChips(msg, groupToolCount(groupOfMsg(msg.id) || []));
+    if (contentEl.__src !== msg.content) {
+      contentEl.innerHTML = streamMarkdown(msg.content, !!msg.streaming);
+      enhanceBlocks(contentEl, !!msg.streaming);
+      contentEl.__src = msg.content;
+    }
+  }
+  restoreScrollState(msgEl, prevScroll);
+  var genLine = msgEl.querySelector(".gen-line");
+  if (genLine) genLine.style.display = msg.streaming ? "" : "none";
+  var av = msgEl.querySelector(".avatar");
+  if (av) av.classList.toggle("thinking", !!msg.streaming);
+  scrollToBottom();
+}
+function findMsg(id) {
+  if (!conv) return null;
+  for (var i = 0; i < conv.messages.length; i++) if (conv.messages[i].id === id) return conv.messages[i];
+  return null;
+}

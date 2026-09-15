@@ -1,0 +1,1708 @@
+<script>
+"use strict";
+/* ============================================================================
+   AzusaAI WebUI —— 单文件对话终端
+   · OpenAI 兼容协议 / Anthropic Messages 协议
+   · 全部逻辑与依赖内嵌于本文件,不请求任何外部资源
+   · 内置浏览器端 MCP 工具服务(默认关闭)
+   ============================================================================ */
+(function () {
+
+/* ---------------------------------------------------------------------------
+   0. 环境能力与兼容垫片
+--------------------------------------------------------------------------- */
+var ENV = window.__ENV__ || { critical: [], soft: [], ok: true, noFlexGap: false };
+var CAP = {
+  stream: typeof window.ReadableStream === "function" && typeof window.TextDecoder === "function",
+  abort: typeof window.AbortController === "function",
+  clipboard: !!(navigator.clipboard && navigator.clipboard.writeText),
+  broadcast: typeof window.BroadcastChannel === "function",
+  speech: !!(window.speechSynthesis && typeof window.speechSynthesis.speak === "function"),
+  recognition: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
+  objectUrl: !!(window.URL && window.URL.createObjectURL),
+  matchMedia: typeof window.matchMedia === "function",
+  timeout: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function",
+  download: typeof document.createElement("a").download !== "undefined",
+  fileReader: typeof window.FileReader === "function",
+  worker: typeof window.Worker === "function" && typeof window.Blob === "function"
+    && !!(window.URL && window.URL.createObjectURL),
+  cssEscape: typeof window.CSS !== "undefined" && typeof CSS.escape === "function",
+  /* 外部 MCP 工具的能力门:外部工具条目带 cap:"fetch",
+     缺 fetch 的环境(极老内核)整套外部工具自动隐藏 */
+  fetch: typeof window.fetch === "function"
+};
+var raf = window.requestAnimationFrame
+  ? window.requestAnimationFrame.bind(window)
+  : function (fn) { return setTimeout(function () { fn(Date.now()); }, 16); };
+
+/* AbortController 垫片:旧内核缺少时保证发送/停止逻辑不抛错 */
+if (!CAP.abort) {
+  window.AbortController = function () {
+    this.signal = { aborted: false, addEventListener: function () {} };
+    this.abort = function () { this.signal.aborted = true; };
+  };
+  CAP.abort = false;
+}
+/* 超时包装:优先用原生 AbortSignal.timeout,否则手动计时 */
+function timeoutSignal(ms) {
+  var ctrl = new AbortController();
+  var timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, ms);
+  if (ctrl.signal && typeof ctrl.signal.addEventListener === "function") {
+    ctrl.signal.addEventListener("abort", function () { clearTimeout(timer); });
+  }
+  return { signal: ctrl.signal, abort: function () { clearTimeout(timer); ctrl.abort(); } };
+}
+
+/* ---------------------------------------------------------------------------
+   1. 常量
+--------------------------------------------------------------------------- */
+var LS_KEY = "chatgpt-webui-v1";
+/* Base URL 的默认值:本机回环地址(中性,不指向任何具体机器,也不泄露内网前缀)。
+   0.1.0 之前的旧默认曾是某个局域网地址 —— 已随首个公开版本移除;为不在公开源码里保留内网字面量,
+   这里**不做**「旧默认 → 新默认」的等值改名迁移:任何已存设置都原样保留(见 mergeSettings 里的说明)。
+   全新安装(或用户自己清空该字段)才会得到这个默认值 */
+var DEFAULT_BASE = "http://127.0.0.1:8080/v1";
+/* 用户可见版本号的**唯一权威**(改值 = 改这一处):环境面板 / 环境信息 / 导出备份 version 字段 /
+   MCP clientInfo.version / 关于弹窗都读它;启动时把 <meta name="version"> 也同步成它。
+   口径 = README 头 + CHANGELOG [0.1.0] + 发布 tag v0.1.0(旧值 "2.1" 是历史遗留,已统一)。
+   注意:它不是存储 schema(那是 SCHEMA,另算),也不是 MCP 协议版本(MCP_PROTOCOL,另算) */
+var APP_VERSION = "0.1.0";
+/* 作者显示名与项目主页(唯一权威):关于弹窗的 hero 由 JS 从这里填充,
+   HTML / CSS / 其它 JS 里不得再出现这两个字面量(日后改一行) */
+var APP_AUTHOR = "yuunnn-w";
+var APP_HOME_URL = "https://github.com/yuunnn-w/AzusaAI-WebUI";
+var BOOT_AT = Date.now();    // 页面开始加载的时刻(环境面板显示运行时长)
+var SCHEMA = 4;              // 设置结构版本,用于一次性迁移旧默认值
+var MAX_ATTACH = 50 * 1024 * 1024;   // 见 appD 的 ATTACH_MAX_BYTES(两处必须同值)
+/* 自定义标签页图标(设置 → 外观):输入上限 → 居中剪方 → ≤256px(不放大)→ PNG。
+   处理结果以 data URI 存进 settings.customIcon,超 FAVICON_DATA_MAX 时降 128/96px 重试 */
+var FAVICON_MAX_SIDE = 256;
+var FAVICON_SRC_MAX = 10 * 1024 * 1024;
+var FAVICON_DATA_MAX = 500 * 1024;
+var MAX_MSGS_PER_CONV = 600;
+/* ---- 上下文压缩(Compact 工具 / 自动压缩 / 近极限提醒)的数值口径 ----
+   ★ 与 settings.compact(紧凑模式,界面密度)是两个无关的开关,只是名字相邻 */
+var CX_TRIGGER_DEF = 85;        // 自动压缩默认阈值(%)
+var CX_TRIGGER_MIN = 60, CX_TRIGGER_MAX = 95;
+var CX_WARN_GAP = 15;           // 提醒阈值 = 触发阈值 - 15(个百分点,下限 50)
+var CX_KEEP_RATIO = 0.15;       // 保留尾部预算 = 窗口 × 0.15(Kimi maxRecentSizeRatio 0.2 / deepseek retainRatio 0.16 的同量级)
+var CX_KEEP_MIN_TOK = 8192;     // 保留尾部预算下限
+var CX_KEEP_MAX_TOK = 20000;    // 保留尾部预算上限(= Kimi COMPACT_USER_MESSAGE_MAX_TOKENS)
+var CX_HEAD_TOK = 2000;         // 最早用户输入保留预算(= Kimi COMPACT_USER_MESSAGE_HEAD_TOKENS)
+var CX_KEEP_MAX_MSGS = 8;       // 保留尾部最多几条消息(我们的扩展预算,非 Kimi 原值)
+var CX_LOOP_TAIL_MIN = 2;       // 「单用户轮有界 tail 档」要求 tail 至少含这么多个完整工具循环
+var CX_RESERVE_MIN = 16384;     // 冗余触发项下限:reserve = min(max(本值, win*0.05), win*0.5)
+var CX_SUMMARY_MAX_TOK = 8192;  // 摘要请求 max_tokens(独立于 settings.maxTokens;OpenAI / Anthropic 同值)
+var CX_SUMMARY_TIMEOUT_MS = 180000;   // 摘要请求超时(ms)
+var CX_SUMMARY_RETRY = 2;       // 摘要请求失败重试次数(含溢出缩小重试)
+var CX_HISTORY_PART_CAP = 4096; // 摘要输入投影:单条消息文本上限(超限留头+留尾,中间省略)
+var CX_HISTORY_TOTAL_CAP = 120000; // 摘要输入投影总字符上限(超限按「中部省略」处理)
+var CX_HISTORY_HEAD_CAP = 16000;   // 投影头部保留字符数(最早的内容:原始意图 / 约束所在)
+var CX_MIN_MSGS = 4;            // 少于这么多条消息时拒绝压缩(可压缩内容不足)
+/* 最大输出滑块上限 384K;Anthropic 协议必须带 max_tokens,未设置时用 256K */
+var MAX_TOK_LIMIT = 393216;
+var ANTHROPIC_DEFAULT_MAXTOK = 262144;
+/* 模型上下文窗口的兜底值:服务端没给出时用 256K */
+var DEFAULT_CTX_WINDOW = 262144;
+
+var DEFAULT_SETTINGS = {
+  schema: SCHEMA,
+  protocol: "openai",
+  baseUrl: DEFAULT_BASE,
+  apiKey: "",
+  model: "",
+  stream: true,
+  autoscroll: true,
+  showReasoning: true,
+  autoSync: true,
+  systemPrompt: "",
+  theme: "dark",
+  accent: "sakura",
+  fontSize: 14.5,
+  compact: false,
+  fx: true,
+  codeWrap: true,
+  customIcon: "",           // 自定义标签页图标(处理后 PNG 的 data URI);"" = 默认图标
+  reasoningEffort: "",
+  temperature: -1,
+  topP: -1,
+  maxTokens: 0,
+  freqPenalty: 0,
+  presencePenalty: 0,
+  ctxMsgs: 0,
+  tokCalib: {},
+  modelCtx: {},
+  /* --- MCP 工具(由对话中的模型调用,默认关闭) --- */
+  toolsEnabled: false,
+  toolPerms: {},
+  toolLimits: { timeoutMs: 600000, maxCalls: 50, maxOut: 16384 },
+  toolNet: false,
+  /* --- 上下文压缩(Compact / 自动压缩;与上面的 settings.compact「紧凑模式」无关) --- */
+  compactAuto: true,        // 接近窗口上限时自动压缩(可在 设置 → 工具与权限 关闭)
+  compactTriggerPct: 85,    // 自动压缩阈值(60~95,单位 %);提醒阈值 = 本值 - 15(下限 50)
+  /* --- 工作区(沙箱虚拟盘):右栏开合状态 + 各项上限 --- */
+  /* 这三个上限的默认值在这里写死是**有意的**:`WS_SESSION_BYTES/WBACK/FILES`
+     是 appE 的常量,而 appA 在 appE **之前**求值 —— 这里引用会拿到 undefined。
+     三个运行期使用点(appE 的 wsOpenSession / pyWriteBack / pyToolRun)都已改引那三个常量。 */
+  wsRailOpen: false,        // 右栏开合状态(纯界面状态,只在 localStorage 里)
+  wsSessionBytesMb: 16,     // 一次会话预载进执行环境的总量上限(MB) —— 默认 = WS_SESSION_BYTES/1MB
+  wsSessionWbackMb: 256,    // 一次会话回写工作区的总量硬顶(MB) —— 默认 = WS_SESSION_WBACK/1MB
+  wsSessionFiles: 2000,     // 一次会话回写的文件数上限 —— 默认 = WS_SESSION_FILES
+  toolOpsAllowDelete: true,      // FileOps 是否允许 delete
+  toolOpsAllowOverwrite: true,   // FileOps 是否允许覆盖已存在的目标
+  /* --- Python 运行时(pyodide,随页面内置) --- */
+  pyodideCacheReady: false,      // 运行时是否已缓存(全内嵌下 pyocache 恒空 → 纯展示位)
+  pyTaskTimeoutMs: 1800000,      // 后台 Python 任务超时(默认 30 分钟,clamp 60s–60min)
+  pyTaskStopKills: false,        // 「停止生成时也终止后台任务」(默认关)
+  /* --- 外部 MCP(需求④;默认关闭) --- */
+  externalToolsEnabled: false,       // 外部 MCP 总开关(刻意避开 mcpEnabled,旧语义已废弃,见 mergeSettings)
+  externalToolDefaultPerm: "ask",    // 外部工具默认权限(ask/allow/deny;个别工具的三态 toolPerms[全名] 优先)
+  mcpServers: [ {                    // 服务器列表(UI 首版只渲染 [0])
+    id: "local", name: "本地 Rust-MCP", url: "http://127.0.0.1:3344/mcp",
+    enabled: true, auth: "", timeoutMs: 120000, disabledTools: []
+  } ],
+  mcpInjectInstructions: false,      // 是否把服务器 instructions 拼进系统提示词(默认不注入)
+  /* --- 附件与多模态 --- */
+  pdfMode: "text",          // PDF:纯文本抽取(默认) / 图片渲染
+  pdfDpi: 150,              // PDF 图片模式的渲染分辨率(DPI)
+  pdfMaxPages: 10,          // PDF 图片模式最多处理多少页
+  ocrLangs: "chi_sim+eng",  // OCR 语言
+  visionForce: "auto",      // auto / yes / no:图像输入能力的手动覆盖
+  modelVision: {},          // 每个模型的视觉能力探测结果
+  imgMaxSide: 4096,         // 图片最长边上限,超过就自动下采样
+  imgResample: "spline",    // 下采样算法预设(spline/high/medium/low/nearest)
+  attachMsgMaxMb: 100,      // 单条消息附件总量上限(MB;数据在大仓库里,所以可以很宽松)
+  cleanKeepRecent: 30       // 清理/自动整理时「最近 N 个对话」原样保留(10~100)
+};
+
+/* 思考强度挡位。空字符串 = 不发送,交由服务端决定 */
+var EFFORT_LEVELS = ["low", "medium", "high", "max"];
+
+/* 图片下采样算法预设。
+   浏览器不暴露具体滤波核,只给 imageSmoothingQuality(low/medium/high),
+   所以「样条插值」= 先逐级减半(每步 ≤2 倍)再用 high 质量缩放 ——
+   这是最接近专业立方/样条重采样的做法,抗锯齿与细节保留明显好于一次性缩放。 */
+var RESAMPLE_PRESETS = {
+  spline: { label: "样条插值", desc: "逐级减半 + high 质量平滑,细节保留最好(默认)", quality: "high", steps: true },
+  high: { label: "高质量", desc: "一次性 high 质量缩放,速度快一些", quality: "high", steps: false },
+  medium: { label: "中等", desc: "medium 质量,更快、略糊", quality: "medium", steps: false },
+  low: { label: "快速", desc: "low 质量,最快,锯齿较明显", quality: "low", steps: false },
+  nearest: { label: "最近邻", desc: "不做平滑,适合像素画 / 截图放大看像素", quality: "low", steps: false, nearest: true }
+};
+
+/* 主题色(马卡龙色系)。采样参数为 -1 表示「不发送」 */
+var ACCENTS = ["mint", "sakura", "lavender", "sky", "peach", "lemon",
+               "matcha", "lilac", "aqua", "coral", "taro", "cream"];
+var ACCENT_ALIAS = {
+  cyan: "aqua", violet: "lavender", emerald: "mint", amber: "cream", rose: "coral",
+  blue: "sky", indigo: "lavender", teal: "aqua", green: "mint", purple: "lavender",
+  orange: "peach", yellow: "lemon", pink: "sakura", red: "coral", gray: "sky", grey: "sky"
+};
+
+var DEFAULT_LIB = [
+  { name: "设计评审汇报", text: "你是一位飞机设计研究所的资深主任设计师。请把下面的设计内容整理成评审汇报:先给结论与主要指标,再按「设计依据 / 方案描述 / 分析校核 / 风险与对策」四节展开,语言严谨、面向评审专家。\n\n" },
+  { name: "需求符合性检查", text: "请对照需求条款逐条检查下面方案描述的符合性,按「条款号 | 符合 / 部分符合 / 不符合 | 依据说明 | 缺口与建议」输出表格,逐条核对、不要遗漏;方案中没有对应描述的标「未覆盖」。\n\n需求条款:\n方案描述:\n" },
+  { name: "技术方案论证", text: "请以飞机总体论证专家的视角,对下面的技术方案从「技术可行性、性能指标达成度、研制风险、成本与周期」四个维度进行论证,给出明确的论证结论与改进建议。\n\n" },
+  { name: "仿真试验数据分析", text: "请分析下面的仿真 / 试验数据:识别异常点与变化趋势,与理论预期或指标要求对比,给出可能的原因分析和下一步试验建议。\n\n[粘贴数据]" },
+  { name: "专利交底书", text: "请根据下面的技术方案起草一份专利交底书草稿,包含:技术领域、背景技术、发明内容、技术方案、具体实施方式、与现有技术相比的有益效果。\n\n" },
+  { name: "中译英(信达雅)", text: "把下面的内容翻译成地道的英文,保持原意与语气,不要逐字直译。只输出译文。\n\n" },
+  { name: "要点提取", text: "把下面的内容压缩成不超过 8 条要点,每条一行,用 - 开头。只输出要点。\n\n" },
+  { name: "代码审查", text: "请以资深工程师的视角审查下面的代码,指出潜在缺陷、边界情况与性能问题,并给出修改后的代码。\n\n" }
+];
+
+var WELCOME_TIPS = [
+  { icon: "brain", text: "用通俗的语言解释 Transformer 的注意力机制,并说明它在机载边缘计算上的落地难点" },
+  { icon: "cpu", text: "对比 CNN 与 ViT 在航空遥感图像目标检测中的优缺点,用表格呈现" },
+  { icon: "book", text: "帮我梳理飞行器总体设计的主要流程与各学科之间的关键权衡" },
+  { icon: "terminal", text: "写一段 Python,用卡尔曼滤波融合 IMU 与 GNSS 数据,并逐行解释思路" },
+  { icon: "shield", text: "民用飞机适航审定对飞控软件提出了哪些主要要求?" },
+  { icon: "activity", text: "分析这份风洞试验数据的趋势,指出异常点并给出复测建议:[粘贴数据]" }
+];
+
+var SHORTCUTS = [
+  ["Enter", "发送消息"],
+  ["Shift + Enter", "换行"],
+  ["Ctrl + K", "命令面板"],
+  ["Ctrl + F", "在对话中查找"],
+  ["Ctrl + M", "切换模型"],
+  ["Ctrl + B", "显示 / 隐藏侧边栏"],
+  ["Ctrl + ,", "打开设置"],
+  ["Ctrl + N", "新建对话"],
+  ["Ctrl + Shift + L", "切换深色 / 浅色"],
+  ["Ctrl + Alt + C", "复制最后一条回答"],
+  ["Ctrl + O", "展开 / 折叠压缩总结"],
+  ["Esc", "关闭弹层 / 停止当前操作"],
+  ["↑ / ↓(命令面板)", "选择条目"],
+  ["PageUp / PageDown", "滚动对话"]
+];
+
+/* ---------------------------------------------------------------------------
+   2. 状态与持久化
+--------------------------------------------------------------------------- */
+function loadState() {
+  var raw = null;
+  try { raw = localStorage.getItem(LS_KEY); } catch (e) { storageBroken = true; }
+  var s = null;
+  if (raw) {
+    try { s = JSON.parse(raw); } catch (e) { s = null; }
+  }
+  if (!s || typeof s !== "object") s = {};
+  s.settings = mergeSettings(s.settings);
+  /* 会话本体放 IndexedDB(那 10GB 的池子),localStorage 只留设置 + 轻量状态。
+     旧库(会话还在 localStorage 里)先收着,启动时自动搬走 —— 先写成功再瘦身,不会丢 */
+  pendingConvs = Array.isArray(s.conversations) ? s.conversations : null;
+  s.conversations = pendingConvs ? pendingConvs.map(sanitizeConv) : [];
+  /* 会话版本:接住落盘里别人的进度(否则本页会用一个更小的版本号覆盖记录,对侧以为"没变化")。
+     **这里不动 convRevState.sig** —— sig 只由 stateRecord() 维护,而 loadState 每次 storage
+     事件都会跑;在这里把 sig 重置成"当前列表的指纹"(IDB 模式下必然是空列表)会让本页之后
+     每一次保存都误判成"会话变了"并多推一个版本。IDB 模式下这里给出的
+     s.conversations 只是迁移源,真正的列表由 bootStorage() 从 IDB 采纳,那时才对齐一次 sig。 */
+  if (typeof s.convsRev === "number" && isFinite(s.convsRev) && s.convsRev > convRevState.rev) {
+    convRevState.rev = s.convsRev;
+  }
+  /* 对侧的"明确撤回"先知会墓碑:撤回比墓碑新时墓碑作废(用户导入回来的会话不能被旧墓碑判死) */
+  mergeConvsRestored(s.convsRestored);
+  /* 对侧的删除墓碑要接住(它是对侧"删除 / 清空 / 导入替换"的显式意图,合并时优先于本地副本) */
+  mergeConvsGone(s.convsGone);
+  /* 记录里那份旧库会话列表同样要按墓碑优先(必须放在上面两次 merge 之后 —— 墓碑是先从这里读进来的):
+     记录里带着墓碑、这份列表里还留着那条,界面就会显示一条"点不开也写不进去"的幽灵条目
+     (旧库版本同理;IDB 采纳那份在 bootStorage 里套同一个判据 convsWritable) */
+  if (s.conversations.length) s.conversations = convsWritable(s.conversations);
+  /* 对侧整库替换过(清空全部 / 导入备份)⇒ 本次合并不再让本地未落库副本优先 */
+  if (typeof s.convsWiped === "number" && isFinite(s.convsWiped) && s.convsWiped > convRevState.wiped) {
+    convRevState.wiped = s.convsWiped;
+    convRevState.replaced = true;
+  }
+  if (!Array.isArray(s.promptLib)) s.promptLib = DEFAULT_LIB.slice();
+  s.activeId = s.activeId || null;
+  s.fetchedModels = Array.isArray(s.fetchedModels) ? s.fetchedModels : [];
+  return s;
+}
+/* 修正一条会话里的脏数据(旧库/导入都可能缺字段) */
+function sanitizeConv(c) {
+  if (!c || typeof c !== "object") c = {};
+  if (!Array.isArray(c.messages)) c.messages = [];
+  if (typeof c.updatedAt !== "number") c.updatedAt = c.createdAt || Date.now();
+  if (typeof c.title !== "string" || !c.title) c.title = "新对话";
+  if (typeof c.pinned !== "boolean") c.pinned = false;
+  /* 工作区挂载引用只做类型校验(同步函数里不做存在性查询;悬垂引用由 WS.* 返回 ENOENT 兜底) */
+  if (typeof c.wsId !== "string" || !c.wsId) c.wsId = null;
+  /* 外部 MCP 工具的会话级覆盖:只认 true / false,其余一律删掉。
+     这里**不能**写默认值 —— 缺字段的含义是「跟随全局总开关」,补一个 false 就等于
+     给每条会话钉上"永久关闭",全局开关从此对任何会话都不生效 */
+  if (c.extToolsEnabled !== true && c.extToolsEnabled !== false) delete c.extToolsEnabled;
+  /* 上下文压缩账目(conv.compactMeta):只做类型校验,**不补默认值** ——
+     缺字段的含义是「这条会话没被压缩过」,补一份全零的账目会让界面显示「压缩过」 */
+  if (c.compactMeta !== undefined) {
+    var cm = c.compactMeta;
+    if (!cm || typeof cm !== "object" || Array.isArray(cm)) delete c.compactMeta;
+    else if (cm.source !== "manual" && cm.source !== "auto" && cm.source !== "tool") delete c.compactMeta;
+    else {
+      var CM_NUMS = ["at", "dropped", "droppedTokens", "before", "after", "released", "freedBytes", "ms"];
+      CM_NUMS.forEach(function (k) {
+        if (typeof cm[k] !== "number" || !isFinite(cm[k])) cm[k] = 0;
+      });
+      if (typeof cm.model !== "string") cm.model = "";
+    }
+  }
+  /* 消息层也要挡:条目本身是 null / 数字 / 字符串 时,m.alternates 会抛 TypeError(导入链
+     是先替换 state、再落盘,一旦半途抛出就是"内存换了、盘没换、界面还是旧的"且没有任何提示)。
+     旧库 / 手改 / 半损坏的备份都可能带上这种条目,丢掉它们比整批中断好。 */
+  c.messages = c.messages.filter(function (m) { return !!m && typeof m === "object"; });
+  c.messages.forEach(function (m) {
+    if (!Array.isArray(m.alternates)) { delete m.alternates; delete m.altIndex; }
+    else if (typeof m.altIndex !== "number" || m.altIndex < 0 || m.altIndex >= m.alternates.length) {
+      m.altIndex = 0;
+    }
+  });
+  return c;
+}
+function mergeSettings(st) {
+  var out = {}, k;
+  st = st || {};
+  var prevSchema = typeof st.schema === "number" ? st.schema : 0;
+  for (k in DEFAULT_SETTINGS) {
+    if (Object.prototype.hasOwnProperty.call(DEFAULT_SETTINGS, k)) out[k] = DEFAULT_SETTINGS[k];
+  }
+  for (k in st) {
+    if (Object.prototype.hasOwnProperty.call(st, k)) out[k] = st[k];
+  }
+  /* Base URL 有意不做「旧默认 → 新默认」的自动迁移:旧默认是内网地址,公开源码不再保留它的字面量
+     (见 DEFAULT_BASE 处的注释)。等值迁移的唯一安全判据恰好需要那个字面量,所以宁可不迁移 ——
+     已存设置一律原样保留,不会被任何规则改写 */
+  /* 已移除「上下文 token 预算」:只保留历史条数限制,不再按 token 截断历史 */
+  delete out.ctxBudget;
+  if (typeof out.maxTokens !== "number" || out.maxTokens < 0 || out.maxTokens > MAX_TOK_LIMIT) {
+    out.maxTokens = DEFAULT_SETTINGS.maxTokens;
+  }
+  if (typeof out.ctxMsgs !== "number" || out.ctxMsgs < 0 || out.ctxMsgs > 200) {
+    out.ctxMsgs = DEFAULT_SETTINGS.ctxMsgs;
+  }
+  out.tokCalib = (st.tokCalib && typeof st.tokCalib === "object" && !Array.isArray(st.tokCalib)) ? st.tokCalib : {};
+  /* 每个模型由服务端告知的上下文窗口(设置里展示、用量环按它算百分比) */
+  out.modelCtx = (st.modelCtx && typeof st.modelCtx === "object" && !Array.isArray(st.modelCtx)) ? st.modelCtx : {};
+  /* 旧的「把页面暴露给外部调用方」那套 MCP 配置已被「模型侧工具调用」取代,直接丢弃 */
+  delete out.mcpEnabled;
+  delete out.mcpTools;
+  delete out.mcpTransports;
+  out.toolPerms = (st.toolPerms && typeof st.toolPerms === "object" && !Array.isArray(st.toolPerms)) ? st.toolPerms : {};
+  var lim = (st.toolLimits && typeof st.toolLimits === "object") ? st.toolLimits : {};
+  out.toolLimits = {
+    timeoutMs: clampNum(lim.timeoutMs, 60000, 3600000, 600000),
+    maxCalls: clampNum(lim.maxCalls, 1, 100, 50),
+    maxOut: clampNum(lim.maxOut, 1000, 131072, 16384)
+  };
+  /* 旧字段(代码长度上限 / 调用轮数上限)已按需求移除 */
+  delete out.toolLimits.maxCode;
+  delete out.toolLimits.maxRounds;
+  /* 工具改名的一次性键搬迁(幂等;设计约定"执行顺序"):
+     · 【位置写死】必须放在下面 `if (prevSchema < SCHEMA)` 块【之前】—— 搬迁先执行,
+       schema<4 的「询问 → 允许」重置规则才查得到归一后的键(否则那条重置静默失效)
+     · schema 门外,【不】bump SCHEMA:schema 块里还压着「旧默认值清理」这类非幂等规则,
+       bump 会误伤用户在 schema 4 之后主动设成的 0.7 / 0.95 / false(与改名无关)
+     · 覆盖两个入口:老库升级 与 导入旧备份(两条路径都走 mergeSettings) */
+  var PERM_RENAME = { run_js: "ExecuteJavaScript" };
+  for (var oldName in PERM_RENAME) {
+    if (!Object.prototype.hasOwnProperty.call(PERM_RENAME, oldName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(out.toolPerms, oldName)) continue;
+    if (out.toolPerms[PERM_RENAME[oldName]] === undefined) out.toolPerms[PERM_RENAME[oldName]] = out.toolPerms[oldName];
+    delete out.toolPerms[oldName];
+  }
+  out.toolsEnabled = !!st.toolsEnabled;
+  out.toolNet = !!st.toolNet;
+  /* 上下文压缩:自动压缩开关(布尔归一)+ 触发阈值(clampNum 风格,60~95,默认 85)。
+     非法输入("x" / 200 / -1)一律归一:默认值 / 95 / 60 —— 不抛错、不写坏设置 */
+  out.compactAuto = out.compactAuto !== false;
+  out.compactTriggerPct = clampNum(out.compactTriggerPct, CX_TRIGGER_MIN, CX_TRIGGER_MAX, CX_TRIGGER_DEF);
+  /* 工作区右栏开合状态(纯界面设置):布尔归一,写入口径与 wsRailSetOpen 一致 */
+  out.wsRailOpen = !!out.wsRailOpen;
+  /* 工作区:预载/回写上限做成可配(clampNum 风格与既有校验一致) */
+  out.wsSessionBytesMb = clampNum(out.wsSessionBytesMb, 1, 256, 16);
+  out.wsSessionWbackMb = clampNum(out.wsSessionWbackMb, 16, 4096, 256);
+  out.wsSessionFiles = clampNum(out.wsSessionFiles, 100, 20000, 2000);
+  /* FileOps 的两个子开关(布尔归一:只有显式 false 才算关) */
+  out.toolOpsAllowDelete = out.toolOpsAllowDelete !== false;
+  out.toolOpsAllowOverwrite = out.toolOpsAllowOverwrite !== false;
+  /* Python 运行时:全内嵌下 pyocache 恒空,"是否已缓存"退化为纯展示位 */
+  out.pyodideCacheReady = !!out.pyodideCacheReady;
+  /* 后台任务超时(clampNum 风格,60s–60min,默认 30min)+ 「停止时终止后台任务」开关 */
+  out.pyTaskTimeoutMs = clampNum(out.pyTaskTimeoutMs, 60000, 3600000, 1800000);
+  out.pyTaskStopKills = out.pyTaskStopKills === true;
+  /* ④ 外部 MCP:总开关 / 默认权限 / 服务器列表 / instructions 注入,逐条校验 */
+  out.externalToolsEnabled = !!out.externalToolsEnabled;
+  out.mcpInjectInstructions = !!out.mcpInjectInstructions;
+  out.externalToolDefaultPerm = (out.externalToolDefaultPerm === "allow" || out.externalToolDefaultPerm === "deny")
+    ? out.externalToolDefaultPerm : "ask";
+  if (!Array.isArray(out.mcpServers) || !out.mcpServers.length) {
+    out.mcpServers = JSON.parse(JSON.stringify(DEFAULT_SETTINGS.mcpServers));
+  } else {
+    out.mcpServers = out.mcpServers.slice(0, 8).map(function (s, i) {   /* 多服务器留余量,上限 8 */
+      s = (s && typeof s === "object") ? s : {};
+      return {
+        id: typeof s.id === "string" && s.id ? s.id : ("srv" + i),
+        name: (typeof s.name === "string" && s.name.slice(0, 40)) || ("服务器 " + (i + 1)),
+        url: /^https?:\/\//.test(String(s.url || "")) ? String(s.url).slice(0, 500)
+          : DEFAULT_SETTINGS.mcpServers[0].url,
+        enabled: s.enabled !== false,
+        auth: typeof s.auth === "string" ? s.auth.slice(0, 500) : "",
+        timeoutMs: clampNum(s.timeoutMs, 5000, 600000, 120000),
+        disabledTools: Array.isArray(s.disabledTools)
+          ? s.disabledTools.filter(function (x) { return typeof x === "string"; }).slice(0, 200) : []
+      };
+    });
+  }
+  /* 附件:PDF 模式 / 页数 / OCR 语言 / 视觉能力覆盖 + 每个模型的探测结果 */
+  if (out.pdfMode !== "image") out.pdfMode = "text";
+  if (typeof out.pdfDpi !== "number" || out.pdfDpi < 72 || out.pdfDpi > 300) out.pdfDpi = 150;
+  if (typeof out.pdfMaxPages !== "number" || out.pdfMaxPages < 1 || out.pdfMaxPages > 50) out.pdfMaxPages = 10;
+  if (out.ocrLangs !== "eng" && out.ocrLangs !== "chi_sim" && out.ocrLangs !== "chi_sim+eng") out.ocrLangs = "chi_sim+eng";
+  if (out.visionForce !== "yes" && out.visionForce !== "no") out.visionForce = "auto";
+  out.modelVision = (st.modelVision && typeof st.modelVision === "object" && !Array.isArray(st.modelVision)) ? st.modelVision : {};
+  /* 图片最长边 / 重采样算法 / 单条消息附件上限 */
+  if (typeof out.imgMaxSide !== "number" || out.imgMaxSide < 512 || out.imgMaxSide > 8192) out.imgMaxSide = 4096;
+  if (!RESAMPLE_PRESETS[out.imgResample]) out.imgResample = "spline";
+  if (typeof out.attachMsgMaxMb !== "number" || out.attachMsgMaxMb < 1 || out.attachMsgMaxMb > 100) out.attachMsgMaxMb = 100;
+  if (typeof out.cleanKeepRecent !== "number" || out.cleanKeepRecent < 10 || out.cleanKeepRecent > 100) out.cleanKeepRecent = 30;
+  if (typeof out.temperature !== "number" || out.temperature > 2 || out.temperature < -1) {
+    out.temperature = DEFAULT_SETTINGS.temperature;
+  }
+  if (typeof out.topP !== "number" || out.topP > 1 || out.topP < -1) out.topP = DEFAULT_SETTINGS.topP;
+  if (EFFORT_LEVELS.indexOf(out.reasoningEffort) === -1) out.reasoningEffort = "";
+  if (typeof out.fontSize !== "number" || out.fontSize < 12 || out.fontSize > 18) out.fontSize = 14.5;
+  if (ACCENT_ALIAS[out.accent]) out.accent = ACCENT_ALIAS[out.accent];
+  if (ACCENTS.indexOf(out.accent) === -1) out.accent = DEFAULT_SETTINGS.accent;
+  /* 自定义标签页图标:只接受本页生成的两类 data URI,非法/超长一律回默认
+     (防手改备份往 href 里塞任意字符串) */
+  if (typeof out.customIcon !== "string" ||
+      (out.customIcon !== "" &&
+       (!/^data:image\/(png|jpeg);base64,/.test(out.customIcon) || out.customIcon.length > FAVICON_DATA_MAX))) {
+    out.customIcon = "";
+  }
+  /* 一次性迁移:旧版本的默认值(当时没有对应 UI,存下来的都是默认值而非用户选择) */
+  if (prevSchema < SCHEMA) {
+    if (out.temperature === 0.7) out.temperature = -1;
+    if (out.topP === 0.95) out.topP = -1;
+    if (out.codeWrap === false) out.codeWrap = true;
+    /* schema 4:ExecuteJavaScript(原 run_js)的默认权限改成「允许」,旧库里存下的「询问」一并重置成新默认。
+       键用改名后的名字:上面的 PERM_RENAME 块已经把旧键搬过来了 */
+    if (prevSchema < 4 && out.toolPerms && out.toolPerms.ExecuteJavaScript === "ask") delete out.toolPerms.ExecuteJavaScript;
+  }
+  out.schema = SCHEMA;
+  if (out.theme !== "dark" && out.theme !== "light" && out.theme !== "system") out.theme = "dark";
+  if (out.protocol !== "anthropic") out.protocol = "openai";
+  return out;
+}
+
+/* ---------------------------------------------------------------------------
+   跨标签页的会话版本号(convsRev)+ 会话指纹
+---------------------------------------------------------------------------
+   背景(IDB 模式下):localStorage 记录里**不写**会话正文(见 stateRecord),记录里也没有时间戳。
+   于是"只动会话、不动设置"的写操作(删除**非当前**会话 / 重命名 / 置顶 / 清空消息 / 改消息)
+   产生的记录**逐字节不变** → 浏览器不派发 storage 事件 → 另一个标签页的 onStorageSync 根本不运行
+   → 它一直显示陈旧列表;而且它下一次整表回写(flushConvs → convsPutAll)会把对侧已删的会话
+   连内容一起写回 IDB(删除被"复活")。
+   修法:记录里带一个只增不减的 convsRev;**会话集合或内容一变就 bump**。bump 用指纹比对决定,
+   不靠各个改动点自觉调用(漏一个点 = 漏一条同步)。记录必然逐字节不同 ⇒ 事件必然派发 ⇒
+   对侧走既有的 pullConvsFromIdb() 收敛。
+   历史教训:光有版本号还不够 —— "IDB 里没有这条"分不清"对侧删了它"与"它还没写进去",
+   于是"本页未落库改动优先"会把对侧已删 / 已清空 / 已覆盖掉的会话连内容一起写回 IDB
+   (删除被复活 / 清空后残留 / 覆盖导入没覆盖干净)。现在删除意图显式化,见下面 convGoneMap
+   (墓碑,跟着记录走)与 convRevState.wiped(整库替换标记)。
+--------------------------------------------------------------------------- */
+var convRevState = {
+  rev: 0,         /* 本页写进记录里的版本号(写之前先接住落盘里更大的值,保证单调) */
+  sync: 0,        /* 内存副本(与 IDB 快照)对应的版本号 */
+  peer: 0,        /* 本次写记录前从落盘记录里读到的版本号(即"别人的"进度) */
+  /* 上次写记录时的会话指纹。**只有 stateRecord() 能写它**(它才是"写记录"这个动作本身):
+     null = 本页还没写过记录 ⇒ 第一次写只对齐、不 bump(启动时的会话列表是从 IDB 采纳来的,
+     对侧早就知道,不该被当成"会话变了"再推一次) */
+  sig: null,
+  pending: false, /* 本轮的会话改动还没在 IDB 落地 ⇒ 落地后再推一次版本(见 broadcastConvsChange) */
+  seen: 0,        /* 已经按记录收敛过的版本号(同一 rev 的重复事件不再重读全库,见 onStorageSync) */
+  wiped: 0,       /* 「整库被替换」(清空 / 导入)的时间戳:跟着记录走,对侧见到更大的值就按整库替换处理 */
+  replaced: false /* 一次性标记:记录里的 wiped 比本页新 ⇒ 本次合并不做"本地未落库副本优先"。
+                     消费点都是"采纳完整库的那一步":bootStorage 的三个分支(含旧库搬家)与
+                     mergeConvsByIdb 的收尾(合并体跑完才置否,中途抛错就留给下一轮) */
+};
+/* 每条会话的**权威副本**长什么样:id → 指纹。来源有二 —— ① 本页成功写进 IDB 的那一份;
+   ② 从 IDB 读回来时采纳的那一份(bootStorage / mergeConvsByIdb)。内存副本与它一致
+   ⇒ 这条会话没有还没落库的改动;不一致 ⇒ 本页改过、还没落库(saveSoon 最多延迟 700ms),
+   收敛时必须以本页为准,否则会把用户刚做的改动吃掉。
+   (不能只用"本页写没写过"来判断:没写过 ≠ 改过 —— 那样会把从 IDB 读进来的每一份都当成
+   有本地改动,两边永远各说各话。) */
+var convSeenSigs = {};
+/* 删除墓碑:id → 删除时间戳。
+   光看"IDB 里没有这条"分不清"对侧把它删了"与"它还没被写进去",于是"本页未落库改动优先"
+   那条分支会把对侧已删 / 已清空 / 已覆盖掉的会话连内容一起写回权威库(删了又回来)。
+   墓碑是**显式的删除意图**,跟着 localStorage 记录跨标签页走,合并与落盘时都优先于本地副本。 */
+var convGoneMap = {};
+/* 显式撤回台账:id → 「用户把这条会话要回来」的时间戳(导入备份里带回了同一个 id)。
+   墓碑只该否决"删除方向",不该否决"用户明确导入回来"这条通路 —— 而且这个意图必须跟着记录走:
+   ① 本页撤回后,同一次 stateRecord() 里的 mergeConvsGone(rec0.gone) 读到的还是**撤回之前**
+      那份记录,会把刚撤掉的墓碑原样加回来,convsWritable 又按墓碑挡写 ⇒ 导入回来的会话
+      永远写不进 IDB(历史教训:清空 / 删除后 10 分钟内导入备份 = 静默丢数据);
+   ② 对侧手里那份墓碑会让它在收敛时把刚导入的会话当成"幽灵副本"从 IDB 里删掉。
+   判据统一成:墓碑与撤回,谁的意图更新谁算(见 convGoneActive / mergeConvsGone)。 */
+var convRestoredMap = {};
+/* 墓碑有效期:它只需要覆盖"对侧还没收到这次删除"的那几秒到几分钟。过期即失效 ——
+   这样"删掉后又从备份导入回来"的极端操作不会被一张很久以前的墓碑永久挡住。
+   撤回台账同一个窗口:墓碑过期后不再否决任何东西,撤回也就不必再留着 */
+var CONV_GONE_MS = 10 * 60 * 1000;
+/* 记录里最多带多少条墓碑 / 撤回(防记录膨胀;超出丢掉最旧的)。三处口径必须一致:
+   ① 落盘(pruneConvsGone)② 记录 → 内存的合并(mergeConvsGone / mergeConvsRestored)
+   ③ 批量记账(markConvsGone / markConvsRestored)都与这个常量对齐 —— 任何一处小于它,
+   记录里合法的条目就会被静默丢掉(历史教训:200 条时"一次删掉 >200 个会话",
+   例如清理空间按保护范围整段删,墓碑落不进记录,只能靠 wiped 的整库替换语义兜底)。
+   提到 2000 让这条路径在现实规模的库上也直接覆盖(一条墓碑约 30 字节,2000 条约 60KB,
+   且只在这 10 分钟窗口里出现)。
+   **已知残余边界(未实测)**:一次导入回来的会话既多于 2000 条、其中又有多于 2000 条与对侧
+   仍活着的墓碑同 id 时,超出的那些拿不到撤回条目、会被对侧墓碑判死 —— 要达到这个规模需要
+   先一次性删掉 >2000 个会话再导入一个同类规模的备份,现实不可达;真到那种规模请先弱化墓碑 */
+var CONV_GONE_MAX = 2000;
+var state = loadState();
+var conv = null;
+var generating = false;
+var abortCtrl = null;
+var storageBroken = false;
+var connState = { level: "idle", text: "未配置" };
+var draftFiles = [];
+var convSearchKw = "";
+var lastStats = null;
+
+/* ---------------------------------------------------------------------------
+   附件二进制的外置存储(IndexedDB)
+---------------------------------------------------------------------------
+   背景:localStorage 每个源只有 ~5MB,而一张 4096px 的图就能到几 MB。
+   策略:附件的 base64 payload 优先写进 IndexedDB(它和 Cache 共用那个几十 GB 的
+        「站点总配额」),localStorage 里只留元数据(name/size/mime/w/h/页数…);
+        读的时候从内存缓存取,缓存没有就按 id 去 IndexedDB 要。
+   安全:任何一步失败(不支持 / 被隐私模式禁掉 / 超时)→ 保持旧行为(内联在 localStorage),
+        绝不出现「既不在 localStorage 也不在 IndexedDB」的窗口:
+        先 await put 成功,才把 payload 从消息里剥掉。
+--------------------------------------------------------------------------- */
+var blobStore = {
+  db: null, opening: null, ok: false, note: "", mem: {}
+};
+/* 版本 3:一次升级建齐工作区三区(workspaces / wsfiles / pyocache),不留第二次 bump。
+   wsfiles 存 Blob(不转 base64);pyocache 是 pyodide 运行时缓存的唯一落点 */
+var IDB_NAME = "chatgpt-webui-blobs", IDB_STORE = "blobs", IDB_CONVS = "convs",
+    IDB_WS = "workspaces", IDB_WSF = "wsfiles", IDB_PYC = "pyocache", IDB_VER = 3;
+/* 旧库迁移用:localStorage 里读到的旧版会话(迁移成功后丢弃) */
+var pendingConvs = null;
+/* 会话是否真的放在 IndexedDB 里(必须确认会话区可用;否则一律退回 localStorage) */
+var convStoreReady = false;
+/* 会话数据的权威副本是否真在 IndexedDB 里(纯诊断:只有在真正读/写过会话区之后才置真) */
+var convsLiveInIdb = false;
+/* 工作区三区是否齐备(DB v3 且 workspaces/wsfiles/pyocache 都在);不齐 → 工作区功能整体关闭 */
+var wsStoreReady = false;
+/* pyocache 区是否存在(pyodide 运行时缓存);全内嵌方案下为空区,仅影响缓存来源可用性 */
+var pyCacheReady = false;
+/* 存储升级是否被其它标签页阻塞(它们还攥着旧版本的连接,升级要等它们全关掉) */
+var idbBlocked = false;
+function convsInIdb() { return convStoreReady === true; }
+function idbOpen(timeoutMs) {
+  return new Promise(function (resolve, reject) {
+    if (!window.indexedDB) { reject(new Error("浏览器不支持 IndexedDB")); return; }
+    var done = false;
+    idbBlocked = false;
+    var to = setTimeout(function () {
+      if (!done) {
+        done = true;
+        /* 被阻塞时也要给出真正的原因,否则用户只能看到「大仓库不可用」 */
+        reject(new Error(idbBlocked
+          ? "打开 IndexedDB 超时:存储升级被其它标签页阻塞,请关闭本应用的其它标签页后刷新"
+          : "打开 IndexedDB 超时(可能是隐私模式)"));
+      }
+    }, timeoutMs || 4000);
+    var req;
+    try { req = indexedDB.open(IDB_NAME, IDB_VER); }
+    catch (e) { clearTimeout(to); reject(e); return; }
+    req.onupgradeneeded = function () {
+      /* 老库(只有 blobs 区)在这里补齐 convs 区;v2→v3 再补工作区三区(只补建,不动既有两行) */
+      var db = req.result;
+      try {
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+        if (!db.objectStoreNames.contains(IDB_CONVS)) db.createObjectStore(IDB_CONVS);
+        if (!db.objectStoreNames.contains(IDB_WS)) db.createObjectStore(IDB_WS);
+        if (!db.objectStoreNames.contains(IDB_WSF)) {
+          var stf = db.createObjectStore(IDB_WSF);
+          /* 按工作区取文件的索引(删除级联、重算用量、快照桥都走它) */
+          try { stf.createIndex("ws", "ws", { unique: false }); } catch (e) {}
+        }
+        if (!db.objectStoreNames.contains(IDB_PYC)) db.createObjectStore(IDB_PYC);
+      } catch (e) {}
+    };
+    /* 升级撞上其它标签页(旧库连接没关)时浏览器会先回调这里:不提示的话用户只会看到 4s 后的超时 */
+    req.onblocked = function () {
+      idbBlocked = true;
+      try { toast("请关闭本应用的其它标签页,以便升级本地存储", "warn", 6000); } catch (e) {}
+    };
+    req.onerror = function () {
+      if (!done) { done = true; clearTimeout(to); reject(req.error || new Error("IndexedDB 打开失败")); }
+    };
+    req.onsuccess = function () {
+      if (done) return;
+      done = true; clearTimeout(to); resolve(req.result);
+    };
+  });
+}
+function blobDb() {
+  if (blobStore.db) return Promise.resolve(blobStore.db);
+  if (!blobStore.opening) {
+    blobStore.opening = idbOpen(4000).then(function (db) {
+      blobStore.db = db;
+      blobStore.ok = true;
+      blobStore.note = "";
+      /* 会话区必须真的存在(旧库只有 blobs 区) —— 否则不能把会话从 localStorage 里搬走 */
+      try {
+        convStoreReady = !!(db.objectStoreNames && db.objectStoreNames.contains(IDB_CONVS));
+        /* 工作区三区缺一个就整体关闭工作区功能(工具隐藏 + 报错),避免半可用的存储状态 */
+        wsStoreReady = !!(db.objectStoreNames && db.objectStoreNames.contains(IDB_WS)
+          && db.objectStoreNames.contains(IDB_WSF) && db.objectStoreNames.contains(IDB_PYC));
+        pyCacheReady = !!(db.objectStoreNames && db.objectStoreNames.contains(IDB_PYC));
+      } catch (e) { convStoreReady = false; wsStoreReady = false; pyCacheReady = false; }
+      if (!convStoreReady) blobStore.note = "数据库里没有会话区(需要升级)";
+      else if (!wsStoreReady) blobStore.note = "数据库里没有工作区存储区(需要升级)";
+      db.onversionchange = function () { try { db.close(); } catch (e) {} blobStore.db = null; blobStore.opening = null; };
+      return db;
+    }, function (e) {
+      blobStore.ok = false;
+      blobStore.note = (e && e.message) || String(e);
+      return null;
+    });
+  }
+  return blobStore.opening;
+}
+function blobPut(id, mime, data) {
+  if (!id || !data) return Promise.resolve(false);
+  return blobDb().then(function (db) {
+    if (!db) return false;
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction(IDB_STORE, "readwrite");
+        tx.objectStore(IDB_STORE).put({ mime: mime || "", data: data, len: data.length, at: Date.now() }, id);
+        tx.oncomplete = function () {
+          /* 写盘成功同时填内存缓存:发送流程是「先外置、再组装请求」,
+             而 protocolContent 取 payload 走的是同步读(blobMemo)——
+             不在这里补一份,同一轮发送就会退化成「图片数据不在本机」的占位文案 */
+          blobStore.mem[id] = { mime: mime || "", data: data, len: data.length, at: Date.now() };
+          resolve(true);
+        };
+        tx.onerror = function () { resolve(false); };
+        tx.onabort = function () { resolve(false); };
+      } catch (e) { resolve(false); }
+    });
+  });
+}
+function blobGet(id) {
+  if (!id) return Promise.resolve(null);
+  if (blobStore.mem[id]) return Promise.resolve(blobStore.mem[id]);
+  return blobDb().then(function (db) {
+    if (!db) return null;
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction(IDB_STORE, "readonly");
+        var rq = tx.objectStore(IDB_STORE).get(id);
+        rq.onsuccess = function () {
+          var v = rq.result || null;
+          if (v && v.data) blobStore.mem[id] = v;
+          resolve(v);
+        };
+        rq.onerror = function () { resolve(null); };
+      } catch (e) { resolve(null); }
+    });
+  });
+}
+function blobDel(ids) {
+  if (!ids || !ids.length) return Promise.resolve(0);
+  return blobDb().then(function (db) {
+    if (!db) return 0;
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction(IDB_STORE, "readwrite");
+        var st = tx.objectStore(IDB_STORE);
+        ids.forEach(function (id) {
+          delete blobStore.mem[id];
+          try { st.delete(id); } catch (e) {}
+        });
+        tx.oncomplete = function () { resolve(ids.length); };
+        tx.onerror = function () { resolve(0); };
+      } catch (e) { resolve(0); }
+    });
+  });
+}
+/* ---- 会话本体:一条会话一个记录 ---- */
+/* 写清单里**不带**被墓碑判死的那些 id:哪怕它们还留在内存里(对侧刚删、本页还没收到事件),
+   也绝不写回权威库 —— 这是"删除被复活"的最后一道闸 */
+function convsWritable(list) {
+  return (list || []).filter(function (c) { return c && c.id && !convGoneActive(c.id); });
+}
+function convsPutAll(list) {
+  var write = convsWritable(list || state.conversations);
+  return blobDb().then(function (db) {
+    if (!db) return false;
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction(IDB_CONVS, "readwrite");
+        var st = tx.objectStore(IDB_CONVS);
+        write.forEach(function (c) { st.put(c, c.id); });
+        tx.oncomplete = function () {
+          convFlush.lastOK = Date.now(); convsLiveInIdb = true;
+          /* 落库成功 ⇒ 这些会话的权威副本就是我们刚写下去的这一份;内存副本对应的版本号一起对齐
+             (mergeConvsByIdb 靠前者判断"有没有还没落库的改动") */
+          markConvsSeen(write);
+          convRevState.sync = convRevState.rev;
+          /* 本轮的会话改动现在真的进 IDB 了 → 再推一次版本号:接收方等的合并窗口里
+             事务若没提交完,它会读到事务前的旧列表,而这个方向不会再产生 storage 事件 */
+          if (convRevState.pending) { convRevState.pending = false; broadcastConvsChange(); }
+          resolve(true);
+        };
+        tx.onerror = function () { resolve(false); };
+        tx.onabort = function () { resolve(false); };
+      } catch (e) { resolve(false); }
+    });
+  });
+}
+function convsGetAll() {
+  return blobDb().then(function (db) {
+    if (!db) return [];
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction(IDB_CONVS, "readonly");
+        var rq = tx.objectStore(IDB_CONVS).getAll();
+        rq.onsuccess = function () { convsLiveInIdb = true; resolve(Array.isArray(rq.result) ? rq.result : []); };
+        rq.onerror = function () { resolve([]); };
+      } catch (e) { resolve([]); }
+    });
+  });
+}
+function convsDel(ids) {
+  if (!ids || !ids.length) return Promise.resolve(0);
+  return blobDb().then(function (db) {
+    if (!db) return 0;
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction(IDB_CONVS, "readwrite");
+        var st = tx.objectStore(IDB_CONVS);
+        ids.forEach(function (id) { try { st.delete(id); } catch (e) {} });
+        tx.oncomplete = function () {
+          /* 删除是"整库替换"方向:对侧删掉的会话必须在它读 IDB 之前真的提交完,
+             否则它会读到旧列表、而且之后不会再收到事件(这个方向不写 localStorage)。
+             所以事务落地后补推一次版本号,逼它再读一次(见 broadcastConvsChange);
+             补推的记录里带上**删除墓碑**,对侧据此才不会把"本页未落库的副本"当成优先项 */
+          ids.forEach(function (id) { delete convSeenSigs[id]; });
+          markConvsGone(ids);
+          broadcastConvsChange();
+          resolve(ids.length);
+        };
+        tx.onerror = function () { resolve(0); };
+      } catch (e) { resolve(0); }
+    });
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   会话指纹与跨标签页收敛(配合文件上方的 convRevState)
+--------------------------------------------------------------------------- */
+/* 一条会话的轻量指纹:覆盖当前所有"会话内容改动"会动到的字段
+   (标题 / 置顶 / 消息条数与更新时间 / 挂载 / 单会话系统提示文本长度 / 外部工具会话级覆盖)。
+   漏掉一个字段的后果是双份的:本页 saveState 不会推进 convsRev(对侧收不到改动),
+   而 mergeConvsByIdb 又会把"本页刚改过的那条"当成已落库的权威副本 */
+function convFingerprint(c) {
+  if (!c) return "";
+  return (c.id || "") + "," + (c.updatedAt || 0) + "," + (c.pinned ? 1 : 0) + "," +
+    (c.messages ? c.messages.length : 0) + "," + (c.title || "") + "," + (c.wsId || "") + "," +
+    ((c.system || "").length) + "," +
+    (c.extToolsEnabled === true ? "E1" : (c.extToolsEnabled === false ? "E0" : "E-"));
+}
+function convsFingerprint(list) {
+  var out = String((list || []).length), i;
+  for (i = 0; i < (list || []).length; i++) out += "|" + convFingerprint(list[i]);
+  return out;
+}
+/* ---- 删除墓碑(记录里的删除意图) ---- */
+/* 墓碑 / 撤回台账都只留 CONV_GONE_MS 以内、且各自不超过 CONV_GONE_MAX 条;过期即删。
+   撤回台账一样要封顶(历史教训:原先只有墓碑封顶,10 分钟内两次规模导入就能让台账
+   涨到 2200 条 / 记录 91KB,与这里的口径不符)。裁掉最旧的撤回条目不会造成"该撤回丢失 ⇒
+   已删会话复活"的反向问题:记下撤回时(mergeConvsRestored)就把不比它新的墓碑一并删了,
+   所以"撤回与墓碑同时存在"时墓碑必然更新 —— 那条撤回本来就已经失效,丢掉它不改变任何一条的
+   判死结果。残余边界与墓碑同源(见 CONV_GONE_MAX 的说明):同一窗口内 id 各不相同、又合计超过
+   CONV_GONE_MAX 条的删除 / 导入,现实不可达 */
+function pruneConvsGone() {
+  var now = Date.now(), keep = [], rkeep = [], i, id;
+  for (id in convGoneMap) {
+    if (!Object.prototype.hasOwnProperty.call(convGoneMap, id)) continue;
+    if (typeof convGoneMap[id] !== "number" || !isFinite(convGoneMap[id]) ||
+        now - convGoneMap[id] > CONV_GONE_MS) { delete convGoneMap[id]; continue; }
+    keep.push(id);
+  }
+  for (id in convRestoredMap) {
+    if (!Object.prototype.hasOwnProperty.call(convRestoredMap, id)) continue;
+    if (typeof convRestoredMap[id] !== "number" || !isFinite(convRestoredMap[id]) ||
+        now - convRestoredMap[id] > CONV_GONE_MS) { delete convRestoredMap[id]; continue; }
+    rkeep.push(id);
+  }
+  if (keep.length > CONV_GONE_MAX) {                 /* 超出上限:丢最旧的那几条 */
+    keep.sort(function (a, b) { return convGoneMap[a] - convGoneMap[b]; });
+    for (i = 0; i < keep.length - CONV_GONE_MAX; i++) delete convGoneMap[keep[i]];
+  }
+  if (rkeep.length > CONV_GONE_MAX) {
+    rkeep.sort(function (a, b) { return convRestoredMap[a] - convRestoredMap[b]; });
+    for (i = 0; i < rkeep.length - CONV_GONE_MAX; i++) delete convRestoredMap[rkeep[i]];
+  }
+}
+/* 记下删除意图(本页删掉的、或从对侧记录里读到的);重复记只取更新的时间戳。
+   撤回与删除同毫秒时按"撤回优先"(两个动作要求用户在同一个毫秒里点两下,现实里不可能;
+   而漏掉撤回就是静默丢数据)—— 见 convGoneActive) */
+function markConvsGone(ids, at) {
+  var t = (typeof at === "number" && isFinite(at)) ? at : Date.now(), n = 0;
+  (ids || []).forEach(function (id) {
+    if (!id || n >= CONV_GONE_MAX) return;
+    n++;
+    if (convRestoredMap[id] >= t) return;      /* 用户明确要回来过 ⇒ 这次删除意图不生效 */
+    if (!convGoneMap[id] || convGoneMap[id] < t) convGoneMap[id] = t;
+  });
+  if (n) pruneConvsGone();
+  return n;
+}
+/* 对侧记录里的墓碑并进本页(取并集:谁的删除意图都不能被另一方忘记) */
+function mergeConvsGone(raw) {
+  if (!raw || typeof raw !== "object") return;
+  var n = 0;
+  for (var id in raw) {
+    if (!Object.prototype.hasOwnProperty.call(raw, id)) continue;
+    if (++n > CONV_GONE_MAX) break;             /* 记录被人手改过:不让它拖死保存链 */
+    var t = raw[id];
+    if (typeof t !== "number" || !isFinite(t)) continue;
+    /* 这条已被"明确要回来"过(且不比这次删除旧)⇒ 墓碑不再生效。它可能来自本页撤回之前
+       那份记录,也可能来自还没来得及收到撤回意图的对侧 —— 两种都不该把用户导入回来的
+       会话重新判死(否则静默丢数据只是换了个入口) */
+    if (convRestoredMap[id] >= t) continue;
+    if (!convGoneMap[id] || convGoneMap[id] < t) convGoneMap[id] = t;
+  }
+  if (n) pruneConvsGone();
+}
+/* 对侧记录里的撤回意图并进本页:它比本页手里的墓碑新 ⇒ 墓碑作废(否则本页收敛时会把
+   用户刚导入回来的会话当成"已删除的幽灵副本"从 IDB 里删掉) */
+function mergeConvsRestored(raw) {
+  if (!raw || typeof raw !== "object") return;
+  var n = 0;
+  for (var id in raw) {
+    if (!Object.prototype.hasOwnProperty.call(raw, id)) continue;
+    if (++n > CONV_GONE_MAX) break;             /* 记录被人手改过:不让它拖死保存链 */
+    var t = raw[id];
+    if (typeof t !== "number" || !isFinite(t)) continue;
+    if (!convRestoredMap[id] || convRestoredMap[id] < t) convRestoredMap[id] = t;
+    if (typeof convGoneMap[id] === "number" && convGoneMap[id] <= convRestoredMap[id]) delete convGoneMap[id];
+  }
+  if (n) pruneConvsGone();
+}
+/* 用户明确要把这些会话拿回来(导入备份里带回了同一个 id):撤回墓碑并把意图写进记录传给对侧。
+   不放进 convsPutAll:那条路径每次整表回写都会跑,让它清墓碑就等于把墓碑机制废掉一半 */
+function markConvsRestored(ids, at) {
+  var t = (typeof at === "number" && isFinite(at)) ? at : Date.now(), n = 0, raw = {};
+  (ids || []).forEach(function (id) {
+    if (!id || n >= CONV_GONE_MAX) return;
+    n++;
+    raw[id] = t;
+  });
+  if (n) mergeConvsRestored(raw);
+  return n;
+}
+/* 这条会话被显式删掉过吗?(有效期见 CONV_GONE_MS)。
+   撤回与墓碑比时间戳:撤回不比墓碑旧 ⇒ 这条不算"被删掉"(用户明确导入回来过) */
+function convGoneActive(id) {
+  var t = convGoneMap[id];
+  if (typeof t !== "number" || (Date.now() - t) > CONV_GONE_MS) return false;
+  return !(convRestoredMap[id] >= t);
+}
+/* 落盘记录里这一小部分的只读快照:版本号 / 墓碑 / 撤回 / 整库替换时间戳。
+   同一份 raw 只 parse 一次(缓存),避免每次保存都重新解析整条记录 */
+var convRecCache = { raw: null, rec: null };
+function readConvsRec() {
+  var empty = { rev: 0, gone: null, restored: null, wiped: 0 };
+  if (storageBroken) return empty;
+  var raw = null;
+  try { raw = localStorage.getItem(LS_KEY); } catch (e) { return empty; }
+  if (!raw) return empty;
+  if (convRecCache.raw === raw && convRecCache.rec) return convRecCache.rec;
+  var out = { rev: 0, gone: null, restored: null, wiped: 0 };
+  try {
+    var rec = JSON.parse(raw);
+    if (rec && typeof rec === "object") {
+      var v = rec.convsRev;
+      if (typeof v === "number" && isFinite(v) && v > 0) out.rev = v;
+      if (rec.convsGone && typeof rec.convsGone === "object") out.gone = rec.convsGone;
+      if (rec.convsRestored && typeof rec.convsRestored === "object") out.restored = rec.convsRestored;
+      if (typeof rec.convsWiped === "number" && isFinite(rec.convsWiped)) out.wiped = rec.convsWiped;
+    }
+  } catch (e) { return out; }        /* 解析失败一律按 0,绝不因此打断保存 */
+  convRecCache.raw = raw;
+  convRecCache.rec = out;
+  return out;
+}
+/* 落盘记录里的版本号(读不到 / 解析失败一律按 0 —— 绝不因此打断保存) */
+function readConvsRev() { return readConvsRec().rev; }
+function convListFind(list, id) {
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === id) return list[i];
+  return null;
+}
+/* 记下"这些会话的权威副本长什么样"(成功写库之后 / 从 IDB 读回来之后都走它) */
+function markConvsSeen(list) {
+  (list || []).forEach(function (c) { if (c && c.id) convSeenSigs[c.id] = convFingerprint(c); });
+}
+/* 这条会话在内存里的样子和"我们手上的权威副本"一致吗?(一致 ⇒ 没有还没落库的改动) */
+function convCommitted(c) {
+  if (!c) return false;
+  var sig = convSeenSigs[c.id];
+  return sig !== undefined && sig === convFingerprint(c);
+}
+/* 把 IDB 读回的会话列表合进内存。三个优先级,从高到低:
+   ① **墓碑**:这条被显式删过(本页或对侧)⇒ 一律不采纳,顺手把库里的幽灵副本也清掉;
+   ② 本页未落库的改动:IDB 里有的用本页那份(saveSoon 有 700ms 延迟,直接拿 IDB 覆盖会把
+      刚做的改名 / 置顶 / 清空静默吃掉);但"对侧刚整库替换过"(replaced)时不认这条 ——
+      整库替换就是要盖掉本页这份(只盖"被那次替换盖掉的那些",见 convWipedAway);
+   ③ IDB 权威:其余一律以 IDB 为准(IDB 里没有 = 对侧删了,本页也跟着删)。
+   返回值 { list, gone }:gone 是"库里还留着、但已被墓碑否掉"的 id,调用方负责删干净。 */
+/* 「整库被替换」(清空全部 / 导入备份)该丢掉的是**被那次替换盖掉的**本地未落库副本,不是
+   本页此后新建的会话:出生时间晚于 wiped 的会话不可能属于被替换掉的那个库。
+   少了这条判据,**下一次无关的合并**会把本页新建的会话整表丢掉(它还没落库)⇒ conv 变 null ⇒
+   sendMessage 收尾抛 TypeError:气泡停在「正在生成…」、这条消息永不落盘。触发链与修法见
+   appD 的 bootStorage(启动采纳 IDB 时就把 replaced 消费掉)+ sendMessage 的收尾兜底。 */
+function convWipedAway(c, replaced) {
+  if (!replaced) return false;
+  var born = (c && typeof c.createdAt === "number" && isFinite(c.createdAt)) ? c.createdAt : 0;
+  return born < convRevState.wiped;
+}
+function mergeConvsByIdb(idbList) {
+  var out = [], gone = [], i, c, local, pick;
+  var replaced = convRevState.replaced === true;   /* 读一次:本次合并按整库替换处理 */
+  for (i = 0; i < (idbList || []).length; i++) {
+    c = idbList[i];
+    if (!c || !c.id) continue;
+    if (convGoneActive(c.id)) { gone.push(c.id); continue; }
+    local = convListFind(state.conversations, c.id);
+    /* 留本页:有还没落库的改动;整库替换只看它有没有被那次替换盖掉 */
+    if (local && !convCommitted(local) && !convWipedAway(local, replaced)) { out.push(local); continue; }
+    pick = sanitizeConv(c);
+    convSeenSigs[pick.id] = convFingerprint(pick);     /* 采纳的这份就是权威副本 */
+    out.push(pick);
+  }
+  for (i = 0; i < state.conversations.length; i++) {
+    c = state.conversations[i];
+    if (!c || !c.id || convListFind(out, c.id)) continue;
+    if (convGoneActive(c.id)) continue;          /* 墓碑优先:对侧删了,本页也删 */
+    if (!convCommitted(c) && !convWipedAway(c, replaced)) out.push(c);
+  }
+  /* 一次性标记:合并体**跑完**才消费(不是一进门就置否)。中途抛错(sanitizeConv / convFingerprint
+     撞上极端数据)时留着它 —— 否则"被那次替换盖掉的本地未落库副本"会活过本轮,还会在后续合并里
+     被当成"本页未落库的改动"保留(反向残留)。启动那三处(bootStorage)的消费同理:采纳完列表才置否 */
+  convRevState.replaced = false;
+  return { list: out, gone: gone };
+}
+/* 从 IDB 重读并合并(flushConvs 的写前加固与 storage 事件的收敛都走它) */
+function pullConvsFromIdb() {
+  /* 收敛基准必须取**读 IDB 之前**的记录版本号:读完之后再取一次会把"这次读快照之后才写进去的
+     版本号"也算成已经收敛过,而这份快照里并没有那次改动的内容 —— 那个版本号对应的事件到达时
+     就会被去重挡掉,对侧列表一直陈旧(实测 1/5 偶发)。取读之前的版本号,则
+     "读的期间记录又前进了"必然满足 `readConvsRev() > seen`,下一次事件照常触发收敛。
+     **有意取舍**:在"对侧删除的事务落地补推版本号正好跨过本页读 IDB"这一交错下,本页会为那次
+     没读到内容的版本再多读一次全库(实测:此交错下 1 次 → 2 次;删除压测里
+     仍是每次 1 次)。宁可多一次读,也不认"没读到内容的版本号" —— 后者就是
+     对侧列表静默陈旧的那条路 */
+  var revAtRead = readConvsRev();
+  return convsGetAll().then(function (list) {
+    if (!convsInIdb()) return false;                 /* 期间回退到 localStorage 模式:交给下一次事件 */
+    var m = mergeConvsByIdb(list);
+    state.conversations = m.list;
+    conv = getConv(state.activeId) || state.conversations[0] || null;
+    state.activeId = conv ? conv.id : null;
+    convRevState.sync = Math.max(convRevState.sync, convRevState.peer, revAtRead);
+    convRevState.seen = Math.max(convRevState.seen, revAtRead);
+    /* 合并完如果内存里已经没有任何"本页改过、还没落库"的会话,就把指纹对齐一次:
+       这份列表现在全是权威副本,下一次保存不该再推一个版本号 —— 否则"对侧改一条"会让本页
+       回声式地再推一次,对侧又白读一遍全库(写放大)。
+       只要还有一条本地未落库改动就**绝不**对齐:那会把该推的版本号吞掉,对侧永远收不到它 */
+    var dirty = false;
+    for (var k = 0; k < state.conversations.length; k++) {
+      if (!convCommitted(state.conversations[k])) { dirty = true; break; }
+    }
+    if (!dirty) convRevState.sig = convsFingerprint(state.conversations);
+    /* 墓碑已经把这些 id 判死,但库里还留着(墓碑之前谁把它写回去的幽灵副本)⇒ 现在清掉。
+       清完会再推一次版本号,让另一侧也读到"这条真的没了" */
+    if (m.gone.length) return convsDel(m.gone).then(function () { return true; });
+    return true;
+  }, function () { return false; });                 /* 读失败:保留内存副本,至少状态一致 */
+}
+/* IDB 事务落地后再补一次记录写(只动版本号,不重写会话正文)。
+   接收方固定等 CONV_SYNC_MERGE_MS 才读 IDB,删除 / 清空 / 导入的事务若没在那之前提交完,
+   它会读到事务前的旧列表;而这个方向不会再产生 storage 事件 ⇒ 陈旧列表会一直留着。
+   补推一次版本号 ⇒ 它必然再读一次(此时读到的是已提交的真相)。 */
+function broadcastConvsChange() {
+  if (storageBroken) return false;
+  try {
+    convRevState.rev++;
+    localStorage.setItem(LS_KEY, JSON.stringify(stateRecord()));
+    convRevState.sync = convRevState.rev;   /* 刚推的就是"已经提交完的本地快照" */
+    convRevState.seen = Math.max(convRevState.seen, convRevState.rev);   /* 本页已经是这个版本了 */
+    return true;
+  } catch (e) { return false; }
+}
+/* 把内存里的会话刷进 IndexedDB:同一时刻只跑一次,期间再有请求就排队重跑 */
+var convFlush = { busy: false, again: false, lastOK: 0, fails: 0 };
+function flushConvs() {
+  if (!convsInIdb()) return Promise.resolve(false);
+  if (!state.conversations.length) return Promise.resolve(true);
+  if (convFlush.busy) { convFlush.again = true; return Promise.resolve(false); }
+  convFlush.busy = true;
+  /* 写前加固:本次保存前读到的落盘版本比内存副本对应的快照新 ⇒ 对侧刚动过会话集合
+     (多是删除),而我们手里这份列表还是基于旧快照的 —— 直接整表回写会把对侧已删的会话
+     写回去(复活)。先按"墓碑优先 + IDB 权威 + 本页未落库改动优先"合并一次,再写;
+     即便这次没合并(版本号没前进),convsPutAll 也会把墓碑里的 id 从写清单里剔掉。 */
+  var pre = (convRevState.peer > convRevState.sync) ? pullConvsFromIdb() : Promise.resolve(false);
+  return pre.then(function () { return convsPutAll(); }).then(function (ok) {
+    convFlush.busy = false;
+    if (!ok) convFlush.fails++;
+    if (convFlush.again) { convFlush.again = false; return flushConvs(); }
+    return ok;
+  }, function () { convFlush.busy = false; return false; });
+}
+/* 自动整理(每次打开时跑一次,不需要用户点任何按钮):
+   ① 把还内联在消息里的附件 payload 搬进附件库
+   ② 回收没有任何消息引用的附件记录(真正的垃圾) */
+var autoTidyStat = null;
+function referencedBlobKeys() {
+  var set = {};
+  state.conversations.forEach(function (c) {
+    (c.messages || []).forEach(function (m) {
+      if (!Array.isArray(m.content)) return;
+      m.content.forEach(function (p) {
+        if (p && p.attach && p.attach.blob) set[p.attach.blob] = 1;
+      });
+    });
+  });
+  return set;
+}
+function gcBlobs() {
+  var keep = referencedBlobKeys();
+  return blobDb().then(function (db) {
+    if (!db) return { removed: 0, freed: 0 };
+    return new Promise(function (resolve) {
+      var keys = [], freed = 0;
+      try {
+        var tx = db.transaction(IDB_STORE, "readonly");
+        var rq = tx.objectStore(IDB_STORE).openCursor();
+        rq.onsuccess = function () {
+          var cur = rq.result;
+          if (cur) {
+            if (!keep[cur.key]) { keys.push(cur.key); freed += (cur.value && cur.value.len) || 0; }
+            cur.continue();
+            return;
+          }
+          if (!keys.length) { resolve({ removed: 0, freed: 0 }); return; }
+          blobDel(keys).then(function () { resolve({ removed: keys.length, freed: freed }); });
+        };
+        rq.onerror = function () { resolve({ removed: 0, freed: 0 }); };
+      } catch (e) { resolve({ removed: 0, freed: 0 }); }
+    });
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   附件释放层(上下文压缩 / 清空 / 裁剪 的唯一出口)
+---------------------------------------------------------------------------
+   为什么必须单独有一层:附件二进制的键(`attach.blob`)会被**多条消息甚至多条会话共享**
+   (最典型:duplicateConv 的副本与原件深拷贝后共用同一批键)。所以释放绝不能
+   「按被删消息的键直接删」—— 必须先把消息从数组里真的移除(且保留集/被搬移的消息已回位),
+   再做一次**全库引用重算**,只删「此刻已无人引用」的键。
+
+   ★ 三条顺序契约(压缩事务;见 shared/specs/b24-context-plan.md §4.3):
+     ① 先移除 + 重插保留集,再释放:`referencedBlobKeys()` 扫的是**当前**内存里的会话树,
+        释放早一步就会把「即将被搬回数组的那条消息」的附件当成无引用删掉(静默丢附件);
+     ② `cxReleasePlan` 的 keep 重算必须在同步块结束、被保留消息回位之后取;
+     ③ 同步块内不得 await:splice / 重插 / 写 meta / 触发落盘全部同步完成,
+        唯一的 async(`blobDel`)后置到重插完成之后(双标签页的 pullConvsFromIdb / mergeConvs*
+        可能替换数组,中段 await 会让后续插入落进「不是我们操作的那份」数组)。
+--------------------------------------------------------------------------- */
+/* 收集一组消息里所有 `p.attach.blob` 键(只读,不改数据)。覆盖图片(f.id)与 pdf/office 页图(f.id-pN) */
+function cxBlobKeysOfMessages(list) {
+  var keys = [];
+  (list || []).forEach(function (m) {
+    if (!m || !Array.isArray(m.content)) return;
+    m.content.forEach(function (p) {
+      if (p && p.attach && p.attach.blob) keys.push(p.attach.blob);
+    });
+  });
+  return keys;
+}
+/* 当前仍被任何会话引用的键集合。单独命名是为了在释放路径上显式表达「共享 blob 保护」这一语义;
+   内部直接调用既有实现(referencedBlobKeys),不复制逻辑 */
+function cxSurvivingBlobKeys() { return referencedBlobKeys(); }
+/* 同步、只读的释放规划:去重 + 过滤空键 → 按当前引用集过滤 → 只返回 {todo, freed},不删任何东西。
+   freed = Σ blobMemo(k).len(未命中按 0 —— 不为此发起 IDB 读,保持同步) */
+function cxReleasePlan(keys) {
+  var seen = {}, keep = cxSurvivingBlobKeys(), todo = [], freed = 0;
+  (keys || []).forEach(function (k) {
+    if (!k || seen[k]) return;
+    seen[k] = 1;
+    if (keep[k]) return;
+    todo.push(k);
+    var rec = blobMemo(k);
+    if (rec && rec.len) freed += rec.len;
+  });
+  return { todo: todo, freed: freed };
+}
+/* 异步删除的**唯一出口**(blobDel 自带 delete blobStore.mem[id],返回「尝试删除的键数」) */
+function cxReleaseBlobs(todo) {
+  if (!todo || !todo.length) return Promise.resolve(0);
+  return blobDel(todo);
+}
+/* 丢弃区间 [from, to] 的消息:只做三件事 —— 收集键、估算 token、splice。
+   **不释放、不 await、不改其它字段**(释放时机由调用方按顺序契约决定,见上) */
+function cxDropMessages(conv, from, to) {
+  var c = conv;
+  if (!c || !Array.isArray(c.messages)) return { keys: [], tokens: 0 };
+  var n = c.messages.length;
+  from = Math.max(0, Math.floor(Number(from) || 0));
+  to = Math.min(n - 1, Math.floor(Number(to)));
+  if (!(to >= from)) return { keys: [], tokens: 0 };
+  var slice = c.messages.slice(from, to + 1);
+  var tokens = 0;
+  slice.forEach(function (m) { tokens += estimateContentTokens(m.content) + estimateTokens(m.reasoning || ""); });
+  var keys = cxBlobKeysOfMessages(slice);
+  c.messages.splice(from, to - from + 1);
+  return { keys: keys, tokens: tokens };
+}
+/* 同步读:只有已经缓存在内存里的才拿得到(发送/渲染前会先 hydrate) */
+function blobMemo(id) {
+  return (id && blobStore.mem[id]) ? blobStore.mem[id] : null;
+}
+/* 统计 IndexedDB 里我们自己的占用(打开数据面板时用一次) */
+function blobStats() {
+  return blobDb().then(function (db) {
+    if (!db) return { count: 0, chars: 0, ok: false };
+    return new Promise(function (resolve) {
+      var count = 0, chars = 0;
+      try {
+        var tx = db.transaction(IDB_STORE, "readonly");
+        var rq = tx.objectStore(IDB_STORE).openCursor();
+        rq.onsuccess = function () {
+          var cur = rq.result;
+          if (!cur) { resolve({ count: count, chars: chars, ok: true }); return; }
+          count++;
+          chars += (cur.value && cur.value.len) || 0;
+          cur.continue();
+        };
+        rq.onerror = function () { resolve({ count: count, chars: chars, ok: true }); };
+      } catch (e) { resolve({ count: 0, chars: 0, ok: false }); }
+    });
+  });
+}
+/* 把某条消息里所有「已外置」的附件读进内存缓存,返回 Promise(用于渲染/发送/导出前的准备) */
+function hydrateAttachments(list) {
+  var need = [], seen = {};
+  (list || []).forEach(function (m) {
+    if (!m || !Array.isArray(m.content)) return;
+    m.content.forEach(function (p) {
+      var a = p && p.attach;
+      if (!a || !a.id) return;
+      /* 键位只有一种在用的:a.blob —— attachMetaOf 在 payload 外置成功时写它
+         (图片 / 文本附件写 a.id,office / PDF 的每页图像写 -pN 键)。
+         图像部件必须走 a.blob:office / PDF 在气泡里只出卡片,渲染不会碰 IndexedDB,
+         不在这里读回来,发送时就会退化成「图片数据不在本机」的占位文案。
+         (历史上这里还兜底过「文本 payload 外置」的 stub / external 两个字段,
+         全库从来没有写入点,属于不可达死条件,已删除) */
+      var key = a.blob || "";
+      if (!key) return;
+      if (blobStore.mem[key] || seen[key]) return;
+      seen[key] = 1;
+      need.push(key);
+    });
+  });
+  if (!need.length) return Promise.resolve(0);
+  return Promise.all(need.map(function (id) { return blobGet(id); })).then(function (arr) {
+    var got = 0;
+    arr.forEach(function (v) { if (v && v.data) got++; });
+    return got;
+  });
+}
+/* 启动时预热:把当前会话的附件读进内存(失败也不影响其它功能) */
+function warmBlobs() {
+  var m = (typeof conv !== "undefined" && conv) ? conv.messages : [];
+  return hydrateAttachments(m).then(function (n) { return n; }, function () { return 0; });
+}
+
+/* localStorage 里保存的那一小份:设置 + 轻量状态(会话在 IndexedDB 里,
+   只有附件库完全不可用时才退回把会话也写在这里) */
+function stateRecord() {
+  /* 会话版本:写之前先接住落盘里别人的进度,再看"会话指纹变没变"决定要不要 bump
+     (见文件上方 convsRev 的说明 —— 这一步是"会话内容变更也能触发 storage 事件"的唯一来源)。
+     版本号 / 墓碑 / 整库替换时间戳都取自同一次记录解析(只读、只 parse 一次) */
+  var rec0 = readConvsRec();
+  var peer = rec0.rev;
+  if (peer > convRevState.rev) convRevState.rev = peer;
+  convRevState.peer = peer;
+  /* 对侧的撤回 / 删除墓碑要并进来:本页这次的记录写就是把它继续传下去的机会。
+     撤回先并:同一条 id 上"撤回比墓碑新"时墓碑作废(顺序无关,撤回会顺手清掉本地墓碑) */
+  mergeConvsRestored(rec0.restored);
+  mergeConvsGone(rec0.gone);
+  var sig = convsFingerprint(state.conversations);
+  if (convRevState.sig === null) {
+    /* 本页第一次写记录:只对齐指纹,不算"会话变了"。启动时这份列表是从 IDB 采纳来的,
+       对侧早就知道,再 bump 一次就是白让对侧重读一遍全库 */
+    convRevState.sig = sig;
+  } else if (sig !== convRevState.sig) {
+    convRevState.sig = sig;
+    convRevState.rev++;
+    convRevState.pending = true;
+  }
+  var rec = {
+    schema: SCHEMA,
+    convsRev: convRevState.rev,
+    settings: state.settings,
+    activeId: state.activeId,
+    promptLib: state.promptLib,
+    fetchedModels: state.fetchedModels,
+    /* 诊断字段:报的是「会话的权威副本真的在 IDB 里」,不是「本次会话当前能不能用 IDB」——
+       后者在存储升级被阻塞时会假阴性(数据其实还在 IDB 里) */
+    convsInIdb: convsLiveInIdb
+  };
+  pruneConvsGone();
+  var gone = [], nRestored = 0, id;
+  for (id in convGoneMap) {
+    if (Object.prototype.hasOwnProperty.call(convGoneMap, id)) gone.push(id);
+  }
+  for (id in convRestoredMap) {
+    if (Object.prototype.hasOwnProperty.call(convRestoredMap, id)) nRestored++;
+  }
+  /* 墓碑跟着记录走:对侧据此才知道"这条是被显式删掉的",而不是"还没写进去" */
+  if (gone.length) rec.convsGone = convGoneMap;
+  /* 撤回也一起走:对侧据此才知道"这条是用户明确要回来的",而不是"墓碑还没到" ——
+     少了这一步,对侧手里那份墓碑会在它收敛时把刚导入的会话从 IDB 里删掉(同类静默丢数据的对侧版本) */
+  if (nRestored) rec.convsRestored = convRestoredMap;
+  if (convRevState.wiped) rec.convsWiped = convRevState.wiped;
+  if (!convsInIdb()) rec.conversations = state.conversations;
+  return rec;
+}
+/* 启动成功后把落盘记录里的 convsInIdb 诊断字段对齐成真值。
+   只在「存储可用 ∧ 记录里写的还是假」时改写这一个字段:不调 flushConvs、不重写会话正文,
+   所以不会变成「每次启动多刷一次全库」(那才是把诊断偏差换成常态写放大)。 */
+function alignConvsMarker() {
+  if (storageBroken || !convsInIdb() || !convsLiveInIdb) return false;
+  try {
+    var raw = localStorage.getItem(LS_KEY);
+    if (!raw) return false;
+    var rec = JSON.parse(raw);
+    if (!rec || typeof rec !== "object" || rec.convsInIdb === true) return false;
+    rec.convsInIdb = true;
+    localStorage.setItem(LS_KEY, JSON.stringify(rec));
+    return true;
+  } catch (e) { return false; }
+}
+function saveState(quiet) {
+  if (storageBroken) return false;
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(stateRecord()));
+    storageRetried = false;
+    flushConvs();
+    return true;
+  } catch (e) {
+    var full = e && (e.name === "QuotaExceededError" || e.code === 22 || e.code === 1014);
+    /* 空间满了:先把内联附件搬进附件库再试一次(自动、无损) */
+    if (full && !storageRetried) {
+      storageRetried = true;
+      migrateAttachmentsToIdb().then(function (r) {
+        var again = saveState(true);
+        if (typeof updateStorageMeter === "function") updateStorageMeter();
+        if (again) return;
+        if (typeof openSpaceDialog === "function") openSpaceDialog("full");
+      });
+      return false;
+    }
+    if (!quiet) {
+      toast("本地存储写入失败:" + (full ? "空间已满,已弹出「清理空间」。" : ((e && e.message) || e)), "error", 5200);
+    }
+    if (full && typeof openSpaceDialog === "function") openSpaceDialog("full");
+    return false;
+  }
+}
+var storageRetried = false;
+var saveSoon = (function () {
+  var t = null;
+  return function () {
+    if (t) clearTimeout(t);
+    t = setTimeout(function () { t = null; saveState(true); updateStorageMeter(); }, 700);
+  };
+})();
+
+/* ---------------------------------------------------------------------------
+   3. DOM 与通用工具
+--------------------------------------------------------------------------- */
+function $(id) { return document.getElementById(id); }
+function $$(sel, root) {
+  return Array.prototype.slice.call((root || document).querySelectorAll(sel));
+}
+function icon(name, cls) {
+  var c = "icon" + (cls ? " " + cls : "");
+  return '<svg class="' + c + '"><use href="#i-' + name + '" xlink:href="#i-' + name + '"/></svg>';
+}
+function escapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function escAttr(s) { return escapeHtml(s); }
+function cssEscape(v) {
+  v = String(v);
+  if (CAP.cssEscape) return CSS.escape(v);
+  return v.replace(/[^a-zA-Z0-9_\u00a0-\uffff-]/g, function (c) { return "\\" + c; });
+}
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function clampNum(v, lo, hi, dflt) {
+  v = Number(v);
+  if (!isFinite(v)) return dflt;
+  return Math.round(clamp(v, lo, hi));
+}
+function fmtTime(ts) { return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }
+function fmtDateTime(ts) {
+  var d = new Date(ts);
+  return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate()) + " " + p2(d.getHours()) + ":" + p2(d.getMinutes());
+}
+function p2(n) { return (n < 10 ? "0" : "") + n; }
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(2) + " MB";
+}
+/* 当前所有会话里的消息总数(面板与清理弹窗都用) */
+function totalMsgs() {
+  var n = 0;
+  state.conversations.forEach(function (c) { n += (c.messages || []).length; });
+  return n;
+}
+function num(n) {
+  if (n == null || isNaN(n)) return "—";
+  return n >= 1000 ? String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",") : String(n);
+}
+/* token 数缩写(1K = 1024,保留一位小数):16.4K / 256.0K / 1.2M */
+function fmtCtxNum(v) {
+  v = Number(v) || 0;
+  if (v < 1024) return String(Math.round(v));
+  if (v < 1048576) return (v / 1024).toFixed(1) + "K";
+  return (v / 1048576).toFixed(2) + "M";
+}
+/* 参数滑块用的写法:0 表示「不发送」 */
+function fmtTok(v) {
+  v = Number(v) || 0;
+  return v <= 0 ? "自动" : fmtCtxNum(v);
+}
+function timeAgo(ts) {
+  var d = Date.now() - ts;
+  if (d < 60e3) return "刚刚";
+  if (d < 3600e3) return Math.floor(d / 60e3) + " 分钟前";
+  if (d < 86400e3) return Math.floor(d / 3600e3) + " 小时前";
+  if (d < 7 * 86400e3) return Math.floor(d / 86400e3) + " 天前";
+  return new Date(ts).toLocaleDateString("zh-CN");
+}
+/* 字符 → token 的四分类经验系数:用真实模型跑 12 组内容
+   (英文散文 ×3 / 中文散文 / 代码 ×3 / JSON / 列表 ×2 / 中英混合 / ASCII 图),
+   拿服务端返回的 completion_tokens 做最小二乘拟合。
+   分桶很关键:CJK 与拉丁、数字差了一个数量级,合并成「其它」会互相抵消 ——
+   实测平均绝对误差 四桶 7.9% / 三桶 17.7% / 朴素系数(1 与 1/3.6) 16.0%。
+   注意数字:Qwen 这类分词器几乎把每个数字当独立 token,系数接近 1。 */
+var TOK_PER_CJK = 0.804;    // 汉字与全角字符
+var TOK_PER_LATIN = 0.170;  // 拉丁字母(A-Z a-z):英文散文约 6 字/token
+var TOK_PER_DIGIT = 1.041;  // 数字:几乎一字一 token
+var TOK_PER_SYM = 0.319;    // 标点 / 空白 / 其它符号
+/* 把文本拆成四类字符计数;流式期间按字符累计再折算,
+   比每个小碎片各自取整加起来准得多 */
+function countScript(text) {
+  var cjk = 0, latin = 0, digit = 0, sym = 0;
+  for (var i = 0; i < text.length; i++) {
+    var c = text.charCodeAt(i);
+    if ((c >= 0x3000 && c <= 0x9fff) || c >= 0xff00) cjk++;
+    else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) latin++;
+    else if (c >= 48 && c <= 57) digit++;
+    else sym++;
+  }
+  return [cjk, latin, digit, sym];
+}
+/* 按模型取校准系数:上一次同样的模型生成完,用真实 token 数反推出来的倍数 */
+function tokCalibFor(model) {
+  var t = state.settings.tokCalib;
+  var k = (t && model) ? t[model] : null;
+  return (typeof k === "number" && k > 0.3 && k < 3) ? k : 1;
+}
+function estimateTokens(text, calib) {
+  if (!text) return 0;
+  var cs = countScript(String(text));
+  return Math.ceil((cs[0] * TOK_PER_CJK + cs[1] * TOK_PER_LATIN +
+                    cs[2] * TOK_PER_DIGIT + cs[3] * TOK_PER_SYM) * (calib || 1));
+}
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(function (c) {
+      if (!c) return "";
+      if (c.type === "text") return c.text || "";
+      if (c.type === "image_url" || c.type === "image") return "[图像]";
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+  return String(content == null ? "" : content);
+}
+/* 复制/朗读用:附件以「[附件:名字]」占位,不要把整个文件内容也当成正文复制出去 */
+function contentToDisplay(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content == null ? "" : content);
+  var out = [];
+  for (var i = 0; i < content.length; i++) {
+    var c = content[i];
+    if (!c) continue;
+    var a = c.attach;
+    if (c.type === "image_url" || c.type === "image") {
+      out.push("[图片" + (a && a.name ? ":" + a.name : "") + "]");
+    } else if (c.type === "text" && a && a.kind) {
+      out.push("[附件:" + (a.name || "") + "]" + (a.ocrOnly && a.ocrText ? "\n" + a.ocrText : ""));
+    } else if (c.type === "text") {
+      out.push(c.text || "");
+    }
+  }
+  return out.join("\n");
+}
+/* 上下文估算:一张图按 ~900 token 粗算(比 "[图像]" 三个字准得多) */
+function estimateContentTokens(content) {
+  if (!Array.isArray(content)) return estimateTokens(contentToText(content)) + 4;
+  var n = 4;
+  for (var i = 0; i < content.length; i++) {
+    var c = content[i];
+    if (!c) continue;
+    if (c.type === "image_url" || c.type === "image") n += 900;
+    else if (c.type === "text") n += estimateTokens(c.text || "");
+  }
+  return n;
+}
+/* 把「气泡里要显示的东西」翻译成协议里真正要发的东西:
+   - 剥掉展示元数据(attach),否则严格实现会因为未知字段报 400
+   - OCR-only 的图片部件换成 OCR 文本(模型看不到图,只能看文字)
+   - 按目标协议统一图片部件形状(历史消息可能是另一种协议写的) */
+function protocolContent(content, proto) {
+  if (!Array.isArray(content)) return content;
+  var out = [];
+  for (var i = 0; i < content.length; i++) {
+    var c = content[i];
+    if (!c) continue;
+    var a = c.attach || null;
+    if (a && a.ocrOnly) {
+      out.push({
+        type: "text",
+        text: "【图片 " + (a.name || "") + " 的文字(OCR 识别)】\n" + (String(a.ocrText || "").trim() || "(未识别出文字)")
+      });
+      continue;
+    }
+    if (c.type === "image_url" || c.type === "image") {
+      var mime = c.type === "image_url"
+        ? (String((c.image_url && c.image_url.url) || "").match(/^data:([^;,]+)/) || [])[1] || "image/png"
+        : (c.source && c.source.media_type) || "image/png";
+      var data = c.type === "image_url"
+        ? String((c.image_url && c.image_url.url) || "").replace(/^data:[^,]*,/, "")
+        : (c.source && c.source.data) || "";
+      /* payload 外置在 IndexedDB 里:从内存缓存取回来(发送前会 hydrate 一次) */
+      if (!data && a && a.blob) {
+        var rec = blobMemo(a.blob);
+        if (rec && rec.data) {
+          data = rec.data;
+          mime = rec.mime || mime;
+        }
+      }
+      if (!data) {
+        out.push({
+          type: "text",
+          text: "【附件 " + ((a && a.name) || "") + " 的图片数据不在本机(可能被清理过),仅保留这条记录】"
+        });
+        continue;
+      }
+      if (proto === "anthropic") out.push({ type: "image", source: { type: "base64", media_type: mime, data: data } });
+      else out.push({ type: "image_url", image_url: { url: "data:" + mime + ";base64," + data } });
+      continue;
+    }
+    if (c.type === "text") { out.push({ type: "text", text: c.text || "" }); continue; }
+    out.push(c);
+  }
+  return out;
+}
+function copyText(text, okMsg) {
+  function fallback() {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) toast(okMsg || "已复制", "success");
+      else toast("复制失败:当前浏览器不允许自动复制,请手动选择文本", "error");
+    } catch (e) { toast("复制失败:" + (e.message || e), "error"); }
+  }
+  if (CAP.clipboard) {
+    navigator.clipboard.writeText(text).then(function () { toast(okMsg || "已复制", "success"); }, fallback);
+  } else fallback();
+}
+function download(filename, content, mime) {
+  try {
+    var blob = new Blob([content], { type: mime || "text/plain;charset=utf-8" });
+    if (!CAP.objectUrl) {
+      var dataUrl = "data:" + (mime || "text/plain") + ";charset=utf-8," + encodeURIComponent(content);
+      var a0 = document.createElement("a");
+      a0.href = dataUrl; a0.download = filename; a0.click();
+      return true;
+    }
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    return true;
+  } catch (e) {
+    toast("导出失败:" + (e.message || e), "error");
+    return false;
+  }
+}
+function focusTrap(mask) {
+  mask.addEventListener("keydown", function (e) {
+    if (e.key !== "Tab") return;
+    var f = $$('a[href],button:not([disabled]),input:not([disabled]),select,textarea,[tabindex]:not([tabindex="-1"])', mask)
+      .filter(function (el) { return el.offsetParent !== null || el === document.activeElement; });
+    if (!f.length) return;
+    var first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   4. Toast
+--------------------------------------------------------------------------- */
+var toastBox = $("toasts");
+function toast(msg, type, ms) {
+  var el = document.createElement("div");
+  var ico = type === "success" ? "check" : type === "error" ? "warn" : type === "warn" ? "warn" : "info";
+  el.className = "toast " + (type || "info");
+  el.innerHTML = icon(ico, "sm") + "<span>" + escapeHtml(msg) + "</span>";
+  toastBox.appendChild(el);
+  while (toastBox.children.length > 5) toastBox.removeChild(toastBox.firstChild);
+  setTimeout(function () { el.className += " out"; }, ms || 2600);
+  setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, (ms || 2600) + 400);
+}
+
+/* ---------------------------------------------------------------------------
+   5. 主题 / 外观
+--------------------------------------------------------------------------- */
+function resolveTheme() {
+  var t = state.settings.theme;
+  if (t === "system" && CAP.matchMedia) {
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+  return t === "system" ? "dark" : t;
+}
+function applyAppearance() {
+  var s = state.settings;
+  var root = document.documentElement;
+  var theme = resolveTheme();
+  root.setAttribute("data-theme", theme);
+  root.setAttribute("data-accent", s.accent);
+  root.setAttribute("data-fx", s.fx ? "on" : "off");
+  root.setAttribute("data-density", s.compact ? "compact" : "normal");
+  root.style.setProperty("--fs", s.fontSize + "px");
+  var sysMode = s.theme === "system";
+  var dark = theme === "dark";
+  var themeIcon = sysMode ? "monitor" : (dark ? "moon" : "sun");
+  var themeText = sysMode ? "跟随系统" : (dark ? "深色" : "浅色");
+  $$("#theme-icon use, #btn-theme-top use").forEach(function (u) {
+    setUse(u, themeIcon);
+  });
+  $("theme-label").textContent = themeText;
+  var tBtn = $("btn-theme"), tBtnTop = $("btn-theme-top");
+  if (tBtn) tBtn.title = "主题:" + themeText + "(点击切换)";
+  if (tBtnTop) tBtnTop.title = "主题:" + themeText + "(点击切换)";
+  applyCodeWrap();
+  $$("#theme-switch button").forEach(function (b) {
+    b.classList.toggle("active", b.dataset.theme === s.theme);
+  });
+  $$("#accent-switch .swatch").forEach(function (b) {
+    b.classList.toggle("active", b.dataset.accent === s.accent);
+  });
+  applyFavicon();
+  /* 密度令牌影响左右栏宽度与对话区下限 ⇒ 切换紧凑模式后立即重判形态与让位 */
+  if (typeof wsRailRefit === "function") wsRailRefit();
+}
+/* 默认标签页图标句柄:appA 脚本求值时 <link rel="icon"> 已在 head 解析完毕,此处捕获其原始
+   href —— 不把 14KB 的 SVG 再内嵌一份,自定义图标只替换 href,默认值永远取自 head 原文 */
+var DEFAULT_FAVICON = (function () {
+  var l = document.querySelector('link[rel~="icon"]');
+  return l ? (l.getAttribute("href") || "") : "";
+})();
+/* 应用当前标签页图标:同步「移除全部 + 追加一个」(同一 JS 任务内完成,不出现"零 link"中间态);
+   挂在 applyAppearance() 末尾 → 启动 / 主题切换 / 保存 / 导入 / 清空五条路径自动覆盖 */
+function applyFavicon() {
+  var custom = state.settings.customIcon || "";
+  var href = custom || DEFAULT_FAVICON;
+  var links = document.querySelectorAll('link[rel~="icon"]');
+  if (!href) {
+    for (var i = 0; i < links.length; i++) links[i].parentNode.removeChild(links[i]);
+    return;
+  }
+  if (links.length === 1 && links[0].getAttribute("href") === href) return;   // 幂等:已是目标图标则不动
+  for (var j = 0; j < links.length; j++) links[j].parentNode.removeChild(links[j]);
+  var link = document.createElement("link");
+  link.setAttribute("rel", "icon");
+  /* type 要跟 href 的实际格式一致:自定义图标允许 PNG / JPEG(手改备份可能带 JPEG),不能恒报 png */
+  link.setAttribute("type", custom ? (/^data:image\/jpeg/i.test(custom) ? "image/jpeg" : "image/png") : "image/svg+xml");
+  link.setAttribute("href", href);
+  document.head.appendChild(link);
+}
+function setUse(useEl, name) {
+  var h = "#i-" + name, x = "#i-" + name;
+  useEl.setAttribute("href", h);
+  useEl.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", x);
+}
+function applyCodeWrap() {
+  var wrap = !!state.settings.codeWrap;
+  $$("#chat pre").forEach(function (pre) { pre.classList.toggle("wrapped", wrap); });
+}
+function cycleTheme() {
+  var order = ["dark", "light", "system"];
+  var i = order.indexOf(state.settings.theme);
+  state.settings.theme = order[(i + 1) % order.length];
+  applyAppearance(); saveSoon();
+  toast("主题:" + (state.settings.theme === "dark" ? "深色" : state.settings.theme === "light" ? "浅色" : "跟随系统"), "info", 1400);
+}
+if (CAP.matchMedia) {
+  var mq = window.matchMedia("(prefers-color-scheme: light)");
+  var onMq = function () { if (state.settings.theme === "system") applyAppearance(); };
+  if (mq.addEventListener) mq.addEventListener("change", onMq);
+  else if (mq.addListener) mq.addListener(onMq);
+}
+
+/* ---------------------------------------------------------------------------
+   6. 连接状态
+--------------------------------------------------------------------------- */
+function setConn(level, text) {
+  connState.level = level; connState.text = text;
+  var dot = $("conn-dot");
+  dot.className = "conn-dot" + (level === "ok" ? " ok" : level === "err" ? " err" : level === "busy" ? " busy" : "");
+  $("conn-text").textContent = text;
+  var sdot = $("st-conn-dot"), st = $("st-conn");
+  sdot.className = "conn-dot" + (level === "ok" ? " ok" : level === "err" ? " err" : level === "busy" ? " busy" : "");
+  $("st-conn-text").textContent = text;
+  st.className = "st clickable" + (level === "ok" ? " ok" : level === "err" ? " err" : level === "warn" ? " warn" : "");
+}
+
+/* ---------------------------------------------------------------------------
+   7. Markdown 渲染(marked + DOMPurify,均为内嵌库)
+--------------------------------------------------------------------------- */
+var hasMarked = typeof window.marked !== "undefined";
+var hasPurify = typeof window.DOMPurify !== "undefined";
+
+if (hasPurify) {
+  DOMPurify.addHook("afterSanitizeAttributes", function (node) {
+    if (node.tagName === "A") {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer nofollow");
+    }
+    if (node.tagName === "IMG") {
+      node.setAttribute("loading", "lazy");
+      node.setAttribute("referrerpolicy", "no-referrer");
+    }
+  });
+}
+
+/* brk=true 时单个换行也转成 <br>(用户消息用,更贴近输入时的换行意图)
+   公式先被抽出成占位符,Markdown 处理完再替换为 KaTeX 输出 */
+function renderMarkdown(text, brk) {
+  if (text == null || text === "") return "";
+  var src = String(text), spans = [];
+  if (hasKatex) {
+    try { src = protectMath(src, spans); } catch (e) { spans = []; src = String(text); }
+  }
+  if (!hasMarked) {
+    var plain = "<p>" + escapeHtml(src).replace(/\n/g, "<br>") + "</p>";
+    return substituteMath(plain, spans);
+  }
+  var raw;
+  try {
+    raw = marked.parse(src, { gfm: true, breaks: !!brk, mangle: false, headerIds: false });
+  } catch (e) {
+    raw = "<p>" + escapeHtml(src).replace(/\n/g, "<br>") + "</p>";
+  }
+  var html = hasPurify ? DOMPurify.sanitize(raw) : raw;
+  return substituteMath(html, spans);
+}
+
