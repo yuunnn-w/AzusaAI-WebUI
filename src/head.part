@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
 <meta name="color-scheme" content="dark light" />
 <meta name="description" content="单文件 AzusaAI WebUI —— 无外部依赖,本地离线可用,内置 MCP 工具服务" />
-<meta name="version" content="0.1.1" />
+<meta name="version" content="0.2.0" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%2032%2032'%3E%3Crect%20width%3D'32'%20height%3D'32'%20rx%3D'8'%20fill%3D'%230f1720'%2F%3E%3Csvg%20x%3D'2'%20y%3D'3'%20width%3D'28'%20height%3D'28'%20viewBox%3D'27%2044%20340%20311'%3E%3Cpath%20d%3D'M%2089.165%2046.515%20C%2085.084%2049.948%2C%2080.829%2058.273%2C%2077.311%2069.703%20C%2074.838%2077.740%2C%2074.593%2080.011%2C%2074.478%2096%20C%2074.381%20109.601%2C%2074.010%20114.168%2C%2072.813%20116.500%20C%2067.116%20127.599%2C%2062.995%20147.945%2C%2063.012%20164.881%20C%2063.032%20184.371%2C%2066.839%20194.111%2C%2079.174%20206.223%20L%2087.039%20213.946%2085.119%20219.723%20C%2079.976%20235.192%2C%2078.705%20262.118%2C%2082.321%20279%20C%2085.718%20294.865%2C%2093.083%20313.446%2C%2099.899%20323.353%20C%20103.383%20328.417%2C%20103.564%20329%2C%20101.655%20329%20C%2099.669%20329%2C%2096.773%20332.589%2C%2097.162%20334.568%20C%2097.720%20337.406%2C%20100.889%20338.807%2C%20102.341%20336.857%20C%20103.439%20335.382%2C%20104.464%20335.760%2C%20112.351%20340.548%20C%20126.430%20349.095%2C%20136.995%20351.691%2C%20167.500%20354.098%20C%20193.830%20356.176%2C%20240.702%20354.150%2C%20262.271%20350.001%20C%20289.209%20344.819%2C%20315.461%20332.503%2C%20305.980%20329.494%20C%20304.110%20328.900%2C%20304.260%20328.512%2C%20308%20324.262%20C%20321.522%20308.901%2C%20328.020%20283.111%2C%20323.638%20262.196%20L%20322.317%20255.893%20332.408%20245.681%20C%20369.994%20207.649%2C%20377.521%20146.503%2C%20349.116%20109.950%20C%20329.444%2084.635%2C%20297.140%2082.325%2C%20286.366%20105.462%20C%20280.159%20118.791%2C%20284.969%20132.574%2C%20299.885%20144.197%20C%20313.181%20154.558%2C%20317.767%20160.061%2C%20321.168%20169.738%20C%20326.222%20184.117%2C%20321.271%20207.255%2C%20310.467%20219.754%20L%20307.291%20223.428%20301.549%20217.227%20C%20293.906%20208.971%2C%20285.328%20202.640%2C%20275%20197.631%20C%20270.325%20195.364%2C%20266.330%20193.411%2C%20266.122%20193.293%20C%20265.914%20193.174%2C%20266.765%20190.922%2C%20268.012%20188.288%20C%20276.466%20170.447%2C%20276.443%20140.221%2C%20267.960%20120.411%20C%20266.393%20116.751%2C%20266.353%20115.769%2C%20267.577%20111.049%20C%20273.449%2088.412%2C%20267.611%2057.046%2C%20256.078%2049.274%20C%20248.081%2043.884%2C%20226.671%2050.045%2C%20207.968%2063.117%20L%20202.436%2066.984%20195.541%2065.012%20C%20179.220%2060.344%2C%20160.271%2060.148%2C%20143.736%2064.474%20L%20137.971%2065.982%20129.745%2059.477%20C%20111.952%2045.408%2C%2096.388%2040.437%2C%2089.165%2046.515%20M%2092.113%2055.583%20C%2087.209%2061.818%2C%2082.035%2082.135%2C%2082.013%2095.250%20C%2082.006%2099.513%2C%2082.183%20103%2C%2082.406%20103%20C%2082.630%20103%2C%2085.892%2099.799%2C%2089.656%2095.886%20C%2098.346%2086.852%2C%20105.228%2081.544%2C%20116.795%2074.955%20C%20121.858%2072.070%2C%20126%2069.598%2C%20126%2069.461%20C%20126%2068.446%2C%20110.405%2057.617%2C%20106%2055.572%20C%2098.784%2052.223%2C%2094.754%2052.226%2C%2092.113%2055.583%20M%20234%2061.313%20C%20227.964%2063.800%2C%20216%2071.548%2C%20216%2072.970%20C%20216%2073.462%2C%20216.891%2074.148%2C%20217.980%2074.494%20C%20221.550%2075.627%2C%20235.364%2086.042%2C%20242.172%2092.734%20L%20248.844%2099.292%20250.081%2094.896%20C%20250.761%2092.478%2C%20251.318%2086%2C%20251.318%2080.500%20C%20251.318%2060.346%2C%20247.260%2055.851%2C%20234%2061.313%20M%2092.105%2066.373%20C%2090.195%2068.675%2C%2091.831%2070.577%2C%2097.292%2072.400%20C%20100.156%2073.356%2C%20102.950%2074.325%2C%20103.500%2074.553%20C%20105.331%2075.312%2C%20107.235%2073.315%2C%20106.596%2071.303%20C%20105.218%2066.961%2C%2094.612%2063.353%2C%2092.105%2066.373%20M%20144.500%2071.470%20C%20106.314%2080.369%2C%2081.188%20105.254%2C%2072.466%20142.812%20C%2070.427%20151.592%2C%2070.329%20151.339%2C%2076.964%20154.402%20C%2083.964%20157.634%2C%2088%20160.600%2C%2088%20162.514%20C%2088%20165.273%2C%2085.876%20165.028%2C%2079.662%20161.554%20C%2071.294%20156.874%2C%2070%20156.922%2C%2070%20161.912%20C%2070%20165.737%2C%2070.095%20165.840%2C%2074.250%20166.532%20C%2081.160%20167.683%2C%2086%20169.980%2C%2086%20172.109%20C%2086%20174.222%2C%2083.954%20174.524%2C%2079.399%20173.083%20C%2077.805%20172.578%2C%2075.201%20171.879%2C%2073.614%20171.529%20L%2070.728%20170.894%2071.247%20175.496%20C%2071.906%20181.343%2C%2071.865%20181.314%2C%2077.455%20179.907%20C%2081.383%20178.918%2C%2082.394%20178.965%2C%2083.627%20180.198%20C%2085.493%20182.065%2C%2084.233%20183.154%2C%2078.215%20184.876%20L%2073.930%20186.101%2076.612%20191.028%20C%2078.984%20195.387%2C%2087.338%20204.213%2C%2095.274%20210.743%20C%2098.510%20213.406%2C%2098.655%20214.428%2C%2096.058%20216.247%20C%2089.105%20221.117%2C%2086.413%20258.723%2C%2091.460%20280.484%20C%2097.249%20305.445%2C%20112.195%20332.068%2C%20123.405%20337.388%20C%20128.525%20339.818%2C%20136.964%20339.499%2C%20141.088%20336.720%20C%20145.812%20333.536%2C%20146.968%20330.641%2C%20146.985%20321.953%20C%20147%20314.428%2C%20146.988%20314.395%2C%20142.918%20310.453%20C%20138.126%20305.813%2C%20135.775%20301.751%2C%20136.614%20299.563%20C%20137.648%20296.868%2C%20140.125%20297.829%2C%20145.674%20303.076%20C%20151.683%20308.759%2C%20153.014%20308.891%2C%20154.294%20303.932%20C%20155.820%20298.024%2C%20158.102%20296.453%2C%20160.002%20300.003%20C%20160.811%20301.516%2C%20160.559%20304.145%2C%20158.968%20310.753%20C%20153.188%20334.763%2C%20156.754%20343.349%2C%20172.552%20343.458%20C%20188.405%20343.568%2C%20206.984%20327.467%2C%20217.655%20304.372%20C%20221.086%20296.944%2C%20224.176%20294.689%2C%20225.652%20298.536%20C%20227.390%20303.065%2C%20215.824%20324.925%2C%20206.806%20334.156%20L%20202.258%20338.812%20206.678%20339.474%20C%20213.535%20340.503%2C%20216.997%20339.396%2C%20217.016%20336.171%20C%20217.073%20327.044%2C%20232.385%20314.939%2C%20236.936%20320.423%20C%20237.899%20321.584%2C%20237.196%20322.448%2C%20233.107%20325.125%20C%20226.303%20329.579%2C%20223.991%20333.812%2C%20226.376%20337.450%20C%20229.040%20341.517%2C%20232.400%20342.385%2C%20245%20342.262%20C%20278.231%20341.937%2C%20303.289%20325.874%2C%20312.676%20298.880%20C%20314.030%20294.988%2C%20314.936%20291.603%2C%20314.690%20291.357%20C%20314.444%20291.111%2C%20312.139%20291.440%2C%20309.567%20292.087%20C%20291.922%20296.530%2C%20271.748%20284.920%2C%20262.139%20264.791%20C%20252.815%20245.260%2C%20252.559%20221.418%2C%20261.515%20206.545%20C%20266.469%20198.318%2C%20263.797%20197.957%2C%20255.676%20205.756%20C%20247.810%20213.309%2C%20238.141%20218.414%2C%20233.079%20217.686%20C%20231.111%20217.403%2C%20228.600%20217.521%2C%20227.500%20217.948%20C%20226.400%20218.374%2C%20224.938%20218.512%2C%20224.250%20218.255%20C%20221.220%20217.119%2C%20223.666%20214.874%2C%20232.750%20210.458%20C%20254.403%20199.930%2C%20265.208%20182.747%2C%20265.421%20158.500%20L%20265.500%20149.500%20255%20148.820%20C%20209.294%20145.862%2C%20164.657%20107.416%2C%20168.422%2074.250%20L%20169.017%2069%20161.759%2069.070%20C%20157.766%2069.108%2C%20150%2070.188%2C%20144.500%2071.470%20M%20236.975%2071.238%20C%20229.716%2076.130%2C%20232.440%2078.704%2C%20241.826%2075.823%20C%20247.280%2074.148%2C%20248.083%2073.595%2C%20247.812%2071.695%20C%20247.348%2068.430%2C%20241.507%2068.184%2C%20236.975%2071.238%20M%2090.176%2078.059%20C%2088.729%2078.639%2C%2087.977%2079.653%2C%2088.184%2080.745%20C%2088.842%2084.216%2C%2099%2083.114%2C%2099%2079.572%20C%2099%2077.096%2C%2094.502%2076.324%2C%2090.176%2078.059%20M%20241%2082.036%20C%20239.720%2082.893%2C%20239.846%2083.331%2C%20241.861%2085.020%20C%20244.732%2087.428%2C%20247.840%2087.581%2C%20248.694%2085.355%20C%20249.885%2082.251%2C%20244.285%2079.835%2C%20241%2082.036%20M%2098%20133.386%20C%2098%20134.698%2C%2097.327%20137.060%2C%2096.505%20138.636%20C%2089.560%20151.946%2C%20101.413%20168.370%2C%20113.639%20162.379%20C%20119.884%20159.319%2C%20122.245%20154.810%2C%20121.806%20146.782%20C%20121.205%20135.793%2C%20114.480%20129.638%2C%20105.355%20131.726%20C%20102.908%20132.286%2C%20100.715%20132.348%2C%20100.418%20131.867%20C%2099.371%20130.174%2C%2098%20131.036%2C%2098%20133.386%20M%20345.323%20136.396%20C%20339.944%20141.848%2C%20331.528%20146.913%2C%20324.307%20149.045%20L%20320.114%20150.283%20322.504%20153.417%20C%20323.819%20155.141%2C%20326.288%20159.527%2C%20327.990%20163.164%20L%20331.084%20169.778%20334.994%20167.889%20C%20339.763%20165.585%2C%20348.628%20165.400%2C%20353.654%20167.500%20C%20355.629%20168.325%2C%20357.482%20169%2C%20357.772%20169%20C%20358.544%20169%2C%20357.202%20151.889%2C%20355.990%20146.294%20C%20354.466%20139.254%2C%20351.818%20130.989%2C%20351.113%20131.074%20C%20350.776%20131.115%2C%20348.170%20133.510%2C%20345.323%20136.396%20M%20108.390%20137.427%20C%20107.072%20140.862%2C%20108.430%20143.493%2C%20111.684%20143.808%20C%20115.578%20144.186%2C%20117.748%20141.265%2C%20116%20138%20C%20114.733%20135.632%2C%20109.237%20135.218%2C%20108.390%20137.427%20M%20187.741%20139.453%20C%20172.208%20144.897%2C%20174.009%20168.515%2C%20190.185%20171.515%20C%20200.653%20173.456%2C%20209.813%20163.258%2C%20207.139%20152.640%20C%20206.555%20150.319%2C%20206.337%20147.426%2C%20206.655%20146.210%20C%20207.113%20144.459%2C%20206.806%20144%2C%20205.176%20144%20C%20204.044%20144%2C%20202.838%20143.547%2C%20202.496%20142.993%20C%20200.446%20139.676%2C%20192.526%20137.776%2C%20187.741%20139.453%20M%20191.204%20143.570%20C%20187.286%20146.314%2C%20188.887%20152%2C%20193.578%20152%20C%20198.183%20152%2C%20199.480%20146.037%2C%20195.454%20143.378%20C%20193.713%20142.228%2C%20193.078%20142.257%2C%20191.204%20143.570%20M%2038.500%20145.878%20C%2036.386%20146.330%2C%2035.500%20147.108%2C%2035.500%20148.510%20C%2035.500%20150.295%2C%2036.378%20150.561%2C%2044%20151.088%20C%2048.977%20151.433%2C%2053.859%20152.382%2C%2055.779%20153.379%20C%2059.389%20155.253%2C%2061%20154.844%2C%2061%20152.055%20C%2061%20149.817%2C%2056.079%20147.343%2C%2048.937%20145.988%20C%2043.309%20144.921%2C%2042.993%20144.917%2C%2038.500%20145.878%20M%20138.336%20160.567%20C%20138.005%20161.430%2C%20138.325%20163.239%2C%20139.047%20164.588%20C%20140.195%20166.732%2C%20140.104%20167.385%2C%20138.330%20169.770%20C%20134.701%20174.649%2C%20129%20173.568%2C%20129%20168%20C%20129%20164.016%2C%20126.244%20161.946%2C%20124.363%20164.518%20C%20119.065%20171.764%2C%20132.142%20181.791%2C%20139.849%20176.393%20C%20141.997%20174.889%2C%20142.289%20174.923%2C%20144.412%20176.917%20C%20149.341%20181.548%2C%20156.401%20181.693%2C%20161.169%20177.262%20C%20165.578%20173.164%2C%20166.088%20166%2C%20161.971%20166%20C%20160.608%20166%2C%20159.776%20167.119%2C%20159.003%20169.990%20C%20157.830%20174.346%2C%20155.179%20175.764%2C%20150.434%20174.573%20C%20145.684%20173.381%2C%20143.793%20165.106%2C%20148.250%20165.015%20C%20149.443%20164.991%2C%20149.119%20161.519%2C%20147.800%20160.200%20C%20145.999%20158.399%2C%20139.065%20158.668%2C%20138.336%20160.567%20M%20228.500%20164.588%20C%20216.250%20167.382%2C%20210.273%20170.673%2C%20212.821%20173.221%20C%20213.720%20174.120%2C%20215.596%20173.880%2C%20220.819%20172.198%20C%20225.026%20170.843%2C%20230.180%20170%2C%20234.262%20170%20C%20241.131%20170%2C%20243.266%20168.837%2C%20240.844%20166.416%20C%20239.367%20164.938%2C%20231.847%20163.824%2C%20228.500%20164.588%20M%2038%20166.935%20C%2032.331%20168.666%2C%2027%20172.071%2C%2027%20173.961%20C%2027%20177.123%2C%2028.647%20177.214%2C%2034.213%20174.360%20C%2038.841%20171.987%2C%2040.591%20171.661%2C%2048.250%20171.745%20C%2056.086%20171.832%2C%2057%20171.652%2C%2057%20170.019%20C%2057%20166.648%2C%2045.210%20164.734%2C%2038%20166.935%20M%2095.072%20171.250%20C%2094.596%20172.492%2C%2094.591%20173.907%2C%2095.062%20174.408%20C%2096.247%20175.668%2C%2099%20173.200%2C%2099%20170.878%20C%2099%20168.254%2C%2096.117%20168.527%2C%2095.072%20171.250%20M%20101.591%20172.552%20C%2099.736%20174.407%2C%2099.939%20176.500%2C%20101.974%20176.500%20C%20103.996%20176.500%2C%20105.688%20173.288%2C%20104.363%20171.963%20C%20103.574%20171.174%2C%20102.806%20171.337%2C%20101.591%20172.552%20M%20191.992%20179.015%20C%20191.149%20180.590%2C%20191.240%20181.155%2C%20192.409%20181.603%20C%20194.469%20182.394%2C%20196%20181.259%2C%20196%20178.941%20C%20196%20176.397%2C%20193.367%20176.445%2C%20191.992%20179.015%20M%20199.035%20178.934%20C%20197.607%20181.604%2C%20197.718%20182%2C%20199.893%20182%20C%20201.860%20182%2C%20203.423%20179.494%2C%20202.444%20177.910%20C%20201.536%20176.440%2C%20200.146%20176.858%2C%20199.035%20178.934%20M%20213.328%20180.030%20C%20210.940%20182.503%2C%20213.021%20184%2C%20218.857%20184.006%20C%20226.438%20184.013%2C%20230.705%20185.329%2C%20236.497%20189.447%20C%20239.168%20191.346%2C%20241.723%20192.671%2C%20242.176%20192.391%20C%20245.042%20190.620%2C%20240.773%20184.902%2C%20234%20181.438%20C%20229.636%20179.206%2C%20215.081%20178.215%2C%20213.328%20180.030%20M%2046.500%20182.369%20C%2038.977%20184.780%2C%2030%20191.508%2C%2030%20194.734%20C%2030%20197.277%2C%2032.987%20197.188%2C%2036.119%20194.554%20C%2040.517%20190.852%2C%2046.625%20187.849%2C%2052.500%20186.498%20C%2056.370%20185.609%2C%2057.500%20184.914%2C%2057.500%20183.424%20C%2057.500%20180.994%2C%2052.336%20180.498%2C%2046.500%20182.369%20M%20212%20191.792%20C%20212%20193.009%2C%20213.922%20194.466%2C%20217.991%20196.334%20C%20221.428%20197.911%2C%20225.157%20200.557%2C%20226.741%20202.542%20C%20231.071%20207.969%2C%20235.842%20206.357%2C%20232.142%20200.716%20C%20227.416%20193.512%2C%20212%20186.681%2C%20212%20191.792%20M%20327.515%20206.750%20C%20326.549%20209.363%2C%20325.102%20212.552%2C%20324.299%20213.837%20C%20323.497%20215.122%2C%20322.989%20216.260%2C%20323.170%20216.366%20C%20323.352%20216.473%2C%20325.191%20217.328%2C%20327.257%20218.267%20C%20330.455%20219.720%2C%20334.017%20223.783%2C%20335.351%20227.500%20C%20335.869%20228.942%2C%20339.424%20224.413%2C%20343.042%20217.703%20C%20346.871%20210.601%2C%20345.930%20208.272%2C%20337.674%20204.428%20C%20330.408%20201.045%2C%20329.552%20201.241%2C%20327.515%20206.750'%20fill%3D'%2322d3ee'%20fill-rule%3D'evenodd'%2F%3E%3C%2Fsvg%3E%3C%2Fsvg%3E" />
 <title>AzusaAI WebUI · 单文件对话终端</title>
 <script>
@@ -629,6 +629,9 @@ html[data-density="compact"] .msg-content { font-size: 14px; }
   font-size: 11px; color: var(--text-faint); padding: 3px 7px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--surface);
   transition: color .14s, border-color .14s; line-height: 1.2;
+  /* 命中区下限 24px(WCAG 2.2 目标尺寸):11×1.2 + 3×2 + 1×2 = 21.2 ⇒ 补到 24;
+     写 min-height 而非加 padding ⇒ 不依赖字体度量,左右内边距与横向宽度一字不变(只有高 21.2 → 24) */
+  min-height: 24px;
 }
 .msg-content pre .code-head button .icon, .tool-card pre .code-head button .icon { width: 12px; height: 12px; flex: none; }
 .msg-content pre .code-head button:hover, .tool-card pre .code-head button:hover { color: var(--text); border-color: var(--accent); }
@@ -938,7 +941,10 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
   border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; margin: 0 1px; color: var(--text-dim);
   line-height: 1.6;
 }
-.pal-esc { flex: none; cursor: pointer; transition: color .14s, border-color .14s; }
+.pal-esc { flex: none; cursor: pointer; transition: color .14s, border-color .14s;
+  /* 命中区下限 24px:与 kbd 共用规则只有 10×1.6 + 1×2 + (1+2) = 21 高 ⇒ 只给按钮补 min-height;
+     正文里的按键提示(kbd)是行内件不是控件,一行不动 */
+  min-height: 24px; display: inline-flex; align-items: center; justify-content: center; }
 .pal-esc:hover { color: var(--text); border-color: rgba(var(--accent-rgb),.6); }
 .pal-esc:active { transform: translateY(1px); border-bottom-width: 1px; }
 .tool-btn {
@@ -1049,6 +1055,17 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
 .pop-sep { height: 1px; background: var(--border-2); margin: 2px 0 12px; }
 .pop-sub-title { font-size: 11px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; color: var(--text-faint); margin-bottom: 4px; }
 #params-pop .switch-row { padding: 6px 0; border-bottom: none; }
+/* 浮层的底部动作行(「调节」的完成 / 恢复默认 · 「上下文用量」的读取模型信息 / 关闭):
+   内容高于浮层上限(cap)时**吸底** ⇒ 任意内容高度下两键都完整可见可点(浮层自身内滚,
+   内容不再把动作行切在按钮中段)。
+   由来:F5 —— 「调节」动作行原为最后一行内容,内容 752px > cap 720px 时只露 13px、中心点不可命中;
+        F11 —— 「上下文用量」同源未修(measured 态溢出 46px ⇒ 1600×900 裁 32.56px、四视口末行整行
+        落在可视盒之外、逐点扫描绘制像素 = 0),同一手法只修了一半。
+   做法 = 浮层下内边距交给动作行自带(同值 13px)⇒ **未溢出时逐像素不变**(动作行是最后一个子元素时,
+   盒底已贴住含块下沿 ⇒ sticky 无位移空间;只有溢出被内滚裁时才贴住浮层下沿)。
+   注意:浮层 `padding-bottom:0` 与动作行的 13px **必须成对**(单加一边会在未溢出态多/少 13px)。 */
+#params-pop, #ctx-pop { padding-bottom: 0; }
+#params-pop .pop-actions, #ctx-pop .pop-actions { position: sticky; bottom: 0; z-index: 1; padding-bottom: 13px; background: var(--surface); }
 #params-pop .switch-row .sw-txt label { font-size: 13px; }
 
 /* ---- 输入区上下文用量环 ---- */
@@ -1115,7 +1132,9 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
 #status-bar .st.warn b { color: var(--warning); }
 #status-bar .st.err b { color: var(--danger); }
 #status-bar .spacer { flex: 1; }
-#status-bar .st.clickable, #status-bar .st[data-click] { cursor: pointer; border-radius: 5px; padding: 2px 6px; margin: 0 -6px; }
+#status-bar .st.clickable, #status-bar .st[data-click] { cursor: pointer; border-radius: 5px; padding: 2px 6px; margin: 0 -6px;
+  /* 命中区下限 24px:芯片内容 17.81 + 2×2 = 21.81 ⇒ 补到 24(状态行 --status-h:28 装得下,不换行不溢出) */
+  min-height: 24px; }
 #status-bar .st.clickable:hover, #status-bar .st[data-click]:hover { background: var(--surface-2); color: var(--text); }
 
 /* 滚动按钮 */
@@ -1210,6 +1229,32 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
 .compact-card .cc-body { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(var(--accent-rgb),.32); }
 .compact-card.expanded .cc-body { display: block; }
 .compact-card .cc-body .msg-content { font-size: 13px; line-height: 1.75; color: var(--text-dim); }
+
+/* 压缩工具气泡(U-4):`.cx-card` = 三态共同壳类(完成 .cx-sum / 运行中 .cx-run / 失败 .cx-fail)。
+   覆盖一律写在 `.cx-card .tool-card .<子选择器>` 作用域内 —— .cx-card 在消息壳上,.tool-card 是
+   renderToolCard 在壳内清空重建的卡片根,二者是祖代—后代关系(不改 .tool-card 自身规则)。 */
+.msg.cx-card { display: block; }
+.cx-card .tool-card .tc-head { flex-wrap: wrap; min-height: 24px; }
+.cx-card .tool-card .cx-chips { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin-top: 3px; }
+.cx-card .tool-card .cx-chips .cc-chip {
+  font-family: var(--font-mono); font-size: 11.5px; padding: 1px 7px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border-2); color: var(--text-dim); white-space: nowrap;
+}
+.cx-card .tool-card .tc-ops .btn { min-height: 24px; }
+.cx-card .tool-card .cx-sum-body { font-size: 13.5px; line-height: 1.75; }
+.cx-card .tool-card .cx-live { margin-top: 10px; padding-top: 9px; border-top: 1px dashed rgba(var(--accent-rgb),.32); }
+.cx-card .tool-card .cx-live .cx-stage { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+.cx-card .tool-card .cx-live .cx-stage::before { content: "· "; color: var(--accent); }
+.cx-card .tool-card .cx-live .cx-elapsed { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); margin-top: 4px; }
+.cx-card .tool-card .cx-live .cx-stream {
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.62; color: var(--text-dim);
+  white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; padding-top: 6px;
+  border-top: 1px dashed var(--border-2); max-height: min(40vh, 420px); overflow-y: auto;
+}
+.cx-run .tool-card .tc-arrow, .cx-fail .tool-card .tc-arrow { display: none; }
+.cx-run .tool-card .tc-head, .cx-fail .tool-card .tc-head { cursor: default; }
+@media (max-width: 880px) { .cx-card .tool-card .tc-sum { display: none; } }
+[data-density="compact"] .cx-card .tool-card .cx-live .cx-stream { max-height: 22vh; }
 
 /* 标签页 */
 .tabs { flex: none; display: flex; gap: 3px; padding: 0 18px; border-bottom: 1px solid var(--border-2);
@@ -1495,6 +1540,11 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
 .fav-cur { font-size: 12px; color: var(--text-faint); margin-bottom: 7px; }
 .fav-btns { display: flex; gap: 8px; flex-wrap: wrap; }
 
+/* 桌面快捷方式(.url + 自定义 .ico):命名一律 dsk-*,与既有数据面板的 ds-* 家族(含 #ds-hint)严格隔离 */
+.dsk-state { font-size: 12px; color: var(--text-faint); margin-bottom: 7px; white-space: pre-line; }
+.dsk-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.dsk-warn { color: var(--danger); }
+
 /* 下拉菜单 */
 .pop-menu {
   position: fixed; z-index: 300; min-width: 178px; padding: 5px;
@@ -1514,6 +1564,12 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
 .pop-menu .pm-sep { height: 1px; background: var(--border-2); margin: 5px 4px; list-style: none; }
 .pop-menu button .icon { width: 14px; height: 14px; }
 .pop-menu .pm-hint { font-size: 10.5px; color: var(--text-faint); margin-left: auto; font-family: var(--font-mono); }
+/* 工作区右键菜单:禁用项用原生 disabled(理由放 title,disabled 也能 hover 显示);
+   选择器比全局 button{cursor:pointer} 更具体,不需要 !important */
+.pop-menu button:disabled { opacity: .45; cursor: default; }
+.pop-menu button:disabled:hover { background: transparent; color: var(--text-dim); }
+.pop-menu .pm-foot { margin-top: 5px; padding: 6px 11px 2px; border-top: 1px solid var(--border-2);
+  font-size: 10.5px; color: var(--text-faint); }
 
 /* 重命名输入 */
 .rename-input {
@@ -1550,6 +1606,7 @@ html[data-density="compact"] .sq-row { padding: 4px 7px; }
 #cmd-input { flex: 1; border: none; background: none; outline: none; font-size: 15px; }
 #cmd-input::placeholder { color: var(--text-faint); }
 #cmd-list { overflow-y: auto; padding: 7px; }
+#palette .cmd-foot { flex: none; padding: 8px 17px 10px; border-top: 1px solid var(--border-2); font-size: 11px; color: var(--text-faint); }
 .cmd-item {
   display: flex; align-items: center; gap: 11px; width: 100%;
   padding: 9px 12px; border-radius: var(--r-sm); text-align: left; color: var(--text-dim);
@@ -2163,6 +2220,10 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
 .wsr-crumb button { padding: 1px 5px; border-radius: 6px; color: var(--text-dim); font-size: 11.5px; }
 .wsr-crumb button:hover { background: var(--surface-2); color: var(--accent); }
 .wsr-crumb .wsr-sep { opacity: .55; }
+/* 根目录项 = 「文件夹图标 + /」同一个按钮:命中区放大到 24px 高(其余面包屑按钮同高对齐) */
+.wsr-crumb button { padding: 3px 8px; min-height: 24px; display: inline-flex; align-items: center; gap: 4px; }
+.wsr-crumb .wsr-home { color: var(--text-dim); }
+.wsr-crumb .wsr-home .icon { width: 14px; height: 14px; color: var(--accent); }
 
 #wsr-files { flex: 1; min-height: 70px; max-height: none; overflow-y: auto; gap: 2px; }
 .wsr-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--r-xs);
@@ -2176,10 +2237,18 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
 .wsr-row .wsr-size { flex: none; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); }
 .wsr-row .wsr-ops { flex: none; display: flex; gap: 2px; opacity: 0; transition: opacity .12s; }
 .wsr-row:hover .wsr-ops, .wsr-row:focus-within .wsr-ops { opacity: 1; }
-.wsr-row .wsr-ops button { width: 22px; height: 22px; border-radius: 6px; display: flex;
+/* 行内 ops(下载/删除)与展开箭头:命中区下限 24px(WCAG 2.2 目标尺寸)。
+   三者只放大按钮盒 ⇒ 图标本身尺寸不动(.icon 15px / .wsr-caret .icon 13px),视觉体量不变;
+   行高 36 → 38(+2px,由行内容 max = 24 决定、`align-items:center` 上下各 +1,实测 4+6 行全同值) */
+.wsr-row .wsr-ops button { width: 24px; height: 24px; border-radius: 6px; display: flex;
   align-items: center; justify-content: center; color: var(--text-faint); }
 .wsr-row .wsr-ops button:hover { background: var(--surface-3); color: var(--text); }
 .wsr-row .wsr-ops button.danger:hover { color: var(--danger); background: rgba(var(--danger-rgb),.13); }
+/* 工作区内部剪贴板:被「剪切」的行先打上这个标记(粘贴成功后由重渲染自然消失) */
+.wsr-row.wsr-cut { opacity: .5; font-style: italic; }
+/* 选中行(门 8=B 多选:单击/多选的可见反馈;左缘竖条 + 底色,与 hover 区分开) */
+.wsr-row.wsr-sel { background: var(--surface-2); border-color: var(--border-2);
+  box-shadow: inset 2px 0 0 var(--accent); }
 .wsr-empty { padding: 20px 10px; text-align: center; color: var(--text-faint); font-size: 12px; line-height: 1.75; }
 .wsr-empty .btn { margin-top: 12px; }
 .wsr-prog, .wsr-report { flex: none; font-size: 11px; color: var(--text-dim); line-height: 1.7; }
@@ -2236,7 +2305,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
 /* ---- 目录树的「上级目录」行与展开箭头 / 树行 ---- */
 .wsr-row.up .icon { transform: rotate(90deg); }        /* i-left 顺时针 90° = 向上 */
 .wsr-row.up .wsr-name { color: var(--text-dim); }
-.wsr-caret { flex: none; width: 20px; height: 20px; border-radius: 6px; display: flex;
+.wsr-caret { flex: none; width: 24px; height: 24px; border-radius: 6px; display: flex;
   align-items: center; justify-content: center; color: var(--text-faint); }
 .wsr-caret:hover { background: var(--surface-3); color: var(--text); }
 .wsr-caret .icon { width: 13px; height: 13px; transition: transform .16s var(--ease); }
@@ -2310,6 +2379,8 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
 <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2.2"/><line x1="6" y1="9.5" x2="6.6" y2="9.5"/><line x1="9.8" y1="9.5" x2="10.4" y2="9.5"/><line x1="13.6" y1="9.5" x2="14.2" y2="9.5"/><line x1="17.4" y1="9.5" x2="18" y2="9.5"/><line x1="7.5" y1="14.5" x2="16.5" y2="14.5"/></symbol>
 <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.4A1.9 1.9 0 0 1 5.4 4.5h3.4l1.9 2.2h7.9a1.9 1.9 0 0 1 1.9 1.9v8.9a1.9 1.9 0 0 1-1.9 1.9H5.4a1.9 1.9 0 0 1-1.9-1.9z"/></symbol>
 <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3.5h7.5L19 9v11.5H6z"/><polyline points="13.2 3.5 13.2 9.2 19 9.2"/></symbol>
+<symbol id="i-file-plus" viewBox="0 0 24 24"><path d="M6 3.5h7.5L19 9v11.5H6z"/><polyline points="13.2 3.5 13.2 9.2 19 9.2"/><line x1="12.5" y1="13" x2="12.5" y2="18.4"/><line x1="9.8" y1="15.7" x2="15.2" y2="15.7"/></symbol>
+<symbol id="i-folder-plus" viewBox="0 0 24 24"><path d="M3.5 6.4A1.9 1.9 0 0 1 5.4 4.5h3.4l1.9 2.2h7.9a1.9 1.9 0 0 1 1.9 1.9v8.9a1.9 1.9 0 0 1-1.9 1.9H5.4a1.9 1.9 0 0 1-1.9-1.9z"/><line x1="11.5" y1="10.9" x2="11.5" y2="16.1"/><line x1="8.9" y1="13.5" x2="14.1" y2="13.5"/></symbol>
 <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.4"/><circle cx="8.6" cy="10" r="1.7"/><polyline points="4 17 9.5 12 13.5 15.5 16.5 13 20 16"/></symbol>
 <symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5.5a3 3 0 0 0-5.6-1.4A3 3 0 0 0 4 9.4a3 3 0 0 0 1.6 4.4A3 3 0 0 0 9 18.6a3 3 0 0 0 3-1.7z"/><path d="M12 5.5a3 3 0 0 1 5.6-1.4A3 3 0 0 1 20 9.4a3 3 0 0 1-1.6 4.4A3 3 0 0 1 15 18.6a3 3 0 0 1-3-1.7z"/></symbol>
 <symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 3 14.7 9.2 21.4 9.8 16.3 14.3 17.8 20.9 12 17.3 6.2 20.9 7.7 14.3 2.6 9.8 9.3 9.2"/></symbol>
@@ -2317,6 +2388,10 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
 <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13.8a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1 1"/><path d="M14 10.2a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1-1"/></symbol>
 <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/></symbol>
 <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.9 4.7 19 5 19 5c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></symbol>
+<!-- Jupyter 官方标记(两条月牙 = 轨道 + 三个小圆 = 卫星)。几何逐字取自 JupyterLab
+     ui-components 的 jupyter 图标(viewBox 0 0 152 165,BSD-3-Clause),只把配色换成 currentColor;
+     三个小圆按官方圆心放大到小尺寸下可见(官方半径在 15~18px 下 <0.5px,呈亚像素 ⇒ 认不出) -->
+<symbol id="i-jupyter" viewBox="-2 -2 156 169"><g fill="currentColor" stroke="none"><path d="M76.021 140.163c-32.64 0-61.145-11.927-75.942-29.58 5.51 15.84 15.781 29.567 29.39 39.278a80.17 80.17 0 0 0 46.57 14.929 80.17 80.17 0 0 0 46.57-14.929c13.61-9.711 23.88-23.437 29.391-39.278-14.833 17.653-43.338 29.58-75.979 29.58m-.005-114.832c32.64 0 61.146 11.927 75.943 29.58a80.9 80.9 0 0 0-29.391-39.278A80.16 80.16 0 0 0 75.998.705a80.16 80.16 0 0 0-46.57 14.928A80.9 80.9 0 0 0 .038 54.912c14.832-17.617 43.338-29.58 75.978-29.58"/><circle cx="34.2" cy="6.4" r="7"/><circle cx="8.6" cy="46.4" r="8.4"/><circle cx="7.6" cy="9.6" r="5.6"/></g></symbol>
 </defs></svg>
 
 <!-- ============ 旧浏览器提示 ============ -->
@@ -2405,14 +2480,14 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
       <button class="icon-btn" id="btn-find" title="在对话中查找 (Ctrl+F)" aria-label="查找">
         <svg class="icon"><use href="#i-search" xlink:href="#i-search"/></svg>
       </button>
-      <button class="icon-btn" id="btn-ws-rail" title="工作区面板" aria-label="工作区面板" hidden>
-        <svg class="icon"><use href="#i-layers" xlink:href="#i-layers"/></svg>
-      </button>
       <button class="icon-btn" id="btn-palette" title="命令面板 (Ctrl+K)" aria-label="命令面板">
         <svg class="icon"><use href="#i-grid" xlink:href="#i-grid"/></svg>
       </button>
       <button class="icon-btn" id="btn-theme-top" title="切换主题" aria-label="切换主题">
         <svg class="icon"><use href="#i-moon" xlink:href="#i-moon"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-ws-rail" title="工作区面板" aria-label="工作区面板" hidden>
+        <svg class="icon"><use href="#i-layers" xlink:href="#i-layers"/></svg>
       </button>
     </header>
 
@@ -2448,7 +2523,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
             <button class="tool-btn" id="btn-attach" title="添加附件:文本 / 图片 / PDF / 办公文档(doc/docx/ppt/pptx/xls/xlsx),单个 ≤ 50MB,一条消息最多 10 个" aria-label="添加附件">
               <svg class="icon"><use href="#i-clip" xlink:href="#i-clip"/></svg>
             </button>
-            <button class="tool-btn" id="btn-ws-mount" data-menu-opener title="工作区(沙箱虚拟盘):挂载后模型可用 Read / Write / Edit / Glob / Grep / FileOps" aria-label="工作区挂载" aria-haspopup="menu" hidden>
+            <button class="tool-btn" id="btn-ws-mount" data-menu-opener title="工作区(沙箱虚拟盘):挂载后模型可用 Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office" aria-label="工作区挂载" aria-haspopup="menu" hidden>
               <svg class="icon"><use href="#i-layers" xlink:href="#i-layers"/></svg>
             </button>
             <button class="tool-btn" id="btn-voice" title="语音输入(需浏览器支持)" aria-label="语音输入">
@@ -2562,7 +2637,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
         <div style="display:flex;gap:8px;margin-bottom:12px">
           <button class="btn sm grow" id="p-manage-tools" style="flex:1">管理工具与服务器…</button>
         </div>
-        <div style="display:flex;gap:8px">
+        <div class="pop-actions" style="display:flex;gap:8px">
           <button class="btn sm grow" id="p-reset" style="flex:1">恢复默认</button>
           <button class="btn sm primary" id="p-close" style="flex:1">完成</button>
         </div>
@@ -2575,7 +2650,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
         <div class="pop-title"><svg class="icon sm"><use href="#i-layers" xlink:href="#i-layers"/></svg> 上下文用量
           <span class="pop-sub" id="ctx-pop-src"></span></div>
         <div id="ctx-pop-body"></div>
-        <div style="display:flex;gap:8px;margin-top:12px">
+        <div class="pop-actions" style="display:flex;gap:8px;margin-top:12px">
           <button class="btn sm" id="ctx-refresh" style="flex:1">读取模型信息</button>
           <button class="btn sm primary" id="ctx-close" style="flex:1">关闭</button>
         </div>
@@ -2602,6 +2677,9 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
       <svg class="icon sm"><use href="#i-layers" xlink:href="#i-layers"/></svg>
       <b>工作区</b>
       <span class="wsr-sub" id="wsr-sub">—</span>
+      <button class="icon-btn" id="btn-wsr-jupyter" title="通过 JupyterLab 打开(工作区为根)" aria-label="通过 JupyterLab 打开" hidden>
+        <svg class="icon"><use href="#i-jupyter" xlink:href="#i-jupyter"/></svg>
+      </button>
       <button class="icon-btn" id="btn-wsr-close" title="收起工作区面板" aria-label="收起工作区面板">
         <svg class="icon sm"><use href="#i-right" xlink:href="#i-right"/></svg>
       </button>
@@ -2843,6 +2921,16 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
           </div>
           <div class="hint">图标以内嵌数据保存在本机(标签页与收藏夹即取即用),断网与 file:// 打开都会显示,不依赖外部文件。建议方形图片,会自动居中裁剪并缩放到 ≤256px;原图只在本页处理,不会离开本机。</div>
           <input type="file" id="fav-file" accept="image/*" style="display:none" />
+        </div>
+        <div class="field">
+          <label>桌面快捷方式</label>
+          <div class="dsk-state" id="dsk-state">—</div>
+          <div class="dsk-btns">
+            <button type="button" class="btn sm" id="btn-dsk-ico">下载图标(.ico)</button>
+            <button type="button" class="btn sm" id="btn-dsk-url">下载快捷方式(.url)</button>
+            <button type="button" class="btn sm ghost" id="btn-dsk-write" hidden>写入文件夹…</button>
+          </div>
+          <div class="hint gap-top multi" id="dsk-hint">生成 Windows 原生 `.url` 快捷方式与自定义 `.ico` 图标(状态与步骤见上方,仅 `file://` 打开时可用)。`.html` 文件本身的图标由系统按文件类型决定,网页无法改写它。</div>
         </div>
         <div class="field">
           <div class="switch-row">
@@ -3229,10 +3317,11 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
   <div id="palette">
     <div class="pal-input-row">
       <svg class="icon"><use href="#i-search" xlink:href="#i-search"/></svg>
-      <input type="text" id="cmd-input" placeholder="输入命令或搜索对话…" spellcheck="false" autocomplete="off" />
+      <input type="text" id="cmd-input" placeholder="搜索命令、模型与对话…" spellcheck="false" autocomplete="off" />
       <button type="button" class="pal-esc" id="cmd-close" title="关闭命令面板 (Esc)" aria-label="关闭命令面板">Esc</button>
     </div>
     <div id="cmd-list"></div>
+    <div class="cmd-foot" id="cmd-hint">输入关键词可搜索命令、模型与对话(含消息正文) · ↑↓ 选择 · Enter 执行 · Esc 关闭</div>
   </div>
 </div>
 

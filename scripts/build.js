@@ -155,7 +155,45 @@ const tessPart = readIf('tesseract.part');
 /* 内嵌办公文件解析分段(mammoth / SheetJS / docstream / fflate + OfficeKit 包装层)
    由 make-office-part.js 生成,自带 </script> 转义与自检;缺失时同款语义:跳过 + 警告 */
 const officePart = readIf('office.part');
-const app = read('appA.part') + read('appB.part') + read('appC.part') + read('appD.part') + read('appE.part');
+/* 内嵌 JupyterLite 分段(lab 站点 + pyodide 依赖闭包 + Jupyter 专用锁 + 合并后的 piplite 索引)
+   由 make-jupyterlite-part.js 生成。读取口径与 pyodide 载荷**逐字同款**:按字节读 + **含 CR 即 exit 1**
+   (载荷段头按字符数记长,CRLF→LF 归一会让段长错位)⇒ **禁止**走做归一的 readIf。
+   缺 src/jupyterlite.part ⇒ 打印警告 + 注入 JL_AVAILABLE=false 的极小占位段,**不 exit 1**
+   (与 pdfjs/tesseract 同款降级语义;占位段的 `jl-status.json` 段 = 运行期判定"载荷缺失"的唯一入口,
+   由 Phase 2 的 jlAppWaitReady 读取)。该载荷**无档位维度**:三档共用同一份(勘-七-5.8)。 */
+const JL_PART_FILE = 'jupyterlite.part';
+const JL_PLACEHOLDER_SECTION = 'jl-status.json';
+let jlPart = '', jlDegraded = false;
+{
+  const jlPath = path.join(SRC, JL_PART_FILE);
+  if (fs.existsSync(jlPath)) {
+    const jlRawBuf = fs.readFileSync(jlPath);
+    const crAt = jlRawBuf.indexOf(13);
+    if (crAt >= 0) {
+      console.error('构建失败:' + JL_PART_FILE + ' 含 CR(0x0D,首个偏移 ' + crAt + ')。'
+        + '载荷按字符数记长,CRLF→LF 归一会让段长错位 → 请跑 node scripts/make-jupyterlite-part.js '
+        + '重新生成(该脚本保证 LF 输出)。');
+      process.exit(1);
+    }
+    jlPart = jlRawBuf.toString('utf8');
+  } else {
+    jlDegraded = true;
+    const st = 'JL_AVAILABLE=false\n';
+    jlPart = '<!-- ===== JupyterLite 载荷缺失(降级占位段;正式载荷由 node scripts/make-jupyterlite-part.js 生成)===== -->\n'
+      + '<script type="text/plain" id="jupyterlite-assets">\n'
+      + ';;;JLITE-PART 1 1\n'
+      + ';;;JLITE-META ' + JSON.stringify({ assetsInlined: 0, pyodideCopies: 0, jlAvailable: false, missing: true, jlVersion: null }) + '\n'
+      + ';;;JLITE-SECTION ' + JL_PLACEHOLDER_SECTION + ' text ' + st.length + '\n' + st + '\n'
+      + ';;;JLITE-END\n</script>\n';
+    console.log('! 缺少 ' + JL_PART_FILE + '(JupyterLab 标签页功能会自动降级为不可用)');
+    console.log('   ↳ 跑 node scripts/make-jupyterlite-part.js 生成正式载荷;占位段 ' + JL_PLACEHOLDER_SECTION + ' = JL_AVAILABLE=false');
+  }
+}
+/* appJ.part = JupyterLite 宿主的**主页面侧**(需求 6 · Phase 2)。它插在 appD 与 appE 之间:
+   appA–appE(含 appJ)同属**一个 IIFE**,靠函数声明提升共享作用域 ⇒ appJ 不得提前闭合 IIFE,
+   appE 必须仍是最后一段(勘-七-5.7)。新增函数名须先全库搜重名(同名后声明者会静默覆盖)。 */
+const app = read('appA.part') + read('appB.part') + read('appC.part') + read('appD.part')
+  + read('appJ.part') + read('appE.part');
 
 /* ---- 暂存写出:先写临时文件,全部成功后才 rename 成正式名 ---- */
 /* 暂存路径与正式文件同目录(rename 才是同卷原子替换)+ 进程号(并发构建互不覆盖) */
@@ -204,7 +242,7 @@ function stageProfile(profile) {
     : ('<!-- AzusaAI WebUI · ' + profile.label + ' edition (profile=' + profile.id + ', '
       + (wheelCount === null ? '?' : wheelCount) + ' 个预置包) · 由 node scripts/build.js --profile='
       + profile.id + ' 生成 · 完整版 = AzusaAI-WebUI-full.html -->\n');
-  const out = (profileBanner + head + libs + katexJs + pdfjsPart + tessPart + officePart + pyPart + app).replace(/\r\n/g, '\n');
+  const out = (profileBanner + head + libs + katexJs + pdfjsPart + tessPart + officePart + pyPart + jlPart + app).replace(/\r\n/g, '\n');
   fs.mkdirSync(path.dirname(OUT), { recursive: true });
   stagedTmps.push(TMP);          /* 先登记后写:写到一半失败也能被 cleanup 掉 */
   fs.writeFileSync(TMP, out);
@@ -218,7 +256,8 @@ function stageProfile(profile) {
     + (pyBytes ? ('预置包 ' + (wheelCount === null ? '?' : wheelCount) + ' 个') : '载荷缺失(Python 工具族不可用)')
     + ']');
   logs.push('  pdfjs ' + pdfjsPart.length + ' B / tesseract ' + tessPart.length + ' B / office '
-    + Buffer.byteLength(officePart) + ' B');
+    + Buffer.byteLength(officePart) + ' B / jupyterlite ' + Buffer.byteLength(jlPart) + ' B'
+    + (jlDegraded ? '(降级占位段:载荷缺失)' : ''));
 
   /* 附加核对:打印 pyodide 分段体积并与档位期望值核对(±5%)
      期望总量 = 档位 expect.partBytes(实测写回) + 本产物实测的非 pyodide 部分(不再写死 203,600,000) */

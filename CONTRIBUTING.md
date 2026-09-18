@@ -36,11 +36,13 @@ node scripts/syntax.js    # 把产物里每段内联脚本交给 V8 解析（跳
 node scripts/lint.js      # 启发式检查「调用了但未声明」的标识符
 ```
 
+换 KaTeX 字体时才需要跑 `node scripts/embed-fonts.js`：它把 `src/fonts/` 里的 woff2 转成 base64 内联、重新生成 `src/katex-embedded.css`（构建期由 `head.part` 的占位符引用）。
+
 产物 html 是构建结果，**不要直接改**——会被下一次构建覆盖；改 `src/` 下的 `.part` 才作数。
 
 ## 重新生成内嵌库载荷（vendor/ 取件）
 
-`vendor/` 是各上游发行版的本地副本（不进版本库，最新取件后约 205 MB）。装到位后运行对应的生成脚本，产物即 `src/*.part`（全部幂等：输入不变则输出字节级一致）：
+`vendor/` 是各上游发行版的本地副本（不进版本库，最新取件后约 233 MB；2026-09-18 现取，以取件时刻为准）。装到位后运行对应的生成脚本，产物即 `src/*.part`（全部幂等：输入不变则输出字节级一致）：
 
 | 载荷 | 生成命令 | 上游来源（放 `vendor/` 下） | 细节 |
 | --- | --- | --- | --- |
@@ -48,6 +50,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | `src/pdfjs.part` | `node scripts/make-pdfjs-part.js` | pdfjs-dist 6.3.289 legacy（npm 发行 tgz 解出） → `vendor/pdfjs-src/` | `docs/PDFJS-NOTES.md` |
 | `src/tesseract.part` | `node scripts/make-tesseract-part.js` | tesseract.js 7.0.0 + tesseract.js-core + tessdata_fast 训练数据 → `vendor/tess-src/` | `docs/TESS-NOTES.md` |
 | `src/office.part` | `node scripts/make-office-part.js` | mammoth / SheetJS CE / docstream / fflate 四个浏览器单包 → `vendor/office-src/` | `docs/OFFICE-NOTES.md` |
+| `src/jupyterlite.part` | `node scripts/make-jupyterlite-part.js` | JupyterLite 0.8.3 lab 站点（`site/**` 469 件）+ jupyterlite-pyodide-kernel 0.8.6 闭包（含 jedi 0.19.2 / parso 0.8.6）+ `MANIFEST.json` → `vendor/jupyterlite-src/` | `docs/JUPYTERLITE-NOTES.md` |
 
 pyodide 载荷的取件目录最讲究，`vendor/pyodide-src/` 应包含（缺了脚本会直接报错退出）：
 
@@ -59,7 +62,7 @@ wheels/*.whl           官方闭包 + 自造条目的全部 wheel
 MANIFEST.json          可选：取件清单，存在时逐条核对 sha256
 ```
 
-其余三份载荷的取件就是「按上表来源下载 → 放入对应目录」；每份 NOTES 里都记录了当时取到的文件名、字节数、SHA-256 断言位置与生成脚本的自检规则。**换任何库版本前先读对应 NOTES**——`file://` 下的 worker 加载约束、转义规则、ESM 改写都在里面。
+其余四份载荷的取件就是「按上表来源下载 → 放入对应目录」；每份 NOTES 里都记录了当时取到的文件名、字节数、SHA-256 断言位置与生成脚本的自检规则。**换任何库版本前先读对应 NOTES**——`file://` 下的 worker 加载约束、转义规则、ESM 改写都在里面。JupyterLite 的取件目录 `vendor/jupyterlite-src/` 另要求 `MANIFEST.json` 逐条对上（生成期强断言，上游多出件仅告警登记）；站点内 5 处程序化改写的**唯一权威表** = `scripts/jupyterlite-patches.json`（`make-jupyterlite-part.js` 机械读取，禁止内联副本）。
 
 ## 代码风格（刻意保守）
 

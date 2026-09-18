@@ -101,6 +101,12 @@
     if (typeof buf.byteLength === "number") { return buf.byteLength; }
     return buf.length || 0;
   }
+  /* S12(P2-a):按次调整单文档正文上限。缺省 / 非法(非正数)= 0 ⇒ 一路透传 0,
+     胶水退回它自己的 TEXT_MAX(131072)⇒ 不传时与批前逐字节一致。 */
+  function textMaxOf(opts) {
+    var n = parseInt(opts && opts.textMax, 10);
+    return (isFinite(n) && n > 0) ? n : 0;
+  }
   /* ArrayBuffer → base64(分包,避免超长参数的栈/字符串峰值) */
   function abToBase64(buf) {
     var u8 = (buf && typeof Uint8Array !== "undefined" && buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
@@ -200,7 +206,9 @@
         data: b64,
         bytes: im.bytes || 0,
         label: im.label || ("图 " + (i + 1)),
-        page: im.page || (i + 1)
+        /* 页号原样透传;**0 要保住**(不是"缺省"):pptx 认不出归属的图由胶水显式写 0,
+           应用层据此保留整篇序号 + 如实注记(P2-a / S11b)。缺字段时才退回整篇序号。 */
+        page: (typeof im.page === "number" && im.page >= 0) ? im.page : (i + 1)
       });
     }
     return {
@@ -255,7 +263,7 @@
         return;
       }
       try {
-        ctx.worker.postMessage({ type: "parse", id: id, ext: ext, buf: copy }, [copy]);
+        ctx.worker.postMessage({ type: "parse", id: id, ext: ext, buf: copy, textMax: opts.textMax }, [copy]);
       } catch (e) {
         delete ctx.pending[id];
         clearTimeout(timer);
@@ -300,7 +308,7 @@
           resolve(failResult("corrupt", "解析失败:没有拿到文件内容", t0));
           return;
         }
-        core.parse(copy, ext, { onProgress: opts.onProgress }).then(function (r) {
+        core.parse(copy, ext, { onProgress: opts.onProgress, textMax: opts.textMax }).then(function (r) {
           if (settled) { return; }
           settled = true; clearTimeout(timer);
           resolve(normalizeResult(r, t0));
@@ -321,7 +329,9 @@
     return run;
   }
 
-  /* ---------------- 对外:parse / cancelCurrent / terminate ---------------- */
+  /* ---------------- 对外:parse / cancelCurrent / terminate ----------------
+     parse(buf, ext, opts):opts.timeout / opts.onProgress / opts.textMax(P2-a:单文档正文上限,
+       0 / 缺省 = 不指定 ⇒ 胶水用 TEXT_MAX 131072;正数则抬高,只在**本次解析**生效)。 */
   function parse(buf, ext, opts) {
     opts = opts || {};
     var t0 = now();
@@ -340,7 +350,10 @@
         + "上限 " + Math.round(cap / 1048576) + "MB", t0));
     }
     var timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : DEFAULT_TIMEOUT;
-    var hooks = { onProgress: typeof opts.onProgress === "function" ? opts.onProgress : null };
+    var hooks = {
+      onProgress: typeof opts.onProgress === "function" ? opts.onProgress : null,
+      textMax: textMaxOf(opts)          /* S12:0 = 不指定(胶水用 TEXT_MAX) */
+    };
     return enqueue(function () {
       if (api.mode === "main-thread") { return runMainThread(buf, e, hooks, timeout, t0); }
       return runWorker(buf, e, hooks, timeout, t0);

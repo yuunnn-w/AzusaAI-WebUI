@@ -75,7 +75,7 @@ function setConvExtTools(v) {
   return true;
 }
 /* 可见性:总开关 → 外部工具另门(source)→ 工作区门(needsWorkspace)→ 权限三态 → 能力门。
-   needsWorkspace 的工具(6 个文件工具)要求「当前会话已挂载工作区」且「工作区存储三区齐备」;
+   needsWorkspace 的工具(9 个文件工具)要求「当前会话已挂载工作区」且「工作区存储三区齐备」;
    两个判定都是同步的(wsMountedId 只读 conv.wsId,wsReady 只读一个布尔),不给启动链引入 async 前置 */
 function activeTools(c) {
   var list = [];
@@ -123,11 +123,12 @@ function mcpStatusInfo(c) {
 }
 
 /* ---- 工具定义(与 MCP tools/list 同构) ---- */
-/* 工作区路径口径的唯一权威句子(广播枢纽:6 个文件工具 + Python/JS 两个执行工具共用)。
+/* 工作区路径口径的唯一权威句子(广播枢纽:9 个文件工具里 8 个直接内嵌它 +
+   Python/JS 两个执行工具;第 9 个 DownloadForUser 用引用式一句,不复制原文 —— 门 5-A)。
    成本:随【工作区】块每轮进 system(≈90–110 汉字 ⇒ ≈100–130 token/请求,跨所有已挂载工作区的会话)。
    ★ 只在函数体内 / 数组字面量里引用(分段顺序 appA→…→appE,本常量在 appE 顶部求值) */
 var WS_PATH_DUAL_NOTE =
-  "路径口径:工作区工具(Read/Write/Edit/Glob/Grep/FileOps)用 / 开头的根路径(如 /a.png);Python 解释器里同一份数据挂载在 /workspace(如 /workspace/a.png)。";
+  "路径口径:工作区工具(Read/ReadOffice/Write/Edit/Glob/Grep/FileOps/Office)用 / 开头的根路径(如 /a.png);Python 解释器里同一份数据挂载在 /workspace(如 /workspace/a.png)。";
 /* 任务类工具 modelDesc 的公共尾段(「modelDesc 必含」的六个要点);写一次、四处引用
    (广播枢纽:改一处即四处同步)。必须在 AGENT_TOOLS 之前求值 —— 数组字面量里有 concat。 */
 var PV_TASK_COMMON = [
@@ -149,7 +150,7 @@ var AGENT_TOOLS = [
     modelDesc: [
       "在当前浏览器的一个隔离沙箱(Web Worker 线程)里运行一段 JavaScript,并把结果返回给你。",
       "",
-      "- 这是浏览器内的沙箱,不是宿主文件系统:它读不到用户电脑上的文件,也读不到工作区文件(沙箱里**没有** `/workspace` —— 那是 Python 解释器的挂载点);要读写文件请用工作区工具(Read / Write / Edit / Glob / Grep / FileOps)。",
+      "- 这是浏览器内的沙箱,不是宿主文件系统:它读不到用户电脑上的文件,也读不到工作区文件(沙箱里**没有** `/workspace` —— 那是 Python 解释器的挂载点);要读写文件请用工作区工具(Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office)。",
       "- 用法:把要算的东西写进去,用 `return` 返回结果。例如:`const a = 12 * 34 + 5; return a;`。",
       "- 可用:ES 内置对象(Math、JSON、Date、RegExp、Array、Object、Map、Set、TypedArray、TextEncoder/TextDecoder 等)、Promise 与 async/await;`console.log` 的输出会一起返回。",
       "- 不可用:`document` / `window` / DOM / `localStorage`(沙箱里没有页面环境),以及 `fetch` / `XMLHttpRequest` / `WebSocket` / `importScripts`(默认禁用网络,调用会抛错)。",
@@ -176,7 +177,7 @@ var AGENT_TOOLS = [
       return runJsInSandbox(code, { timeoutMs: toolLimit("timeoutMs") });
     }
   },
-  /* ---- 以下 6 个是「工作区(沙箱虚拟盘)」文件工具 ----
+  /* ---- 以下 8 个是「工作区(沙箱虚拟盘)」文件工具 ----
      只作用于本会话挂载的虚拟盘,不碰用户磁盘;路径一律经 wsNormPath 规范化。
      入参 / 默认权限按既定设计;描述首句统一写明边界(防止模型把它们当宿主文件系统)。 */
   {
@@ -184,25 +185,26 @@ var AGENT_TOOLS = [
     title: "读取工作区文件",
     scope: "read",
     icon: "file",
-    desc: "只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。按行读取文本文件(可分行分页、可续读超长行);也支持图片与办公文档 / PDF(模型支持图像时直读,不支持时自动 OCR);其它二进制一律拒绝并报出类型。",
+    desc: "只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。按行读取文本文件(可分行分页、可续读超长行);也支持图片(模型支持图像时直读,不支持时自动 OCR);办公文档与 PDF 请用 ReadOffice;其它二进制一律拒绝并报出类型。",
     modelDesc: [
       "只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。",
       WS_PATH_DUAL_NOTE,
       "",
       "- 读取工作区里的一个文本文件,按行返回;每行前缀是该文件里的行号(格式「行号[制表符]内容」)。",
-      "- 能读什么:纯文本 / 图片(png·jpg·gif·webp·bmp·avif·ico)/ 办公文档(doc·docx·ppt·pptx·xls·xlsx)/ PDF。svg 按文本读(它的 XML 源码可读);tif/tiff 本机浏览器解不开,会提示你先转换。",
-      "- 图片与文档按本机能力处理:模型支持图像输入时直接把图交给你;不支持时自动改用本机 OCR 只回文本 —— **你不需要做任何额外操作**。读一张图至少占约 1000 token(实测口径),请按需读取,不要反复读同一张。",
+      "- 能读什么:纯文本 / 图片(png·jpg·gif·webp·bmp·avif·ico)。svg 按文本读(它的 XML 源码可读);tif/tiff 本机浏览器解不开,会提示你先转换。办公文档与 PDF 请用 ReadOffice。",
+      "- 图片按本机能力处理:模型支持图像输入时直接把图交给你;不支持时自动改用本机 OCR 只回文本 —— **你不需要做任何额外操作**。读一张图至少占约 1000 token(实测口径),请按需读取,不要反复读同一张。",
       "- 关键参数:`path` 必填(以 `/` 开头的绝对路径);`line_offset` 从第几行开始(1 起,负数 = 从文件末尾倒数);`n_lines` 省略 = 读到文件末尾;`max_chars` 默认 16000、上限 65536;`column_offset` 只在正向读使用(与负数 `line_offset` 同时给出会直接报错)。",
-      "- 返回末尾有一行状态:`[total 总行数 · shown 显示范围 · eof 是否到末尾 · size 字节数 · mtime 修改时间]`(办公文档 / PDF 的状态行前面还有 file / 页数 / 图数 / 是否截断;OCR 的状态行以 OCR 开头并给出置信度,可能有个别识别误差);被截断时另有 `truncated`、`next_line_offset` 与(超长行场景)`next_column_offset`。",
+      "- 返回末尾有一行状态:`[total 总行数 · shown 显示范围 · eof 是否到末尾 · size 字节数 · mtime 修改时间]`(OCR 的状态行以 OCR 开头并给出置信度,可能有个别识别误差);被截断时另有 `truncated`、`next_line_offset` 与(超长行场景)`next_column_offset`。",
       "- 只读文本文件:按 UTF-8 / UTF-16 LE·BE / GB18030 自动识别并转码显示,非 UTF-8 时状态行会注明实际编码。文件里只要含 NUL 字节都按二进制处理(采样窗之外的 NUL 也会被拒)。",
-      "- 其它二进制(压缩包 / 可执行文件 / 音视频 / 字体 / 数据库等)一律拒绝:返回错误并说明它是什么类型,**不返回任何内容**,请不要重试。需要字节用 ExecutePython 以 \"rb\" 读取(例如 `open(\"/workspace/x.png\",\"rb\").read()`,容器内路径以 /workspace/ 开头);要取走文件用右栏「下载」或 FileOps;要里面的内容可以先用 ExecutePython 解包/转码、把结果写进工作区,再 Read 那些新文件。",
-      "- 要改文件用 Edit(`old_string` 必须取自本工具输出去掉行号后的原文;纯 CRLF 文件请用 LF 书写;混合行尾时本工具把 \\r 显示成两个字符,`old_string` 里请写对应的真实回车);要看目录结构用 Glob;要按内容找位置用 Grep。"
+      "- 其它二进制(压缩包 / 可执行文件 / 音视频 / 字体 / 数据库等)一律拒绝:返回错误并说明它是什么类型,**不返回任何内容**,请不要重试。需要字节用 ExecutePython 以 \"rb\" 读取(例如 `open(\"/workspace/x.png\",\"rb\").read()`,容器内路径以 /workspace/ 开头);要取走文件用右栏「下载」、FileOps 或 DownloadForUser;要里面的内容可以先用 ExecutePython 解包/转码、把结果写进工作区,再 Read 那些新文件。",
+      "- 要改文件用 Edit(`old_string` 必须取自本工具输出去掉行号后的原文;纯 CRLF 文件请用 LF 书写;混合行尾时本工具把 \\r 显示成两个字符,`old_string` 里请写对应的真实回车);要看目录结构用 Glob;要按内容找位置用 Grep。",
+      "- 索引/定位受限时(如超出预算被截断)照抄状态行末尾的 `next {…}` 继续读;办公文档与 PDF 请改用 ReadOffice。"
     ].join("\n"),
     defaultPerm: "allow",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "工作区里的绝对路径,以 / 开头,例如 /notes/a.md;支持文本 / 图片 / 办公文档 / PDF(目录请用 Glob)" },
+        path: { type: "string", description: "工作区里的绝对路径,以 / 开头,例如 /notes/a.md;支持文本 / 图片(svg 按文本读);办公文档与 PDF 请用 ReadOffice(目录请用 Glob)" },
         line_offset: { type: "integer", description: "起始行号(1 起);负数表示从文件末尾倒数(-1 = 最后一行)" },
         n_lines: { type: "integer", minimum: 1, description: "最多返回多少行;省略表示读到文件末尾" },
         max_chars: { type: "integer", minimum: 1, maximum: 65536, description: "本次返回的最大字符数(默认 16000,超过上限 65536 会被压到 65536)" },
@@ -215,6 +217,46 @@ var AGENT_TOOLS = [
     needsWorkspace: true,
     wsPathArgs: ["path"],
     run: function (args, ctx) { return wsToolRun("Read", args, ctx, wsReadTool); }
+  },
+  {
+    name: "ReadOffice",
+    title: "读取办公文档 / PDF",
+    scope: "read",
+    icon: "file",
+    desc: "只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。按页 / 表 / 行偏移读取办公文档(doc·docx·ppt·pptx·xls·xlsx)与 PDF;文档里的图片可按下标逐张读取(模型支持图像时直读,不支持时自动 OCR);纯文本与图片请用 Read。",
+    modelDesc: [
+      "只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。",
+      WS_PATH_DUAL_NOTE,
+      "",
+      "- 能读什么:办公文档(doc·docx·ppt·pptx·xls·xlsx)与 PDF;纯文本与图片请用 Read(本工具读不了)。",
+      "- 怎么定位:`page_offset` + `n_pages` 按页 / 表 / 幻灯取(1 起,负数从末尾倒数;省略即从头);`line_offset` + `n_lines` 按行取(行号是整篇的全局行号,与 `page_offset` 可互相换算);`max_chars` 默认取本次预算上限。",
+      "- 怎么读全:**照抄状态行末尾的 `next {…}`** 继续调用即可一段段读完;状态行的 `eof=true` 表示已到文档末尾;`max_chars` 不在 `next` 里——嫌慢可自行调大(上限 65536)。",
+      "- 文档里的图片:`image_offset` 给出第几张(1 起,按文档顺序)、`n_images` 给一次几张(默认 4,上限 12);给出 `image_offset` 时只回图片不回正文。模型支持图像时直接把图交给你,不支持时自动改用本机 OCR 只回文本。",
+      "- 返回末尾状态行:`[file 路径 · 格式 · 共 N 页/表 · 本次 第 a-b 页 · total 总行数 · shown 显示范围 · eof 是否到末尾 · size 字节数 · mtime 修改时间 · next 续读参数]`;图片视图的状态行以「图片 共 N 张 · 本次 第 a-b 张」开头。",
+      "- 只读文本文件用 Read;要改文件用 Edit;要看目录用 Glob;要按内容找位置用 Grep。",
+      "- 读不到的部分:超过本工具的单文件上限时,状态行会写明「仅前 N 字符 / 仅前 N 页」——那是文件的硬边界(不要用 ExecutePython 去拆它),如实告诉用户即可。"
+    ].join("\n"),
+    defaultPerm: "allow",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "工作区里的绝对路径,以 / 开头,例如 /docs/report.docx;支持 doc / docx / ppt / pptx / xls / xlsx / pdf(纯文本与图片请用 Read)" },
+        page_offset: { type: "integer", description: "起始页 / 表 / 幻灯号(1 起);负数表示从末尾倒数(-1 = 最后一页);省略 = 从头开始" },
+        n_pages: { type: "integer", minimum: 1, description: "本次覆盖多少页 / 表 / 幻灯;省略 = 一直覆盖到文档末尾(仍受 max_chars 约束)" },
+        line_offset: { type: "integer", description: "全局行游标(1 起;负数表示从文档末尾倒数);给出 page_offset 时不得同时给出" },
+        n_lines: { type: "integer", minimum: 1, description: "最多返回多少行;省略表示读到本次覆盖范围的末尾" },
+        max_chars: { type: "integer", minimum: 1, maximum: 65536, description: "本次返回的最大字符数(默认取本次可用预算的上限,不超过 65536)" },
+        column_offset: { type: "integer", minimum: 0, description: "正向读时从首个返回行的第几个字符开始(续读被截断的超长行);给出 page_offset 或负数 line_offset 时报错" },
+        image_offset: { type: "integer", minimum: 1, description: "图片视图:要读的第几张图(1 起,按文档顺序);给出它就只返回图片(或 OCR 文本),不返回正文" },
+        n_images: { type: "integer", minimum: 1, description: "图片视图一次最多交付几张(默认 4,上限 12)" }
+      },
+      required: ["path"],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, requiresNetwork: false },
+    needsWorkspace: true,
+    wsPathArgs: ["path"],
+    run: function (args, ctx) { return wsToolRun("ReadOffice", args, ctx, wsReadOfficeTool); }
   },
   {
     name: "Write",
@@ -407,10 +449,178 @@ var AGENT_TOOLS = [
     ],
     run: function (args, ctx) { return wsToolRun("FileOps", args, ctx, wsFileOpsTool); }
   },
+  {
+    name: "Office",
+    title: "生成与编辑办公文档",
+    scope: "write",
+    icon: "file",
+    cap: "office",
+    desc: "在工作区里新建或修改 docx / pptx 文件(Word 文档与 PowerPoint 演示文稿)。只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。生成用 `operation=create`(不覆盖已存在的文件);改文字 / 段落 / 幻灯用 `replace_text` / `append` / `add_slide` / `set_text` / `delete`;插表格 / 图片 / 图表、设页眉页脚、给幻灯套版式分别用 `add_table` / `add_image` / `add_chart` / `set_header_footer` / `apply_layout` —— 只改被点名的内容,其余部件(既有图片、图表、主题、母版等)逐字节原样保留。",
+    modelDesc: [
+      "在工作区里新建或修改 docx / pptx 文件(Word 文档 / PowerPoint 演示文稿);不能访问你的磁盘。",
+      WS_PATH_DUAL_NOTE,
+      "",
+      "- 三种意图请分清:要看内容用 `Read` / `ReadOffice`;要全新生成用 `operation=create`;要改已有文件用 `replace_text` / `append` / `add_slide` / `set_text` / `delete` / `set_properties`。",
+      "- 关键参数:`operation` 与 `path` 必填(路径以 `/` 开头);`file_type` = `docx` | `pptx`(`create` 必填,编辑时省略则按扩展名推断);**`create` 不覆盖已存在的文件**(报 `EEXIST`,要替换请先换名字或先 FileOps 删除)。",
+      "- **改已有文件前先 `operation=outline` 拿索引**:docx 给 `paragraphs[...]`(另有 `header` / `footer` 文本与是否多节);pptx 给 `slides[{i,layout,shapes[...]}]` + `layouts[...]`(套版式用的索引);索引 0 起、**任何一次编辑之后都可能变**,改完请重新 outline 再接着改。",
+      "- `create` 的内容格式:docx 用 `content`(支持 `#`/`##`/`###` 标题、普通段落、`-`/`*` 无序列表、`1.` 有序列表、行内 `**加粗**` 与 `*斜体*`);pptx 用 `slides`(每项 `{title, bullets:[...], layout:\"title\"|\"content\"|\"blank\"}`,`layout:\"title\"` 的封面页只填 `title`)。",
+      "- **插表格**:`add_table` + `table:{rows:[[...],[...]], header:true}`(首行加粗);docx 用 `paragraph_index` 指定插在哪一段之后(省略 = 追加到末尾),pptx 用 `slide_index`(省略 = 最后一页)。",
+      "- **插图片**:`add_image` + `image_path`(工作区里的 png / jpeg 路径,先用 Read 或 Glob 确认存在);可选 `image_width_px` / `image_height_px`(只给一边就按原比例缩放,都不给按原尺寸且自动限宽)。",
+      "- **插图表**:`add_chart` + `chart:{type:\"bar\"|\"line\"|\"pie\", title, categories:[\"Q1\",\"Q2\",...], series:[{name:\"收入\", values:[100,125,...]}]}`;数值会同时写进图表与**内嵌工作簿**(用户双击图表改数据时能看到同一批数);**只能新增图表,不能改已有图表的数据**。",
+      "- **页眉页脚**:`set_header_footer` + `header:{text}` / `footer:{text}`(header 只有 docx 有;pptx 传 header 会报错),pptx 另可 `slide_number:true`;docx 另可 `first_page_different` / `even_odd`。",
+      "- **给幻灯套版式**:`apply_layout` + `slide_index` + `layout_index`(取自 outline 的 `layouts[...]`);套用后占位符按新版式重定位,**不会删掉原有文字**。",
+      "- 编辑**只动被点名的内容**:其余 zip 部件(既有图片、图表、内嵌工作簿、主题、母版、页眉页脚)**逐字节原样保留**;因此**不会重排版式、不会改字体字号** —— 那些由文档自己的样式决定。",
+      "- 已知边界:`replace_text` 的 `old_string` 若被拆在多个 run 里,会退化为「整段重写」(该段 run 级格式丢失,结果 `warnings` 里会如实写明);不支持改已有图表的数据 / 批注 / 公式 / 智能艺术 / 宏(`.docm`·`.pptm`)/ 加密文档 / 老格式(`.doc`·`.ppt`,只读不写);图片只收 png 与 jpeg(单张 ≤8 MB)。",
+      "- 结果:`{path,file_type,operation,size,sizeDelta,counts:{...},warnings:[...]}`。**`warnings` 非空请读一遍** —— 它说明有内容走了降级路径(例如\"跨 run 重写,该段格式已丢失\")。",
+      "- 写回是**整份替换**(同一次事务内完成,不会留半个文件):文件上限 20 MB;**超过上限的文件本工具无法写入**(请拆分内容或另存为更小的文档)。",
+      "- 本工具**默认禁止**——默认态下它**不在你的工具列表里**;需要用的时候请让用户在 设置 → MCP 工具 里把权限改成「询问」或「允许」。"
+    ].join("\n"),
+    defaultPerm: "deny",
+    inputSchema: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: ["create", "outline", "append", "replace_text", "set_text",
+                 "delete", "add_slide", "set_properties",
+                 "add_table", "add_image", "add_chart", "set_header_footer", "apply_layout"],
+          description: "要执行的操作(见工具描述);docx 支持 create/outline/append/replace_text/delete/set_properties/add_table/add_image/add_chart/set_header_footer,pptx 支持 create/outline/add_slide/replace_text/set_text/delete/set_properties/add_table/add_image/add_chart/set_header_footer/apply_layout"
+        },
+        path: { type: "string", description: "工作区里的绝对路径,以 / 开头,后缀必须是 .docx 或 .pptx" },
+        file_type: { type: "string", enum: ["docx", "pptx"], description: "文档类型;create 必填;编辑时省略则按 path 后缀推断,与后缀不符会报错" },
+        content: { type: "string", description: "create(docx):正文;支持 # / ## / ### 标题、段落、- 或 * 列表、1. 有序列表、**加粗**、*斜体*" },
+        slides: {
+          type: "array", minItems: 1, maxItems: 200,
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string", description: "幻灯片标题(可省略)" },
+              bullets: { type: "array", items: { type: "string" }, description: "正文项目符号(每条一行,可省略)" },
+              layout: { type: "string", enum: ["title", "content", "blank"], description: "版式:title=封面(只有标题)/content=标题+正文(默认)/blank=空白" }
+            },
+            required: [],
+            additionalProperties: false
+          },
+          description: "create(pptx):幻灯片数组;add_slide 用单元素数组(只取第 0 个)"
+        },
+        head_limit: { type: "integer", minimum: 1, maximum: 200, description: "outline 最多返回多少项(默认 80);被截断时结果里 truncated=true 与 total" },
+        paragraphs: { type: "array", items: { type: "string" }, description: "append(docx):追加的段落文本(逐条一段)" },
+        content_append: { type: "string", description: "append(docx):追加正文(与 content 同格式);与 paragraphs 二选一" },
+        old_string: { type: "string", minLength: 1, description: "replace_text:要被替换的原文" },
+        new_string: { type: "string", description: "replace_text:替换成的新文本(空串 = 删除)" },
+        replace_all: { type: "boolean", description: "replace_text:是否替换全部命中(默认 true);false 时要求唯一命中" },
+        slide_index: { type: "integer", minimum: 0, description: "pptx:幻灯片序号(0 起,取自 outline);add_table/add_image/add_chart 省略 = 最后一页(apply_layout 与 set_header_footer 不需要)" },
+        shape_index: { type: "integer", minimum: 0, description: "pptx set_text:形状序号(0 起,取自 outline);省略 = 该页第 0 个文本框" },
+        shape_text: { type: "array", items: { type: "string" }, description: "pptx set_text:把该形状的文字整体换成这些行(每条一行/一段;空数组 = 清空该文本框)" },
+        paragraph_index: { type: "integer", minimum: 0, description: "docx:段落序号(0 起,取自 outline);delete = 删该段,add_table/add_image/add_chart = 插在该段之后,省略 = 追加到正文末尾(sectPr 之前)" },
+        table: {
+          type: "object",
+          properties: {
+            rows: { type: "array", minItems: 1, maxItems: 200,
+                    items: { type: "array", minItems: 1, maxItems: 30, items: { type: "string" } },
+                    description: "表格内容,逐行逐格;每格一个字符串(允许空串)" },
+            header: { type: "boolean", description: "首行是否按表头处理(加粗,默认 true)" }
+          },
+          required: ["rows"],
+          additionalProperties: false,
+          description: "add_table:表格内容;最大 200 行 x 30 列"
+        },
+        image_path: { type: "string", description: "add_image:工作区里的图片路径(png 或 jpeg,单张 <=8 MB)" },
+        image_width_px: { type: "integer", minimum: 16, maximum: 4096, description: "add_image:目标宽度(像素);与 image_height_px 只给一个时按原比例缩放" },
+        image_height_px: { type: "integer", minimum: 16, maximum: 4096, description: "add_image:目标高度(像素);都不给 = 原尺寸(超宽时自动限到版心宽度)" },
+        chart: {
+          type: "object",
+          properties: {
+            type: { type: "string", enum: ["bar", "line", "pie"], description: "柱 / 折线 / 饼(柱 = 簇状柱形图)" },
+            title: { type: "string", description: "图表标题(可省略)" },
+            categories: { type: "array", minItems: 1, maxItems: 64, items: { type: "string" }, description: "分类轴标签(如季度 / 月份)" },
+            series: {
+              type: "array", minItems: 1, maxItems: 8,
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string", description: "系列名(进图例与内嵌工作簿首行)" },
+                  values: { type: "array", minItems: 1, maxItems: 64, items: { type: "number" }, description: "与 categories 一一对应的数值" }
+                },
+                required: ["name", "values"],
+                additionalProperties: false
+              },
+              description: "系列数组;每个系列的 values 长度必须 == categories 长度"
+            }
+          },
+          required: ["type", "categories", "series"],
+          additionalProperties: false,
+          description: "add_chart:图标数据;数值会同时写进图表缓存与内嵌工作簿(PPTX 双击图表可编辑)"
+        },
+        header: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false,
+                  description: "set_header_footer(docx):页眉文本;pptx 没有页面页眉,传了报错" },
+        footer: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false,
+                  description: "set_header_footer:页脚文本(docx 与 pptx 都支持)" },
+        slide_number: { type: "boolean", description: "set_header_footer(pptx):是否显示幻灯片编号" },
+        first_page_different: { type: "boolean", description: "set_header_footer(docx):首页页眉页脚是否单独一套(默认 false)" },
+        even_odd: { type: "boolean", description: "set_header_footer(docx):奇偶页是否不同(默认 false;开启会新建 word/settings.xml)" },
+        layout_index: { type: "integer", minimum: 0, description: "apply_layout(pptx):目标版式序号(0 起,取自 outline 的 layouts[])" },
+        properties: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            creator: { type: "string" },
+            subject: { type: "string" },
+            description: { type: "string" },
+            keywords: { type: "string" }
+          },
+          additionalProperties: false,
+          description: "set_properties:写入 docProps/core.xml(缺省字段保持原值);v1.3 起不含页面设置(page 移出 v1)"
+        }
+      },
+      required: ["operation", "path"],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, requiresNetwork: false },
+    needsWorkspace: true,
+    wsPathArgs: ["path", "image_path"],
+    /* 13 个 operation 的**参数作用域判据**全在 officeSpecCheck()(唯一出口,见文件工具实现区);
+       载荷实现全部就位:批次 D(基础 8 项)/ F(add_chart)/ G(set_header_footer)/
+       H(add_table / add_image / apply_layout)—— 13 项各有对应的载荷 builder,
+       OfficeWrite 只对"该 file_type 没有这个 op"报 EINVAL(如 docx 传 apply_layout) */
+    run: function (args, ctx) { return wsToolRun("Office", args, ctx, officeToolRun); }
+  },
+  {
+    name: "DownloadForUser",
+    title: "下载文件给用户",
+    scope: "read",
+    icon: "download",
+    desc: "只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。把文件(或整个目录,自动打包成 zip)下载到用户电脑 —— 用来交付任务产物;单次打包上限 128 MB。",
+    modelDesc: [
+      "只能把本会话挂载的工作区(虚拟盘)里的内容交付到用户电脑,不能访问你的磁盘。",
+      "",
+      "- 把一个文件(或整个目录——目录会自动递归打包成一个 zip)下载到用户电脑,用来把任务产物交付给用户。",
+      "- 路径口径:同其它工作区工具(见系统提示里的路径口径句),一律以 / 开头的根路径(如 /out/report.zip)。",
+      "- 使用时机:用户要拿走产物时主动调用一次;同一产物不要重复下载;只想给用户看内容请用 Read(不要用下载代替阅读)。",
+      "- `path` 必填:传文件直接下载;传目录会打成 zip(包内保留该目录名作顶层文件夹;传 `/` 等于整箱导出)。",
+      "- 限制:单次打包内容合计不超过 128 MB、条目不超过 65535 个、空目录直接报错;超过请按子目录分批下载。打包在浏览器内存里完成,大目录会有几秒到几十秒的等待。",
+      "- 文件落点由浏览器决定(通常是系统「下载」文件夹),你无法指定;用户会在浏览器下载列表里看到它。若浏览器禁用了下载会返回错误,请如实告知用户(不要重试)。",
+      "- 打包期间用户按 `Ctrl+X` 可中止,中止后不会留下半成品文件;同一时刻只允许一个下载或上传任务(冲突时返回错误,稍后重试即可)。"
+    ].join("\n"),
+    /* 默认「每次询问」:下载是"出沙箱到用户磁盘"的可见副作用(AGENTS §6.2) */
+    defaultPerm: "ask",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "工作区里的绝对路径,以 / 开头;文件直接下载,目录自动打包成 zip" }
+      },
+      required: ["path"],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, requiresNetwork: false },
+    needsWorkspace: true,
+    wsPathArgs: ["path"],
+    run: function (args, ctx) { return wsToolRun("DownloadForUser", args, ctx, wsDownloadTool); }
+  },
   /* ---- Python 解释器(pyodide 314.0.6 / CPython 3.14.2,内嵌在页面里) ----
      不设 cap:cap 是"静态能力表"查询(toolSupported 会变成恒真),运行期就绪由
      activeTools() 里的 pyReady() 门控;不设 needsWorkspace:未挂载工作区也能跑,
-     只是看不到文件(与 6 个文件工具的区别就在这里) */
+     只是看不到文件(与 8 个文件工具的区别就在这里) */
   {
     name: "ExecutePython",
     title: "Python 解释器",
@@ -439,8 +649,8 @@ var AGENT_TOOLS = [
         "- 想枚举环境里的包:`importlib.metadata.distributions()`(已安装清单,含版本)、`importlib.metadata.version(\"名\")`、`pkgutil.iter_modules()` —— 看的是「已安装/已装载」视角;本档的预置全集(含还没 import 的)用 PythonPackages 查。",
         "",
         "**边界**",
-        "- 只能访问本会话挂载的工作区(虚拟盘,根目录 `/`),看不到你的磁盘,也不能执行宿主程序;读写工作区文件用 Read / Write / Edit / Glob / Grep / FileOps。",
-        "- 需要二进制文件(图片/压缩包/办公文档等)的字节时,直接用 `open(\"/workspace/...\",\"rb\").read()` 读取并处理;这类文件不要用 Read(它把图片/办公文档/PDF 按各自的内核解析成文本或图像交付,**不交付原始字节**)。",
+        "- 只能访问本会话挂载的工作区(虚拟盘,根目录 `/`),看不到你的磁盘,也不能执行宿主程序;读写工作区文件用 Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office。",
+        "- 需要二进制文件(图片/压缩包/办公文档等)的字节时,直接用 `open(\"/workspace/...\",\"rb\").read()` 读取并处理;这类文件不要用 Read / ReadOffice(它们把图片与文档解析成文本或图像交付,**不交付原始字节**)。",
         "- 当前浏览器没有 JSPI 时,`asyncio.run` / `loop.run_until_complete` 这类栈切换路径不可用(普通同步代码不受影响,可用 asyncio 的其它写法)。",
         "- 关网时(设置 → MCP 工具 里关闭「允许联网」)Python 侧的网络调用会失败并给出提示;开网时的请求也受浏览器 CORS 约束。",
         "",
@@ -891,6 +1101,11 @@ function toolArgLang(name) {
 }
 function toolApprovalNote(name) {
   var canon = toolCanonOf(name);
+  /* 下载类要早于下面的通用 needsWorkspace 句:通用句说的是"在工作区里执行",
+     而这次调用的可见副作用是"落到你电脑上",必须说清 */
+  if (canon === "DownloadForUser") {
+    return "这次调用会把工作区里的文件(目录会先打包成 zip)下载到你电脑的下载目录(具体落点由浏览器决定),需要你放行。";
+  }
   if (canon === "ExecuteJavaScript") {
     return "这段代码将在浏览器沙箱(独立线程,无页面数据、默认无网络)里执行,需要你放行。";
   }
@@ -1113,6 +1328,38 @@ function toolResultText(res, toolName) {
       if (res.logs && res.logs.length) o.console = res.logs.slice(0, 20);
     }
     var s0;
+    /* 状态行保活(§3.3.1;唯一权威):**仅当 `res.statusLine` 存在**时走新路径 —— 只有走
+       wsLinePageResult 的 Read 族调用点会设它,其余工具(无该字段)一字不动。
+       保护集 = statusLine + tailNote;正文按**实序列化长度**二分收紧(JSON 转义开销自动计入,
+       不另估余量),收敛到"判定通过或正文为空";不变式 = 返回值里 `JSON.parse(...).result`
+       的末尾逐字节包含保护集。 */
+    if (res.ok && res.statusLine != null) {
+      var keep = String(res.statusLine) + (res.tailNote || "");
+      var body = String(res.body == null ? "" : res.body);
+      /* 试装:probe 为正文,命中预算返回整串,超预算返回 "" */
+      var tryRender = function (probe) {
+        o.result = probe + keep;
+        var t;
+        try { t = JSON.stringify(o, null, 1); } catch (e) { t = String(o); }
+        return (t.length <= max) ? t : "";
+      };
+      var full = tryRender(body);
+      if (!full && tryRender("")) {
+        /* 二分找「最长的可装下正文前缀」;收缩不改保护集,只吃正文 */
+        var lo = 0, hi = body.length, best = 0;
+        while (lo <= hi) {
+          var mid = Math.floor((lo + hi) / 2);
+          if (tryRender(body.slice(0, mid))) { best = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        if (best > 0 && wsIsHighSurrogate(body.charAt(best - 1))) best--;   /* 不劈开代理对 */
+        full = tryRender(body.slice(0, best));
+      }
+      if (full) return full;
+      /* 理论不可达(max ≥ 256):如实返回保护集 + 既有尾注 */
+      o.result = keep;
+      try { s0 = JSON.stringify(o, null, 1); } catch (e) { s0 = String(o); }
+      return s0 + "\n…(结果超长已截断,原始长度 " + s0.length + " 字符)";
+    }
     try { s0 = JSON.stringify(o, null, 1); } catch (e) { s0 = String(o); }
     if (s0.length > max) s0 = s0.slice(0, max) + "\n…(结果超长已截断,原始长度 " + s0.length + " 字符)";
     return s0;
@@ -1671,7 +1918,7 @@ function renderMcpPanel() {
   var on = !!state.settings.toolsEnabled;
   st.className = "mcp-state" + (on ? " on" : "");
   $("mcp-enabled").checked = on;
-  /* 「当前浏览器可用」= 本机能力齐备。工作区三区缺失时那 6 个文件工具在本机用不了
+  /* 「当前浏览器可用」= 本机能力齐备。工作区三区缺失时那 8 个文件工具在本机用不了
      (挂载也救不回来),不能算进这个数,否则与「已启用」互相矛盾 */
   var usable = AGENT_TOOLS.filter(function (t) {
     if (t.needsWorkspace && !wsReady()) return false;
@@ -1699,7 +1946,7 @@ function renderMcpPanel() {
   if (box) {
     /* 分组渲染:组标题复用既有 .sec-title 样式;分组按工具的能力面推导
        (需要工作区的 = 文件 / PY_TASK_NAMES 里的 = 任务 / 其余 = 代码执行),不新增工具字段。
-       分组口径:「文件(6)/代码执行(2)/任务(5)/外部 MCP」——
+       分组口径:「文件(9)/代码执行(3)/上下文(1)/任务(5)/外部 MCP」——
        内部工具与外部 MCP 工具分成两段标题(外部段按 source 单独渲染) */
     var groups = [
       { key: "file", title: "文件", list: [] },
@@ -2017,7 +2264,7 @@ function finishInit() {
   }
   updateStatusBar();
   autoFitSidebar();
-  if (isMobile()) collapseSidebar();
+  if (isMobile()) collapseSidebar(true);   /* 初始窄屏收起 = 自动行为,不写手动意图 */
   syncSidebarBackdrop();
   updateStorageMeter();
   if (!CAP.stream) toast("当前浏览器不支持流式读取,已自动切换为非流式输出", "info", 4200);
@@ -2073,6 +2320,10 @@ var READ_PDF_IMG_MAX_PAGES = 4;                  /* 无文字层 PDF 的渲染�
 var READ_OCR_TIMEOUT_MS = 120000;                /* **整次 Read** 的 OCR 总预算(多页共享,不再是每页独立) */
 var READ_DOC_OCR_MAX_IMAGES = 12;                /* 图文按序融合:单次最多 OCR 张数(超出按序丢弃 + 注记) */
 var READ_DOC_OCR_MAX_PAGES = 8;                  /* 图文按序融合:只扫描前 8 页的图片(文本仍按 extractText 的 maxPages 取) */
+var READ_DOC_IMG_SCAN_MAX = 64;                  /* 图片视图的 PDF 取图扫描窗(与 READ_DOC_OCR_MAX_PAGES 并存:
+                                                    后者继续服务非视觉正文融合的旧路径,本常量的唯一消费者 = 图片视图) */
+var READ_PDF_MAX_CHARS = 400000;                 /* PDF 正文抽取字符上限(== PDFKit 的 DEF.maxChars;§3.2-6 的受支持范围) */
+var READ_PDF_TEXT_MAX_PAGES = 200;               /* PDF 正文抽取页数上限(§3.2-6 的受支持范围) */
 var TOOL_MEDIA_CHAT_KEEP_ITEMS = 8;              /* 聊天轮软护栏:最近 N 条带媒体工具项 */
 var TOOL_MEDIA_CHAT_MAX_BYTES = 8 * 1024 * 1024; /* 聊天轮软护栏:累计 data 字符量上限(≈8 MiB) */
 var EDIT_READ_MAX = 2 * 1024 * 1024;            // Edit 可编辑文件上限
@@ -3407,7 +3658,7 @@ function wsContextBlock(c) {
   var m = WS_META_CACHE[wsId];
   if (!m || !m.tree) return "";
   var head = "【工作区】当前会话挂载了工作区「" + m.name + "」(已用 " + fmtBytes(m.usedBytes) + " / " + fmtBytes(m.quotaBytes) +
-    ")。文件读写用 Read / Write / Edit / Glob / Grep / FileOps,根目录为 `/`。" + WS_PATH_DUAL_NOTE;
+    ")。文件读写用 Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office,根目录为 `/`;把产物下载给用户用 DownloadForUser。" + WS_PATH_DUAL_NOTE;
   var files = wsTreeAllFiles(m.tree, "/", []);
   files.sort(function (a, b) { return (b.node.at || 0) - (a.node.at || 0); });
   var lines = [];
@@ -3481,7 +3732,7 @@ function pyCacheStats() {
 }
 
 /* ===========================================================================
-   6 个文件工具的实现(只经 WS.* 与工作区打交道;错误码原样带回)
+   8 个文件工具的实现(只经 WS.* 与工作区打交道;错误码原样带回)
    =========================================================================== */
 /* 统一的工具壳:总开关 / 就绪 / 挂载 三道防御性再校验 + 路径入参规范化 */
 function wsToolRun(name, args, ctx, impl) {
@@ -3530,7 +3781,7 @@ function wsToolRun(name, args, ctx, impl) {
     if (wsIsErr(res)) return fail(res);
     if (!res || typeof res !== "object") return { ok: false, error: "工具没有返回结果", logs: [], ms: Date.now() - t0 };
     if (res.ms == null) res.ms = Date.now() - t0;
-    /* 写类工具(scope="write":Write / Edit / FileOps —— 也只有这三个走 wsToolRun)落盘后
+    /* 写类工具(scope="write":Write / Edit / FileOps / Office —— 也只有这四个走 wsToolRun)落盘后
        把右栏刷一遍:否则模型刚写进去的文件在右栏列表里看不见,要用户手点一次刷新。
        只在这个粒度上刷 —— 下沉到 wsWriteText 之类内核的话,脚本批量落盘会变成每次一个全量重渲染。
        ExecutePython 不过这里(它走 pyToolRun),它的刷新点在 pyWriteBack(前台 + 后台两条路共用)。
@@ -3570,9 +3821,9 @@ function wsBinaryErr(path, type, size, extra, mime) {
   return wsErr("EBINARY",
     "「" + path + "」不是 Read 能直接读的内容(" + (type || "未知二进制") + (mime ? ", " + mime : "") + ", " + fmtBytes(size || 0) + ")。" +
     (extra || "") +
-    "Read 现在支持:纯文本 / 图片(png·jpg·gif·webp·bmp·avif·ico) / 办公文档(doc·docx·ppt·pptx·xls·xlsx) / PDF。" +
+    "Read 支持:纯文本 / 图片(png·jpg·gif·webp·bmp·avif·ico);办公文档(doc·docx·ppt·pptx·xls·xlsx)与 PDF 用 ReadOffice。" +
     "这份文件属于其它二进制,请不要重试。next_step: ① 需要字节 → 用 ExecutePython 以 open(\"/workspace/x.zip\",\"rb\") 读取(容器内路径以 /workspace/ 开头);" +
-    "② 取走/搬动 → 右栏「下载」或 FileOps;③ 需要里面的内容 → 先用 ExecutePython 解包(标准库 zipfile 可用;解出来的文件写进工作区)再 Read 那些文件。",
+    "② 取走/搬动 → 右栏「下载」、FileOps 或 DownloadForUser(下载给用户);③ 需要里面的内容 → 先用 ExecutePython 解包(标准库 zipfile 可用;解出来的文件写进工作区)再 Read 那些文件。",
     path);
 }
 
@@ -3651,7 +3902,7 @@ function wsOcrTextOf(dataUrl, opts) {
     if (!r || !r.ok) {
       var err = String((r && r.error) || "未知");
       if (/超时/.test(err)) {
-        return { ok: false, error: "OCR 超时(整次 Read 的 OCR 预算 " + Math.round(ms / 1000) + " 秒):可换更小的图,或用 ExecutePython 先裁剪后再 Read" };
+        return { ok: false, error: "OCR 超时(整次 Read 的 OCR 预算 " + Math.round(ms / 1000) + " 秒):可换更小的图,或用 ExecutePython 先裁剪后再用 Read / ReadOffice 读" };
       }
       return { ok: false, error: "OCR 识别失败(" + err + ")" };
     }
@@ -3753,10 +4004,13 @@ function wsOcrCands(cands, args, ctx, r, text, info) {
   });
 }
 /* 非视觉模型的「图文按序融合」收尾(§2.2/§2.4):把候选图 OCR 成块插进文本——
-   layout:"pages" = PDF(按页插,格式见 §2.2);layout:"flat" = office(正文之后按序接)。
+   layout:"pages" = **带页标记的格式**(PDF 的 `----- 第 N 页 -----`;pptx 自 P2 的 S11 起同族)
+                    ⇒ 块插到对应页 / 幻灯段之后(格式见 §2.2);
+   layout:"flat"  = 没有页标记的 office(docx / xlsx)⇒ 正文之后按序接。
    四态注记齐:张数超限 / 时间预算 / 字符预算 / OCR 不可用;中止另记。**绝不伪造文本**
    (OCR 不可用 ⇒ 原文照给 + 注记;一张都没识别出来 ⇒ 只有「未识别」注记,不编内容)。
-   o = { path, args, ctx, r, text, info, cands, layout, leftover, notesTail }
+   o = { path, args, ctx, r, text, info, cands, layout, leftover, notesTail,
+         kind, pageOffset, nPages }(后三项只透传给正文视图收尾,§3.4)
    cands[] = { mime, data, label, page, kind:"rect"|"full"|"" };label 的页号口径由调用方定 */
 function wsFuseOcrText(o) {
   var info = (o.info || []).slice();
@@ -3764,7 +4018,10 @@ function wsFuseOcrText(o) {
   var text = String(o.text == null ? "" : o.text);
   var ctx = o.ctx, sig = ctx && ctx.signal;
   function plain() {
-    return wsLinePageResult(text, o.args, { lead: info.concat(tail).join(" · "), size: o.r.size, mtime: o.r.at });
+    return wsDocPageView({
+      text: text, args: o.args, r: o.r, info: info.concat(tail),
+      kind: o.kind || "none", pageOffset: o.pageOffset, nPages: o.nPages
+    });
   }
   var all = o.cands || [];
   var over = Math.max(0, Number(o.leftover) || 0) + Math.max(0, all.length - READ_DOC_OCR_MAX_IMAGES);
@@ -3811,11 +4068,11 @@ function wsFuseOcrText(o) {
         "插入(当前模型不支持图像输入,OCR 可能有误差)");
     }
     if (nFull) info.push("其中 " + nFull + " 页为整页图像 OCR(含文字层重复,可能有误差)");
-    if (over > 0) info.push("另有 " + over + " 图未处理(超出单次上限,可用 ExecutePython 逐张拆出来再 Read)");
+    if (over > 0) info.push("另有 " + over + " 图未处理(超出单次上限;用 ReadOffice 的 `image_offset=k` 继续读)");
     if (res.stopped > 0) {
       info.push(res.stop === "chars"
-        ? ("另有 " + res.stopped + " 图未处理(结果文本已达单次长度上限,可用 ExecutePython 逐张拆出来再 Read)")
-        : ("另有 " + res.stopped + " 图未处理(本机 OCR 时间预算用尽,可缩小范围或先裁剪后再 Read)"));
+        ? ("另有 " + res.stopped + " 图未处理(结果文本已达单次长度上限;用 ReadOffice 的 `image_offset=k` 继续读)")
+        : ("另有 " + res.stopped + " 图未处理(本机 OCR 时间预算用尽,可缩小范围或先裁剪后再用 Read / ReadOffice 读)"));
     }
     if (res.empty > 0) info.push(res.empty + " 图 OCR 未识别到文字");
     if (res.aborted) info.push("生成已中止,结果不完整");
@@ -3824,29 +4081,43 @@ function wsFuseOcrText(o) {
 }
 /* 非视觉 PDF 的取图计划(§2.1c/§5.8):pageImages 报含图 ⇒ 每图一个取区;mode:"full" 的页用
    面积护栏走整页兜底;整条 renderCrops 失败 ⇒ renderPages 整页渲染(P2-14 的降级必须有注记)。
-   返回 { list:[候选图…], leftover:因张数上限没做的张数, pages:扫描页数, unscanned:未扫描页数, hasImgs } */
-function wsPdfImgCands(buf, info) {
+   返回 { list:[候选图…], leftover:因张数上限没做的张数, pages:扫描页数, unscanned:未扫描页数, hasImgs,
+          total:候选图总数(≤ maxImages), dropped:本次窗口外未渲染的张数, err:越界文案(字符串) }
+   opts(§3.5;全部可省 —— 全缺省时行为与批前逐字节一致):
+     maxPages  取图扫描窗页数(缺省 READ_DOC_OCR_MAX_PAGES;图片视图传 READ_DOC_IMG_SCAN_MAX)
+     maxImages 候选池上限(缺省 READ_DOC_OCR_MAX_IMAGES;图片视图传 READ_DOC_IMG_SCAN_MAX)
+     pageFrom/pageTo 按真页号过滤候选(**仅 PDF**:候选带真页号,§3.4-5)
+     imageOffset/nImages 只渲染请求窗口的候选(P2-4:深偏移不再付全量裁剪) */
+function wsPdfImgCands(buf, info, opts) {
+  var op = opts || {};
+  var maxPages = Math.max(1, Math.floor(Number(op.maxPages) || READ_DOC_OCR_MAX_PAGES));
+  var maxImages = Math.max(1, Math.floor(Number(op.maxImages) || READ_DOC_OCR_MAX_IMAGES));
   var tmoMs = Math.min(60000, toolLimit("timeoutMs"));
+  function blank(o2) {
+    var r = { list: [], leftover: 0, pages: 0, unscanned: 0, hasImgs: false, total: 0, dropped: 0 };
+    if (o2) for (var k in o2) if (Object.prototype.hasOwnProperty.call(o2, k)) r[k] = o2[k];
+    return r;
+  }
   function fail(why) {
     info.push((why ? ("精确取区与整页渲染都失败(" + why + ")") : "图片检测失败") + ",未做图文 OCR");
-    return { list: [], leftover: 0, pages: 0, unscanned: 0, hasImgs: false };
+    return blank();
   }
   return window.PDFKit.pageImages(buf, {
-    maxPages: READ_DOC_OCR_MAX_PAGES, dpi: pdfDpi(), region: "rect", timeout: tmoMs
+    maxPages: maxPages, dpi: pdfDpi(), region: "rect", timeout: tmoMs
   }).then(function (pr) {
     if (!pr || !pr.ok) {
       info.push("图片检测失败(" + ((pr && pr.error) || "未知") + "),未做图文 OCR");
-      return { list: [], leftover: 0, pages: 0, unscanned: 0, hasImgs: false };
+      return blank();
     }
     var pages = pr.pages || [], imgPages = [], i, j;
     for (i = 0; i < pages.length; i++) if (pages[i] && pages[i].hasImages) imgPages.push(pages[i]);
-    var out = {
-      list: [], leftover: 0, pages: pages.length,
+    var out = blank({
+      pages: pages.length,
       unscanned: Math.max(0, (pr.pageCount || pages.length) - pages.length),
       hasImgs: imgPages.length > 0
-    };
+    });
     if (!imgPages.length) return out;                    /* 纯文本/无图 ⇒ 输出逐字节不变 */
-    if (out.unscanned > 0) info.push("仅处理前 " + READ_DOC_OCR_MAX_PAGES + " 页的图片(共 " + out.unscanned + " 页未扫描图片)");
+    if (out.unscanned > 0) info.push("仅处理前 " + maxPages + " 页的图片(共 " + out.unscanned + " 页未扫描图片)");
     var groups = [], meta = [];
     for (i = 0; i < imgPages.length; i++) {
       var pg = imgPages[i];
@@ -3862,11 +4133,37 @@ function wsPdfImgCands(buf, info) {
         meta.push({ page: pg.page, kind: "full", seq: 1 });
       }
     }
-    if (groups.length > READ_DOC_OCR_MAX_IMAGES) {
-      out.leftover = groups.length - READ_DOC_OCR_MAX_IMAGES;
-      groups = groups.slice(0, READ_DOC_OCR_MAX_IMAGES);
-      meta = meta.slice(0, READ_DOC_OCR_MAX_IMAGES);
+    /* 页窗口过滤(**仅 PDF**:office 候选不带真页号,一律按整篇顺序编号,§3.4-5) */
+    if (op.pageFrom != null || op.pageTo != null) {
+      var f = Math.max(1, Math.floor(Number(op.pageFrom) || 1));
+      var t = Math.floor(Number(op.pageTo) || 0);
+      if (t < f) t = f;
+      var g2 = [], m2 = [];
+      for (i = 0; i < meta.length; i++) {
+        if (meta[i].page >= f && meta[i].page <= t) { g2.push(groups[i]); m2.push(meta[i]); }
+      }
+      groups = g2; meta = m2;
     }
+    if (groups.length > maxImages) {
+      out.leftover = groups.length - maxImages;
+      groups = groups.slice(0, maxImages);
+      meta = meta.slice(0, maxImages);
+    }
+    out.total = meta.length;
+    /* 请求窗口(候选序号 1 起):只渲染这一段,元数据全量保留 ⇒ 总张数与越界文案不受影响 */
+    var a = 0, b = meta.length;
+    if (op.imageOffset != null) {
+      var off = Math.max(1, Math.floor(Number(op.imageOffset) || 1));
+      if (off > meta.length) {
+        out.err = "本文件共 " + meta.length + " 张图,image_offset=" + off + " 越界";
+        return out;
+      }
+      a = off - 1;
+      b = Math.min(a + Math.max(1, Math.floor(Number(op.nImages) || READ_MEDIA_MAX_IMAGES)), meta.length);
+    }
+    out.dropped = meta.length - (b - a);
+    groups = groups.slice(a, b);
+    meta = meta.slice(a, b);
     function mimeOf(u) { return (String(u || "").match(/^data:([^;,]+)/) || [])[1] || "image/jpeg"; }
     function candOf(im, m) {
       var full = (m.kind === "full");
@@ -3920,31 +4217,51 @@ function wsDocumentPack(o) {
   var cands = (o.cands || []).slice();
   var info = (o.info || []).slice();
   var vision = toolVisionCanImage(ctxConv(o.ctx));
-  if (!cands.length) {
-    return Promise.resolve(wsLinePageResult(text, o.args, { lead: info.join(" · "), size: o.r.size, mtime: o.r.at }));
+  /* 正文收尾统一走 §3.4 的正文视图收尾(窗口 + 页标记口径);kind/pageOffset/nPages 由调用方给 */
+  function pageView(notes) {
+    return wsDocPageView({
+      text: text, args: o.args, r: o.r, info: info,
+      kind: o.kind || "none", pageOffset: o.pageOffset, nPages: o.nPages, notesTail: notes
+    });
   }
-  if (o.ocr) return wsOcrCands(cands.slice(0, READ_MEDIA_MAX_IMAGES), o.args, o.ctx, o.r, text, info);
+  if (!cands.length) return Promise.resolve(pageView(o.notesTail));
+  if (o.ocr) {
+    /* 登记债 P2-2 收口(§3.2-4):本路径的正文 = 每张图一段 OCR 文本的拼装,**没有任何页/表标记**
+       (解析层页码在 R1 不可靠,§3.4-5)⇒ 给出 `page_offset` 一律 EINVAL 并指路按行读,
+       **不得静默忽略**(批前的裸 wsLinePageResult 就是静默忽略;触发面含「无文字层 PDF + 非视觉」)。
+       判据放在付 OCR 代价之前;文案与文档路径同一来源(wsNoMarkErr),n_pages 单给仍按 §3.2-2
+       (= page_offset 省略 ⇒ 全文)不作游标 */
+    if (o.pageOffset != null) {
+      var noMark = wsNoMarkErr(o.kind || "none");
+      return Promise.resolve(wsErr(noMark.code, noMark.error, o.r.path));
+    }
+    return wsOcrCands(cands.slice(0, READ_MEDIA_MAX_IMAGES), o.args, o.ctx, o.r, text, info);
+  }
   if (!vision && o.fuseImgs) {
-    /* 非视觉 + 有文本 + 有图 ⇒ 本机 OCR 按序插到正文之后(office 段内不分区,故 layout = "flat";
-       pptx 的真实页号要另走 docstream AST —— 属后续批次,不阻塞) */
+    /* 非视觉 + 有文本 + 有图 ⇒ 本机 OCR 按序插进正文。
+       带页标记的格式(PDF;pptx 自 P2 的 S11 起也带 `----- 第 N 页 -----`、kind = "pdfPage")
+       走 layout = "pages" ⇒ 块插到**对应页 / 幻灯段之后**(P2 的 S15);docx / xlsx 段内不分区,
+       仍 layout = "flat"(正文之后按序接,与批前逐字节一致)。 */
+    var fuseLayout = (o.kind === "pdfPage") ? "pages" : "flat";
     return wsFuseOcrText({
       path: o.r.path, args: o.args, ctx: o.ctx, r: o.r, text: text, cands: cands,
-      info: info, layout: "flat", notesTail: o.notesTail || []
+      info: info, layout: fuseLayout, notesTail: o.notesTail || [],
+      kind: o.kind || "none", pageOffset: o.pageOffset, nPages: o.nPages
     });
   }
   if (!vision) {
     /* 与附件 resolveOffice 的 dropImages 同语义:非视觉丢图,文本照给
        (只剩 o.ocr 未覆盖的路径:无候选图时上面已提前返回 ⇒ 实际只在 o.fuseImgs 未置位时到达) */
     if (text.trim()) info.push(cands.length + " 图已跳过(当前模型不支持图像输入)");
-    return Promise.resolve(wsLinePageResult(text, o.args, { lead: info.join(" · "), size: o.r.size, mtime: o.r.at }));
+    return Promise.resolve(pageView(o.notesTail));
   }
   var lim = Math.min(cands.length, READ_MEDIA_MAX_IMAGES);
   var skipped = cands.length - lim;
-  if (skipped) info.push("另有 " + skipped + " 图超出单次上限未附带(可用 ExecutePython 逐张拆出来再 Read)");
+  if (skipped) info.push("另有 " + skipped + " 图超出单次上限未附带(用 ReadOffice 的 `image_offset=k` 继续读)");
   return wsFitCands(cands.slice(0, lim)).then(function (out) {
     if (out.media.length) info.push(out.media.length + " 图已附带");
     else if (skipped < cands.length) info.push("图片均超出单张体积上限,未附带");
-    var res = wsLinePageResult(text, o.args, { lead: info.join(" · "), size: o.r.size, mtime: o.r.at });
+    var res = pageView(o.notesTail);
     if (out.media.length) res.media = out.media;
     return res;
   });
@@ -3972,22 +4289,95 @@ function wsReadOfficeResult(wsId, r, args, ctx) {
     if (o.unit === "页" && o.pages) info.push("共 " + o.pages + " 页");
     else if (o.unit === "表" && o.pages) info.push("共 " + o.pages + " 表");
     if (o.subtype === "doc" || o.subtype === "ppt") info.push("仅文本(老格式无图像提取)");
-    if (o.clipped) info.push("clipped");
+    /* S3b(§3.2-6):胶水在 TEXT_MAX(131072)处 `raw.slice(0, TEXT_MAX)` ⇒ 超限部分**真的不存在**,
+       任何偏移都取不到 ⇒ 必须如实注记,不得静默截断 */
+    if (o.clipped) {
+      info.push("仅前 " + num(text.length) + " 字符,剩余内容本工具读不到" +
+        (o.textChars ? "(原文共 " + num(o.textChars) + " 字符)" : ""));
+    }
     var cands = [];
+    /* pptx(P2-a 的 S11b 落地后,§3.5/R6):page = **真实幻灯号**(1 起);0 = 解析层认不出归属
+       ⇒ 保留解析层的「图 N」(整篇序号)+ 如实注记,不猜(§8-R13)。
+       块头的 k = **该幻灯内**的图片序号(1 起,与 PDF 侧 m.seq 同口径)—— 与 image_offset 的
+       整篇顺序是两套口径,不得互相推导(§3.5)。
+       docx/xlsx/ppt/doc:page 只是整篇兜底序号 ⇒ label 一字不动(与批前逐字节一致)。 */
+    var isPptx = (subtype === "PPTX");
+    var perSlide = {}, noSlide = 0;
     (o.images || []).forEach(function (im) {
-      cands.push({ mime: im.mime || "image/png", data: im.data || "", label: im.label || "",
-                   from: "office-image", path: path });
+      var pg = parseInt(im.page, 10);
+      if (!(pg > 0)) pg = 0;
+      var label = im.label || "";
+      if (isPptx) {
+        if (pg > 0) {
+          perSlide[pg] = (perSlide[pg] || 0) + 1;
+          label = "第 " + pg + " 页 · 图 " + perSlide[pg];
+        } else {
+          noSlide++;
+        }
+      }
+      cands.push({ mime: im.mime || "image/png", data: im.data || "", label: label,
+                   from: "office-image", path: path, page: pg });
     });
+    if (noSlide) {
+      info.push(noSlide === 1 ? "该图无法定位到幻灯,按整篇顺序编号"
+        : "有 " + num(noSlide) + " 张图无法定位到幻灯,按整篇顺序编号");
+    }
     var haveText = !!text.trim();
     var vision = toolVisionCanImage(ctxConv(ctx));
-    if (haveText && !cands.length) return wsDocumentPack({ text: text, cands: [], info: info, args: args, ctx: ctx, r: r });
+    /* xlsx/xls 的文本带 "# <表名>" 段头 ⇒ 有表标记;pptx(P2 的 S11 起)带**真实**幻灯标记
+       `----- 第 N 页 -----` ⇒ 与 PDF 同一个标记族(pdfPage) ⇒ 页窗口 / 逐段读 / 逐段续读都可用
+       (空幻灯没有标记 ⇒ 段号会缺号,段标签如实反映真幻灯号,P2 的 S11 已用未过滤原始序号编号);
+       docx/doc/ppt 无任何页/表信息 ⇒ "none"(页标记:无) */
+    var kind = (subtype === "XLSX" || subtype === "XLS") ? "sheet"
+      : (subtype === "PPTX" ? "pdfPage" : "none");
+    /* 图片视图(§3.5):给出 image_offset 时只回图片(或 OCR 文本),正文一律不返回 */
+    if (args.image_offset != null) {
+      if (!cands.length) return wsErr("EINVAL", "本文件没有可读取的图片", path);
+      var iOff = Math.floor(clampNum(args.image_offset, 1, 1000000, 1));
+      if (iOff > cands.length) {
+        return wsErr("EINVAL", "本文件共 " + cands.length + " 张图,image_offset=" + iOff + " 越界", path);
+      }
+      var iNum = Math.floor(clampNum(args.n_images, 1, READ_DOC_OCR_MAX_IMAGES, READ_MEDIA_MAX_IMAGES));
+      var iNotes = [];
+      if (o.skippedImgs > 0) iNotes.push("解析层最多提取 20 张,其余 " + num(o.skippedImgs) + " 张未提取");
+      if (o.clipped) iNotes.push("仅前 " + num(text.length) + " 字符,剩余内容本工具读不到");
+      return wsDocImageView({
+        path: path, args: args, ctx: ctx, r: r, kind: "office", info: info,
+        total: cands.length, cands: cands.slice(iOff - 1, iOff - 1 + iNum),
+        off: iOff, nImg: iNum, notes: iNotes,
+        /* S11b 落地后 pptx 的 page 才是**真幻灯号** ⇒ wsDocImageView 那句「office 图片没有页码」
+           的注记按 §3.3 的条件句只在"没有真页号"的格式上写(其余 office 一字不改) */
+        imgPageKind: isPptx ? "slide" : ""
+      });
+    }
+    /* P3-1:「共 N 页/表」是**解析层声明的总数**(pptx = docProps/app.xml 的幻灯数,含空幻灯),
+       而 wsDocSectionWindow 越界文案的「本文件共 N 页/表/幻灯…越界」按**有标记的段数**计
+       (空幻灯没有正文 ⇒ 没有标记)⇒ 两者不等时把段数一并写进状态行,模型不必先撞一次越界
+       才看到第二个数字。**只补状态行文案,两侧计数逻辑一律不动**。
+       位置在图片视图之后 ⇒ 图片视图状态行一字不变(它不支持 page_offset,两个口径都与它无关)。 */
+    if (o.pages && (kind === "pdfPage" || kind === "sheet")) {
+      var segTotal = docSectionIndex(text, kind).total;
+      var segBase = "共 " + o.pages + " " + o.unit, segAt = info.indexOf(segBase);
+      if (segTotal && segTotal !== o.pages && segAt >= 0) {
+        info[segAt] = segBase + "(" + segTotal + " 段有标记)";
+      }
+    }
+    if (haveText && !cands.length) {
+      return wsDocumentPack({
+        text: text, cands: [], info: info, args: args, ctx: ctx, r: r, kind: kind,
+        /* §3.4:页/表窗口的三个量必须一路透传到 wsDocPageView —— 漏传 ⇒ 窗口不滑动(表读仍从第 1 行起)
+           且 kind="none" 的 EINVAL 永远不触发(PDF 侧同位置已透传,口径按 §3.2-2/§3.2-4 对齐) */
+        pageOffset: args.page_offset, nPages: args.n_pages
+      });
+    }
     if (!haveText && !cands.length) {
       return wsErr("EBINARY", "「" + path + "」没有可读的文本内容(可能是纯图片文档,且没有可提取的图片)", path);
     }
     if (!haveText) info.push(vision
       ? "没有可读文本,改附图片" : "没有可读文本,已改用 OCR(当前模型不支持图像输入)");
     return wsDocumentPack({
-      text: text, cands: cands, info: info, args: args, ctx: ctx, r: r,
+      text: text, cands: cands, info: info, args: args, ctx: ctx, r: r, kind: kind,
+      pageOffset: args.page_offset, nPages: args.n_pages,
       ocr: !haveText && !vision,
       /* B4:有文本 + 非视觉 ⇒ 图片不再丢弃,改本机 OCR 后按序插到正文之后(独立标志,不动 o.ocr 原义) */
       fuseImgs: haveText && !vision
@@ -4003,26 +4393,65 @@ function wsReadPdfResult(wsId, r, args, ctx) {
       ((window.PDFKit && window.PDFKit.why) || "缺少必要能力") + ")", path));
   }
   return wsBlobBuffer(r.blob).then(function (buf) {
-    return window.PDFKit.extractText(buf, { maxChars: ATTACH_TEXT_MAX, maxPages: 200 }).then(function (o) {
+    return window.PDFKit.extractText(buf, { maxChars: READ_PDF_MAX_CHARS, maxPages: READ_PDF_TEXT_MAX_PAGES }).then(function (o) {
       if (!o || !o.ok) return wsErr("EBINARY", "「" + path + "」PDF 文本抽取失败(" + ((o && o.error) || "未知") + ")", path);
       var text = String(o.text || "");
       /* 「有文字层」的判据要排除 pdf.js 的分页标记(否则扫描件会拿到只有 "----- 第 N 页 -----" 的假文本) */
       var realText = text.replace(/^[-\s]*第\s*\d+\s*页[-\s]*$/gm, "").trim();
+      /* S3b(§3.2-6):超范围的降级必须**如实注记**,不得静默截断(胶水只给 truncated 一个标志,
+         页数截断与字符截断各自成句 —— 两条原因可同时成立) */
+      var cutNotes = [];
+      if (o.truncated) {
+        if ((o.pageCount || 0) > READ_PDF_TEXT_MAX_PAGES) {
+          cutNotes.push("仅前 " + num(o.pages || 0) + " 页,剩余内容本工具读不到(分窗读属后续批次)");
+        }
+        if (text.length >= READ_PDF_MAX_CHARS) {
+          cutNotes.push("仅前 " + num(text.length) + " 字符,剩余内容本工具读不到(分窗读属后续批次)");
+        }
+        if (!cutNotes.length) cutNotes.push("已截断");
+      }
+      if (args.image_offset != null) {
+        /* 图片视图(§3.5):**仅 PDF** 的候选带真页号 ⇒ 给了 page_offset 时先按页窗口过滤候选,再按 image_offset 切片 */
+        var iOff = Math.floor(clampNum(args.image_offset, 1, 1000000, 1));
+        var iNum = Math.floor(clampNum(args.n_images, 1, READ_DOC_OCR_MAX_IMAGES, READ_MEDIA_MAX_IMAGES));
+        var pFrom = null, pTo = null;
+        if (args.page_offset != null) {
+          var wsec = wsDocSectionWindow(text, "pdfPage", args.page_offset, args.n_pages);
+          if (!wsec.ok) return wsErr(wsec.err.code, wsec.err.error, path);
+          pFrom = wsec.secs[0].no;
+          pTo = wsec.secs[wsec.secs.length - 1].no;
+        }
+        var iInfo = ["file " + path, "PDF", "共 " + num(o.pageCount || o.pages || 1) + " 页"];
+        return wsPdfImgCands(buf, iInfo, {
+          maxPages: READ_DOC_IMG_SCAN_MAX, maxImages: READ_DOC_IMG_SCAN_MAX,
+          pageFrom: pFrom, pageTo: pTo, imageOffset: iOff, nImages: iNum
+        }).then(function (plan) {
+          if (plan.err) return wsErr("EINVAL", plan.err, path);
+          if (!plan.total) return wsErr("EINVAL", "本文件没有可读取的图片", path);
+          var iNotes = (pFrom != null) ? ["只列本次页窗口内的图片"] : [];
+          if (plan.leftover > 0) iNotes.push("另有 " + num(plan.leftover) + " 张图超过候选池上限未列出");
+          return wsDocImageView({
+            path: path, args: args, ctx: ctx, r: r, kind: "pdf", info: iInfo,
+            total: plan.total, cands: plan.list, off: iOff, nImg: iNum, notes: iNotes
+          });
+        });
+      }
       if (realText) {
         var info = ["file " + path, "PDF", "共 " + (o.pages || 1) + " 页",
                     "文本 " + num(o.chars != null ? o.chars : text.length) + " 字符"];
         if (toolVisionCanImage(ctxConv(ctx))) {
-          /* 视觉模型路径:一字不变(不探页图、不做 OCR) */
-          if (o.truncated) info.push("已截断");
-          return wsLinePageResult(text, args, { lead: info.join(" · "), size: r.size, mtime: r.at });
+          /* 视觉模型路径:不探页图、不做 OCR;正文收尾走 §3.4 的正文视图(页/行两套坐标可互换算) */
+          return wsDocPageView({
+            text: text, args: args, r: r, info: info, kind: "pdfPage",
+            pageOffset: args.page_offset, nPages: args.n_pages, notesTail: cutNotes
+          });
         }
         /* 非视觉 + 有图 ⇒ 按页融合(§2.2);无图 ⇒ 与批前逐字节一致 */
-        var notesTail = [];
-        if (o.truncated) notesTail.push("已截断");
         return wsPdfImgCands(buf, info).then(function (plan) {
           return wsFuseOcrText({
             path: path, args: args, ctx: ctx, r: r, text: text, info: info,
-            cands: plan.list, leftover: plan.leftover, layout: "pages", notesTail: notesTail
+            cands: plan.list, leftover: plan.leftover, layout: "pages", notesTail: cutNotes,
+            kind: "pdfPage", pageOffset: args.page_offset, nPages: args.n_pages
           });
         });
       }
@@ -4037,13 +4466,14 @@ function wsReadPdfResult(wsId, r, args, ctx) {
             cands.push({
               mime: (String(im.dataUrl || "").match(/^data:([^;,]+)/) || [])[1] || "image/jpeg",
               data: dataUrlPayload(im.dataUrl || ""), label: "第 " + (im.page || (i + 1)) + " 页",
-              from: "pdf-page", path: path
+              from: "pdf-page", path: path, page: im.page || (i + 1)
             });
           });
           var info = ["file " + path, "PDF", "共 " + (pr.pages || cands.length) + " 页",
                       "没有文字层,已改用前 " + Math.min(cands.length, maxPages) + " 页图片"];
           return wsDocumentPack({
             text: "", cands: cands, info: info, args: args, ctx: ctx, r: r,
+            kind: "pdfPage", pageOffset: args.page_offset, nPages: args.n_pages,
             ocr: !toolVisionCanImage(ctxConv(ctx))
           });
         });
@@ -4065,8 +4495,10 @@ function wsDocErrText(path, o) {
   return "「" + path + "」解析失败:" + ((o && o.error) || "未知错误") + (m[kind] ? "(" + m[kind] + ")" : "") +
     ";文件可能已损坏或受密码保护";
 }
-/* Read 的类型路由(§3.2;顺序即优先级):1 文本(现状,输出逐字节不变,svg 也在这里)
-   → 2/3 office/PDF → 4 图片(视觉直读 / 非视觉 OCR)→ 5 宏格式沿用既有拒绝 → 5 其余二进制(新文案) */
+/* Read 的类型路由(§3.2;顺序即优先级,S6 之后只剩 1/4/5):
+   1 文本(输出逐字节不变,svg 也在这里)→ 2 图片(视觉直读 / 非视觉 OCR)→ 3 宏格式沿用既有拒绝
+   → 4 其余二进制。**办公文档与 PDF 已移到 ReadOffice** —— 这里只给一条带可照抄 path 的重定向错误,
+   不产生任何解析副作用(不碰解析库、不 OCR) */
 function wsReadTool(wsId, args, ctx) {
   if (!args.path) return Promise.resolve(wsErr("EINVAL", "path 必填(工作区绝对路径,例如 /notes/a.md)"));
   /* column_offset 只用于正向读(Kimi readTool.ts:198-199 同口径) */
@@ -4078,20 +4510,272 @@ function wsReadTool(wsId, args, ctx) {
     return wsProbeBlob(r.blob, r.path, r.mime).then(function (pr) {
       r.probe = pr;
       if (pr && pr.kind === "text") return wsReadTextResult(r, args, pr);
-      if (wsDocKindOf(r.path, pr)) return wsReadDocResult(wsId, r, args, ctx);
+      /* 文档重定向(§3.2-4/C4):逐类给词(办公文档 / 演示文稿 / 表格 / PDF)+ 路径照抄 JSON;
+         错误码统一 EINVAL(不新增 EROUTE)。判据用 wsDocKindOf 的**返回值**(magic 兜底时后缀可能
+         不是文档后缀)⇒ 只有 "office" 分支才按后缀取词("office" 保证后缀 ∈ OFFICE_EXT) */
+      var dk = wsDocKindOf(r.path, pr);
+      if (dk) {
+        var dSuf = wsSuffixOf(r.path);
+        var dWord = (dSuf === "docx" || dSuf === "doc") ? "办公文档"
+          : ((dSuf === "pptx" || dSuf === "ppt") ? "演示文稿" : "表格");
+        var dHere = "(path 照抄:" + JSON.stringify({ path: r.path }) + ")";
+        return wsErr("EINVAL", (dk === "pdf")
+          ? ("「" + r.path + "」是 PDF,同样是 ReadOffice 的职责" + dHere + "。")
+          : ("「" + r.path + "」是" + dWord + "(" + dSuf + "),请用 ReadOffice 读取" + dHere + "。"), r.path);
+      }
       if (wsImgKindOf(pr, r.path)) return wsReadImageResult(wsId, r, args, ctx);
       var suf = wsSuffixOf(r.path);
       if (isMacroExt(suf)) {
-        return wsErr("EBINARY", "「" + r.path + "」是宏格式(." + suf + "),暂不支持转换;请另存为 .docx / .xlsx / .pptx 后再 Read", r.path);
+        return wsErr("EBINARY", "「" + r.path + "」是宏格式(." + suf + "),暂不支持转换;请另存为 .docx / .xlsx / .pptx 后再用 ReadOffice 读", r.path);
+      }
+      return wsBinaryErr(r.path, (pr && pr.type) || "未知二进制", r.size, "", (pr && pr.mime) || "");
+    });
+  });
+}
+/* ReadOffice 的工具入口(参数语义的唯一权威 = plan §3.2;本函数只做:互斥校验 → 类型路由 → 分派)。
+   · 校验与路由都在**解析之前**完成 ⇒ 纯文本 / 图片 / 宏格式 / 其余二进制不必先付解析代价
+   · 参数事实(默认 / 上限 / 省略行为)的唯一权威 = 本条目 inputSchema(§3.1b);这里只管互斥(§3.2-3)
+   路由(§3.2-5,内容优先,与 Read 对称):1 文本 → 指 Read;2 office/PDF → 既有解析链;
+   3 图片 → 指 Read;4 宏格式 → EBINARY;5 其余二进制 → wsBinaryErr(§5-B1 的改口径文案) */
+function wsReadOfficeTool(wsId, args, ctx) {
+  var path = args.path;
+  if (!path) return Promise.resolve(wsErr("EINVAL", "path 必填(工作区绝对路径,例如 /docs/report.docx)"));
+  /* §3.2-3 的两条互斥 + 沿用 Read 口径的第三条(column_offset 与负数 line_offset) */
+  if (args.page_offset != null && args.line_offset != null) {
+    return Promise.resolve(wsErr("EINVAL", "page_offset 与 line_offset 不能同时给出:按页 / 表读用 page_offset + n_pages,按行读用 line_offset + n_lines"));
+  }
+  if (args.page_offset != null && args.column_offset != null) {
+    return Promise.resolve(wsErr("EINVAL", "column_offset 只用于按行读的续读(续读被截断的超长行),不能与 page_offset 同时给出"));
+  }
+  if (args.column_offset != null && typeof args.line_offset === "number" && args.line_offset < 0) {
+    return Promise.resolve(wsErr("EINVAL", "column_offset 只用于正向读,不能与负数 line_offset 同时给出"));
+  }
+  return wsReadBlob(wsId, path).then(function (r) {
+    if (wsIsErr(r)) return r;
+    return wsProbeBlob(r.blob, r.path, r.mime).then(function (pr) {
+      r.probe = pr;
+      if (pr && pr.kind === "text") {
+        return wsErr("EINVAL", "「" + r.path + "」内容是纯文本,请用 Read 读取(path 照抄:" +
+          JSON.stringify({ path: r.path }) + ")", r.path);
+      }
+      if (wsDocKindOf(r.path, pr)) return wsReadDocResult(wsId, r, args, ctx);
+      if (wsImgKindOf(pr, r.path)) return wsErr("EINVAL", "「" + r.path + "」是图片,请用 Read 读取", r.path);
+      var suf = wsSuffixOf(r.path);
+      if (isMacroExt(suf)) {
+        return wsErr("EBINARY", "「" + r.path + "」是宏格式(." + suf + "),暂不支持转换;请另存为 .docx / .xlsx / .pptx 后再用 ReadOffice 读", r.path);
       }
       return wsBinaryErr(r.path, (pr && pr.type) || "未知二进制", r.size, "", (pr && pr.mime) || "");
     });
   });
 }
 
+/* ---- 章节索引 / 页表窗口 / next 游标(§3.4;纯函数,无 IO) ---- */
+/* 章节索引(§3.4):按已解析的 subtype 选定"标记族",把整篇文本切成 [页/表] 段。行号为**全局行号**
+   (1 起,与 wsLinePageResult 的行号同一坐标系,含尾换行的计法也一致)。
+   标记族 · pdfPage = "----- 第 N 页 -----"(与 appD 的 PDF_PAGE_SEP_RE 同一字面量):
+                        PDF 现成;pptx 自 P2 的 S11 起同族(S11 之前它是没有标记的第三态 "slides",
+                        已在 P2 的 S15 随 kind 映射并入本族 —— 那个值不再产生);
+            · sheet   = xlsx/xls 胶水写的 "# <表名>" 段头;
+            · none    = docx/doc/ppt(**没有**任何页/表信息)。
+   none 没有标记行(返回空 list) ⇒ 状态行写「页标记:无」、wsNoMarkErr 给"本格式没有页/表标记"。
+   有标记族却一段也切不出(pptx 的 S11 自检整篇回退 / PDF 的标记被截光)⇒ wsDocSectionWindow
+   落到 wsNoMarkErr 的另一句文案(如实说"本文件里没有可定位的页/表标记")。
+   返回 { kind, unit, total, list:[{no,label,from,to}] };from/to 含标记行本身,页间空行归前段
+   (段 to = 下一段 from − 1,末段 = total)。 */
+function docSectionIndex(text, kind) {
+  var k = (kind === "pdfPage" || kind === "sheet") ? kind : "none";
+  var src = String(text == null ? "" : text);
+  var lines = src.split("\n");
+  var total = lines.length;
+  if (total > 1 && lines[total - 1] === "" && /\n$/.test(src)) total--;
+  var out = { kind: k, unit: (k === "sheet" ? "表" : (k === "pdfPage" ? "页" : "")), total: 0, list: [] };
+  if (k === "none") return out;
+  var marks = [], i, raw, m, lbl;
+  for (i = 0; i < total; i++) {
+    raw = lines[i];
+    if (raw.charAt(raw.length - 1) === "\r") raw = raw.slice(0, -1);
+    if (k === "pdfPage") {
+      m = PDF_PAGE_SEP_RE.exec(raw);
+      if (!m) continue;
+      marks.push({ no: parseInt(m[1], 10) || 0, label: raw, from: i + 1 });
+    } else {
+      if (raw.indexOf("# ") !== 0) continue;
+      marks.push({ no: 0, label: raw, from: i + 1 });
+    }
+  }
+  for (i = 0; i < marks.length; i++) {
+    marks[i].to = (i + 1 < marks.length) ? (marks[i + 1].from - 1) : total;
+    if (!marks[i].no) marks[i].no = i + 1;      /* 缺号(解析不出号的表头)按出现顺序补 */
+  }
+  out.list = marks;
+  out.total = marks.length;
+  return out;
+}
+/* 无页/表标记时的 EINVAL 文案(§3.2-4):**唯一来源** —— 文档路径与 OCR 正文路径共用这一句,
+   不在两处各写一份;两种情况都不改既有文案(纯提取,零行为变化)。
+   "none" = 该格式**本来**没有页/表信息(docx/doc/ppt);其余 = 有标记族却一段也切不出
+   (pptx 的 S11 自检整篇回退 / PDF 的标记被截光) —— pptx 的 "slides" 第三态已随 P2 的 S15 退役 */
+function wsNoMarkErr(kind) {
+  return (kind === "none")
+    ? { code: "EINVAL", error: "本格式没有页/表标记(docx/doc/ppt),请用 line_offset 按行读" }
+    : { code: "EINVAL", error: "本文件里没有可定位的页/表标记,请用 line_offset 按行读" };
+}
+/* 页/表窗口(§3.4):page_offset(1 起 / 负数从末尾倒数)与 n_pages(省略 = 到文档末尾)解析成**全局行窗口**。
+   返回 { ok:true, total, unit, fromSec, toSec, secs, window } 或 { ok:false, err }(EINVAL 文案,
+   path 由调用方补 —— 本函数不接触文件系统)。 */
+function wsDocSectionWindow(text, kind, pageOffset, nPages) {
+  var idx = docSectionIndex(text, kind);
+  if (idx.kind === "none") {
+    return { ok: false, err: wsNoMarkErr(kind) };
+  }
+  var total = idx.total;
+  if (!total) {
+    return { ok: false, err: wsNoMarkErr(kind) };
+  }
+  var k = Math.floor(Number(pageOffset) || 0);
+  if (k === 0) k = 1;
+  var no = (k < 0) ? (total + 1 + k) : k;
+  if (no < 1 || no > total) {
+    return { ok: false, err: { code: "EINVAL", error: "本文件共 " + total + " 页/表/幻灯,page_offset=" + k + " 越界" } };
+  }
+  var n = (nPages == null) ? 0 : Math.floor(Number(nPages) || 0);
+  if (n < 1) n = 0;
+  var last = n ? Math.min(no + n - 1, total) : total;
+  var secs = idx.list.slice(no - 1, last);
+  return {
+    ok: true, total: total, unit: idx.unit, fromSec: no, toSec: last, secs: secs,
+    window: { start: secs[0].from, end: secs[secs.length - 1].to, no: no, n: n, unit: idx.unit, secs: secs }
+  };
+}
+/* next {…} 段的唯一生成点(§3.3):紧凑 JSON、不含 path、可直接照抄进下一次调用的增量参数。
+   kind = "line"(行截断) | "col"(超长行片段) | "page"(页窗口读尽而文档还有后文) | "image"(图片视图)。
+   参数缺关键量时返回 ""(不生成幻影游标)。`max_chars` 有意不进 next —— 它是可调旋钮不是游标。 */
+function wsDocNextArgs(kind, cur) {
+  var c = cur || {}, o = null;
+  if (kind === "col") {
+    if (!c.lineOffset || !c.columnOffset) return "";
+    o = { line_offset: c.lineOffset, column_offset: c.columnOffset, n_lines: 1 };
+  } else if (kind === "line") {
+    if (!c.lineOffset) return "";
+    o = { line_offset: c.lineOffset };
+    if (c.nLines) o.n_lines = c.nLines;
+  } else if (kind === "page") {
+    if (!c.pageOffset) return "";
+    o = { page_offset: c.pageOffset };
+    if (c.nPages) o.n_pages = c.nPages;
+  } else if (kind === "image") {
+    if (!c.imageOffset) return "";
+    o = { image_offset: c.imageOffset };
+    if (c.nImages) o.n_images = c.nImages;
+  } else return "";
+  try { return JSON.stringify(o); } catch (e) { return ""; }
+}
+/* 正文视图收尾(§3.3/§3.4):把文档路径的 info / 窗口 / 预算交给分页内核。
+   o = { text, args, r, info(状态行段数组,可省), kind("pdfPage"|"sheet"|"none"),
+         pageOffset, nPages, notesTail(尾部注记数组,可省) }
+   返回分页结果对象(含 body/statusLine/tailNote)或 wsErr(EINVAL)。 */
+function wsDocPageView(o) {
+  o = o || {};
+  var text = String(o.text == null ? "" : o.text);
+  var info = (o.info || []).slice();
+  var notes = (o.notesTail || []).slice();
+  var kind = o.kind || "none";
+  var win = null, i;
+  if (kind === "none") {
+    /* 无页/表标记的格式(docx/doc/ppt):把「共 N 页/表」换成诚实的「页标记:无」(§3.3 —— 不撒谎)。
+       pptx 自 P2 起带真幻灯标记(kind = "pdfPage")⇒ 走有标记族,「共 N 页」原样保留、窗口可用 */
+    var kept = [];
+    for (i = 0; i < info.length; i++) { if (!/^共 \d+ (页|表)$/.test(String(info[i]))) kept.push(info[i]); }
+    info = kept;
+    info.push("页标记:无");
+  }
+  if (o.pageOffset != null) {
+    var sec = wsDocSectionWindow(text, kind, o.pageOffset, o.nPages);
+    if (!sec.ok) return wsErr(sec.err.code, sec.err.error, o.r && o.r.path);
+    win = sec.window;
+  }
+  return wsLinePageResult(text, o.args || {}, {
+    lead: info.concat(notes).join(" · "), window: win, size: o.r && o.r.size, mtime: o.r && o.r.at
+  });
+}
+/* 图片视图收尾(§3.5):候选图切片 → 视觉附带(wsFitCands) / 非视觉本机 OCR(ocrSeqCands);正文一律不返回。
+   o = { path, args, ctx, r, kind("pdf"|"office"), info(基础状态行段数组), total(候选总张数),
+         cands(本次窗口切片,顺序 = 文档顺序), off(起始张号,1 起), nImg(本次请求张数),
+         notes(附加注记数组,可省) }
+   越界与"无图"由调用方在拿到 total 后先判(避免白渲染),这里只负责交付与状态行。 */
+function wsDocImageView(o) {
+  var path = String(o.path || "");
+  var total = Math.max(0, Math.floor(Number(o.total) || 0));
+  var list = o.cands || [];
+  var off = Math.max(1, Math.floor(Number(o.off) || 1));
+  var nImg = Math.max(1, Math.floor(Number(o.nImg) || READ_MEDIA_MAX_IMAGES));
+  var base = (o.info || []).slice();
+  var notes = (o.notes || []).slice();
+  if (!total || !off) return Promise.resolve(wsErr("EINVAL", "本文件没有可读取的图片", path));
+  var from = off, to = Math.min(off + list.length - 1, total);
+  var more = (off + list.length) <= total;
+  /* 页归属注记(唯一来源):PDF 用真页号、pptx(P2-a 的 S11b 之后)用真幻灯号 ⇒ 都不写这句
+     (pptx 的页归属由块头 `【第 N 页 · 图 k · 本机 OCR】` 给出);其余 office 的 page 只是
+     "整篇兜底序号" ⇒ 照旧如实注记(文案一字未改)。 */
+  if (o.kind !== "pdf" && o.imgPageKind !== "slide") notes.push("office 图片没有页码,按整篇顺序编号");
+  function finish(imgSegs, bodyText, media) {
+    var segs = base.concat(["图片 共 " + total + " 张", "本次 第 " + from + "-" + to + " 张"]).concat(imgSegs).concat(notes);
+    segs.push("eof=" + (!more));
+    if (more) {
+      var nx = wsDocNextArgs("image", { imageOffset: off + list.length, nImages: nImg });
+      if (nx) segs.push("next " + nx);
+    }
+    var status = "[" + segs.join(" · ") + "]";
+    var res = { ok: true, text: bodyText + status, body: bodyText, statusLine: status, tailNote: "" };
+    if (media && media.length) res.media = media;
+    return res;
+  }
+  if (toolVisionCanImage(ctxConv(o.ctx))) {
+    var lim = Math.min(list.length, READ_MEDIA_MAX_IMAGES);
+    return wsFitCands(list.slice(0, lim)).then(function (out) {
+      var segs = ["已附带 " + out.media.length + " 张"];
+      var left = list.length - out.media.length;
+      if (left > 0) segs.push("另有 " + left + " 张未附带(超出单次图片张数或单张体积上限,可按 next 继续读)");
+      return finish(segs, "", out.media);
+    });
+  }
+  if (!ocrReady()) {
+    return Promise.resolve(wsErr("EBINARY", "本机 OCR 引擎不可用(" +
+      ((window.OCRKit && window.OCRKit.why) || "缺少 Web Worker / WebAssembly") +
+      "),图片内容无法读取(可换支持视觉的模型)", path));
+  }
+  var multi = (list.length > 1);
+  return ocrSeqCands(list, {
+    signal: o.ctx && o.ctx.signal,
+    deadline: Date.now() + Math.min(READ_OCR_TIMEOUT_MS, toolLimit("timeoutMs")),
+    maxChars: Math.max(512, toolLimit("maxOut") - 512),
+    /* 块头与融合路径同一格式(ocrBlockHead / ocrBlockText,零新格式);单张时按既有口径省掉块头 */
+    prefixOf: function (c) { return multi ? ocrBlockHead(String((c && c.label) || "")) : ""; }
+  }).then(function (res) {
+    var parts = [], chars = 0, i;
+    for (i = 0; i < res.blocks.length; i++) {
+      var b = res.blocks[i];
+      parts.push(multi ? ocrBlockText(b.label, b.text) : b.text);
+      chars += String(b.text).length;
+    }
+    if (!parts.length) {
+      if (res.aborted) return wsErr("EBINARY", "生成已中止,本次读取没有完成", path);
+      return wsErr("EBINARY", "「" + path + "」里的图片在本机 OCR 里没有识别到文字,而当前模型不支持图像输入 —— " +
+        "内容无法读取(可换支持视觉的模型)", path);
+    }
+    var segs = ["已本机 OCR " + res.blocks.length + " 张", "识别 " + num(chars) + " 字", "可能有识别误差"];
+    if (res.empty > 0) segs.push(res.empty + " 张未识别到文字");
+    if (res.stopped > 0) segs.push("还有 " + res.stopped + " 张未识别");
+    if (res.aborted) segs.push("生成已中止,结果不完整");
+    return finish(segs, parts.join("\n\n") + "\n", null);
+  });
+}
+
 /* 抽自 wsReadTextResult 的渲染内核(§3.7.1):文本 → 行号视图 + 分页 + truncated/next_* 坐标 + 状态行。
    重构判据:既有文本读的**输出逐字节不变**(见 progress 的回归装置:请求体差分 + 源码切片 harness)。
-   meta = {lead(状态行前缀:office/PDF/OCR 用), size, mtime, enc, tailNote, truncatedExtra, stats} */
+   meta = {lead(状态行前缀:office/PDF/OCR 用), size, mtime, enc, tailNote, truncatedExtra, stats,
+           window(§3.4-W:文档路径的**全局行窗口** {start,end,no,n,unit,secs};缺省 = 旧语义一字不改)}
+   恒回填 res.body / res.statusLine / res.tailNote(§3.3.1 的构造不变量:body+statusLine+tailNote === text)。 */
 function wsLinePageResult(text, args, meta) {
   meta = meta || {};
   var size = meta.size || 0, enc = meta.enc || "";
@@ -4107,18 +4791,24 @@ function wsLinePageResult(text, args, meta) {
   var lines = view.split("\n");
   var total = lines.length;
   if (total > 1 && lines[total - 1] === "" && /\n$/.test(view)) total--;
+  var win = meta.window || null;
   var start = 1;
-  if (typeof args.line_offset === "number" && isFinite(args.line_offset) && args.line_offset !== 0) {
+  if (win) {
+    /* 窗口模式:line_offset 被忽略(§3.2-3 已禁"同给"),起点 = 窗口首行(全局行号) */
+    start = Math.max(1, Math.floor(win.start) || 1);
+  } else if (typeof args.line_offset === "number" && isFinite(args.line_offset) && args.line_offset !== 0) {
     start = args.line_offset < 0 ? (total + 1 + Math.floor(args.line_offset)) : Math.floor(args.line_offset);
     if (start < 1) start = 1;
   }
+  /* rangeTo = 本次覆盖范围的末行:窗口模式 = min(窗口末行, total);旧模式 = total */
+  var rangeTo = win ? Math.min(Math.max(1, Math.floor(win.end) || total), total) : total;
   var col = Math.max(0, clampNum(args.column_offset, 0, 100000000, 0));
   var want = args.n_lines == null ? 0 : clampNum(args.n_lines, 1, 1000000, 0);
   var maxReq = clampNum(args.max_chars, 1, READ_MAX_CHARS, READ_DEFAULT_CHARS);
   /* 有效上限还受结果预算约束:状态行(整段)必须活着,模型才能翻页 */
   var maxChars = Math.min(maxReq, Math.max(256, toolLimit("maxOut") - 256));
   var out = [], used = 0, shownTo = start - 1, truncated = false, nextCol = null;
-  for (var ln = start; ln <= total; ln++) {
+  for (var ln = start; ln <= rangeTo; ln++) {
     if (want && (ln - start) >= want) { truncated = true; break; }
     var content = lines[ln - 1];
     var c0 = (ln === start && col > 0) ? Math.min(col, content.length) : 0;
@@ -4143,21 +4833,47 @@ function wsLinePageResult(text, args, meta) {
     shownTo = ln;
   }
   if (start > total) { out = []; shownTo = total; truncated = false; }
+  /* next {…}(§3.3 生成判据 · R2):**仅在续读坐标存在时生成** —— 行/列形态看内核的
+     next_line_offset / next_column_offset;页形态看"窗口读尽且还有后文"。不得用 truncated 当判据
+     (truncatedExtra 对 >4 MiB 文本置真,那时窗口本身完整、没有续读坐标)。 */
+  var nextSeg = "";
+  if (nextCol != null) nextSeg = wsDocNextArgs("col", { lineOffset: start, columnOffset: nextCol });
+  else if (win) {
+    if (truncated && shownTo < rangeTo) nextSeg = wsDocNextArgs("line", { lineOffset: shownTo + 1, nLines: want });
+    else if (rangeTo < total && win.secs && win.secs.length) {
+      nextSeg = wsDocNextArgs("page", { pageOffset: win.secs[0].no + (win.n || win.secs.length), nPages: win.n });
+    }
+  } else if (truncated) nextSeg = wsDocNextArgs("line", { lineOffset: shownTo + 1, nLines: want });
   var segs = [];
   if (meta.lead) segs.push(String(meta.lead));
+  if (win && win.secs && win.secs.length) {
+    /* 「本次 第 a-b 页/表」:a-b 恒为**实际送达**的区间;请求了 n_pages 而只送达一部分 ⇒ 加 (请求 a-c) */
+    var delivered = 0, sc = win.secs;
+    for (i = 0; i < sc.length; i++) if (out.length && sc[i].from <= shownTo) delivered = i + 1;
+    var aNo = sc[0].no, cNo = sc[sc.length - 1].no;
+    var bNo = delivered ? sc[Math.min(delivered, sc.length) - 1].no : aNo;
+    segs.push("本次 第 " + aNo + "-" + bNo + " " + (win.unit || "页") +
+      ((delivered && delivered < sc.length) ? ("(请求 " + aNo + "-" + cNo + ")") : ""));
+  }
   if (meta.stats !== false) {
     segs.push("total " + total + " 行");
     segs.push("shown " + (out.length ? (start + "-" + shownTo) : "无"));
-    segs.push("eof=" + (!truncated && shownTo >= total));
+    segs.push("eof=" + (win ? (!truncated && shownTo >= rangeTo && rangeTo >= total) : (!truncated && shownTo >= total)));
     segs.push("size " + fmtBytes(size));
     segs.push("mtime " + fmtDateTime(meta.mtime || Date.now()));
     if (enc && enc !== "utf-8") segs.push("enc " + wsEncName(enc));
     if (maxChars < maxReq) segs.push("max_chars 已按结果预算压到 " + maxChars);
   }
+  if (nextSeg) segs.push("next " + nextSeg);
   var status = "[" + segs.join(" · ") + "]";
+  var bodyText = out.length ? out.join("\n") + "\n" : "";
+  var tailNote = meta.tailNote || "";
   var res = {
     ok: true,
-    text: (out.length ? out.join("\n") + "\n" : "") + status + (meta.tailNote || "")
+    text: bodyText + status + tailNote,
+    body: bodyText,
+    statusLine: status,
+    tailNote: tailNote
   };
   res.truncated = truncated || !!meta.truncatedExtra;
   if (truncated) res.next_line_offset = (nextCol != null) ? start : (shownTo + 1);
@@ -4485,9 +5201,444 @@ function wsFileOpsTool(wsId, args) {
   });
 }
 
-/* ---- 单文件下载(UI 专用) ----
+/* ===========================================================================
+   Office 工具(需求 4 / 批次 D 接线;方案 §2.1 / §2.2 / §2.6 / §3 S21)
+   分层:本层只做「工作区读写 + 参数作用域校验 + 错误码原样带回」;所有 OOXML 变换在
+   window.OfficeWrite.run(纯数据变换,不碰工作区、不发请求、不写日志)。
+   参数判据的唯一出口 = officeSpecCheck(),判据顺序照方案 §2.2 的 ①–⑧ 逐步走。
+   =========================================================================== */
+/* 单文件写入上限(方案 §2.6 的 OFFICE_MAX_BYTES):整包解压 + 重压的内存峰值约为输入的 3–8 倍,
+   所以本层自己设 20 MB 的门(工作区层不设 —— wsWriteBlob 只判配额) */
+var OFFICE_MAX_BYTES = 20 * 1024 * 1024;
+/* add_image 收的图片后缀(白名单;其余 ⇒ ENOTSUP,方案 §14.2) */
+var OFFICE_IMG_EXT = ["png", "jpg", "jpeg"];
+/* 13 项 operation(= inputSchema 的 enum;唯一权威 = 方案 §2.2) */
+var OFFICE_OPS = ["create", "outline", "append", "replace_text", "set_text", "delete", "add_slide",
+  "set_properties", "add_table", "add_image", "add_chart", "set_header_footer", "apply_layout"];
+/* (file_type, operation) → 参数作用域。need = 必填(键必须出现且非 null);opt = 可选。
+   本表 = 方案 §2.2 的 base 两张子表 ∪ v1.2 两张新表(P3-5:两表同一判据,只是文档里分表便于读);
+   「本表未列出的键一律 ✗」由 officeSpecCheck 的第 ③ 步统一执行 —— 只有这一份定义,不在别处重写 */
+var OFFICE_SCOPE = {
+  docx: {
+    create: { need: ["content"], opt: ["properties"] },
+    outline: { need: [], opt: ["head_limit"] },
+    append: { need: [], opt: ["content_append", "paragraphs"] },
+    replace_text: { need: ["old_string", "new_string"], opt: ["replace_all"] },
+    delete: { need: ["paragraph_index"], opt: [] },
+    set_properties: { need: ["properties"], opt: [] },
+    add_table: { need: ["table"], opt: ["paragraph_index"] },
+    add_image: { need: ["image_path"], opt: ["paragraph_index", "image_width_px", "image_height_px"] },
+    add_chart: { need: ["chart"], opt: ["paragraph_index"] },
+    set_header_footer: { need: [], opt: ["header", "footer", "first_page_different", "even_odd"] }
+  },
+  pptx: {
+    create: { need: ["slides"], opt: ["properties"] },
+    outline: { need: [], opt: ["head_limit"] },
+    add_slide: { need: ["slides"], opt: [] },
+    replace_text: { need: ["old_string", "new_string"], opt: ["replace_all", "slide_index", "shape_index"] },
+    set_text: { need: ["slide_index", "shape_text"], opt: ["shape_index"] },
+    delete: { need: ["slide_index"], opt: [] },
+    set_properties: { need: ["properties"], opt: [] },
+    add_table: { need: ["table"], opt: ["slide_index"] },
+    add_image: { need: ["image_path"], opt: ["slide_index", "image_width_px", "image_height_px"] },
+    add_chart: { need: ["chart"], opt: ["slide_index"] },
+    set_header_footer: { need: [], opt: ["footer", "slide_number"] },
+    apply_layout: { need: ["slide_index", "layout_index"], opt: [] }
+  }
+};
+/* docProps/core.xml 的可写字段(与 OfficeWrite 的 CORE_WRITABLE 同集;properties 里只认这几个) */
+var OFFICE_CORE_FIELDS = ["title", "creator", "subject", "description", "keywords"];
+
+function officeOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+function officeIsInt(v) { return typeof v === "number" && isFinite(v) && Math.floor(v) === v; }
+/* 单张图片上限:与 OfficeWrite.limits.maxImageBytes 同源(取不到才回落 8 MB,不再写死一个数) */
+function officeImgMaxBytes() {
+  var w = window.OfficeWrite;
+  var n = (w && w.limits) ? w.limits.maxImageBytes : 0;
+  return (typeof n === "number" && n > 0) ? n : (8 * 1024 * 1024);
+}
+/* 该 file_type 支持的 operation 列表(报错文案用;由 §2.2 的表推导,不另写清单) */
+function officeOpList(ft) {
+  var t = OFFICE_SCOPE[ft] || {}, out = [], k;
+  for (k in t) { if (officeOwn(t, k)) out.push(k); }
+  return out;
+}
+/* 参数不在该 (file_type, operation) 合法集里时的文案:方案 §2.2 的第 ⑥ 步(文件类型绑定)
+   点名 pptx 的 header 三件与 docx 的 slide_number / layout_index;其余走通用句 */
+function officeParamErrMsg(ft, op, key) {
+  if (ft === "pptx" && key === "header") {
+    return "pptx 没有页面页眉这个概念(p:hf 的 hdr 只对备注 / 讲义母版有意义);要页脚请用 footer,要页码请用 slide_number";
+  }
+  if (ft === "pptx" && (key === "first_page_different" || key === "even_odd")) {
+    return "pptx 不支持「" + key + "」(首页不同 / 奇偶页不同是 docx 的页面设置)";
+  }
+  if (ft === "docx" && key === "slide_number") return "docx 没有幻灯片编号这个概念(slide_number 只对 pptx 有意义)";
+  if (ft === "docx" && key === "layout_index") return "docx 没有「版式」这个概念(layout_index 只对 pptx 有意义)";
+  return "本 operation(operation=" + op + ", file_type=" + ft + ")不消费参数 `" + key + "`";
+}
+/* 字符串数组(schema 的 items.type=string):非数组 / 有非字符串项 ⇒ EINVAL */
+function officeStrArrayErr(v, label) {
+  if (v == null) return null;
+  if (!(v instanceof Array)) return wsErr("EINVAL", "`" + label + "` 必须是字符串数组");
+  for (var i = 0; i < v.length; i++) {
+    if (typeof v[i] !== "string") return wsErr("EINVAL", label + "[" + i + "] 必须是字符串");
+  }
+  return null;
+}
+/* create(pptx) / add_slide 的 slides(schema 的 minItems 1 / maxItems 200 + 逐项子 schema) */
+function officeSlidesErr(sl, op) {
+  if (!(sl instanceof Array) || !sl.length) return wsErr("EINVAL", "`slides` 必须是非空数组(至少一张幻灯)");
+  if (sl.length > 200) return wsErr("EINVAL", "`slides` 最多 200 张(收到 " + sl.length + " 张)");
+  var n = (op === "add_slide") ? 1 : sl.length;   /* add_slide 只消费第 0 个,其余项不判 */
+  for (var i = 0; i < n; i++) {
+    var it = sl[i], k;
+    if (!it || typeof it !== "object" || it instanceof Array) return wsErr("EINVAL", "slides[" + i + "] 必须是对象");
+    for (k in it) {
+      if (!officeOwn(it, k)) continue;
+      if (k !== "title" && k !== "bullets" && k !== "layout") {
+        return wsErr("EINVAL", "slides[" + i + "] 不认识字段 `" + k + "`(只有 title / bullets / layout)");
+      }
+    }
+    if (it.title != null && typeof it.title !== "string") return wsErr("EINVAL", "slides[" + i + "].title 必须是字符串");
+    if (it.layout != null) {
+      var lay = String(it.layout).toLowerCase();
+      if (lay !== "title" && lay !== "content" && lay !== "blank") {
+        return wsErr("EINVAL", "slides[" + i + "].layout 必须是 title / content / blank(收到:" + String(it.layout) + ")");
+      }
+    }
+    var be = officeStrArrayErr(it.bullets, "slides[" + i + "].bullets");
+    if (be) return be;
+  }
+  return null;
+}
+/* add_table 的 table(schema 的 rows / header;含 ⑦ 交叉一致性:各行列数必须一致) */
+function officeTableErr(tb) {
+  if (!tb || typeof tb !== "object" || tb instanceof Array) return wsErr("EINVAL", "`table` 必须是对象({rows:[[...]], header:true})");
+  var k;
+  for (k in tb) {
+    if (!officeOwn(tb, k)) continue;
+    if (k !== "rows" && k !== "header") return wsErr("EINVAL", "table 里不认识字段 `" + k + "`(只有 rows / header)");
+  }
+  var rows = tb.rows;
+  if (!(rows instanceof Array) || !rows.length) return wsErr("EINVAL", "table.rows 必填且必须是非空数组(至少一行)");
+  if (rows.length > 200) return wsErr("EINVAL", "table.rows 最多 200 行(收到 " + rows.length + " 行)");
+  var cols = -1, i, j;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!(r instanceof Array) || !r.length) return wsErr("EINVAL", "table.rows[" + i + "] 必须是非空数组(至少一格)");
+    if (r.length > 30) return wsErr("EINVAL", "table.rows[" + i + "] 最多 30 列(收到 " + r.length + " 列)");
+    for (j = 0; j < r.length; j++) {
+      if (typeof r[j] !== "string") return wsErr("EINVAL", "table.rows[" + i + "][" + j + "] 必须是字符串(每格一个字符串,允许空串)");
+    }
+    if (cols < 0) cols = r.length;
+    else if (r.length !== cols) {
+      return wsErr("EINVAL", "table.rows 各行列数必须一致:第 " + i + " 行有 " + r.length + " 格,第 0 行有 " + cols + " 格");
+    }
+  }
+  if (tb.header != null && typeof tb.header !== "boolean") return wsErr("EINVAL", "table.header 必须是 true / false");
+  return null;
+}
+/* add_chart 的 chart(schema 的逐字段 + ⑦ 交叉一致性:每个系列的 values 长度 == categories 长度) */
+function officeChartErr(ch) {
+  if (!ch || typeof ch !== "object" || ch instanceof Array) return wsErr("EINVAL", "`chart` 必须是对象({type, categories, series})");
+  var k;
+  for (k in ch) {
+    if (!officeOwn(ch, k)) continue;
+    if (k !== "type" && k !== "title" && k !== "categories" && k !== "series") {
+      return wsErr("EINVAL", "chart 里不认识字段 `" + k + "`(只有 type / title / categories / series)");
+    }
+  }
+  if (ch.type !== "bar" && ch.type !== "line" && ch.type !== "pie") {
+    return wsErr("EINVAL", "chart.type 必填且必须是 bar / line / pie(收到:" + String(ch.type) + ")");
+  }
+  if (ch.title != null && typeof ch.title !== "string") return wsErr("EINVAL", "chart.title 必须是字符串");
+  var cats = ch.categories;
+  if (!(cats instanceof Array) || !cats.length) return wsErr("EINVAL", "chart.categories 必填且必须是非空数组");
+  if (cats.length > 64) return wsErr("EINVAL", "chart.categories 最多 64 项(收到 " + cats.length + " 项)");
+  var i, j;
+  for (i = 0; i < cats.length; i++) {
+    if (typeof cats[i] !== "string") return wsErr("EINVAL", "chart.categories[" + i + "] 必须是字符串");
+  }
+  var ss = ch.series;
+  if (!(ss instanceof Array) || !ss.length) return wsErr("EINVAL", "chart.series 必填且必须是非空数组(至少一个系列)");
+  if (ss.length > 8) return wsErr("EINVAL", "chart.series 最多 8 个系列(收到 " + ss.length + " 个)");
+  for (i = 0; i < ss.length; i++) {
+    var it = ss[i];
+    if (!it || typeof it !== "object" || it instanceof Array) return wsErr("EINVAL", "chart.series[" + i + "] 必须是对象");
+    for (k in it) {
+      if (!officeOwn(it, k)) continue;
+      if (k !== "name" && k !== "values") return wsErr("EINVAL", "chart.series[" + i + "] 不认识字段 `" + k + "`(只有 name / values)");
+    }
+    if (it.name == null) return wsErr("EINVAL", "chart.series[" + i + "].name 必填");
+    if (typeof it.name !== "string") return wsErr("EINVAL", "chart.series[" + i + "].name 必须是字符串");
+    var vs = it.values;
+    if (!(vs instanceof Array) || !vs.length) return wsErr("EINVAL", "chart.series[" + i + "].values 必填且必须是非空数组");
+    if (vs.length > 64) return wsErr("EINVAL", "chart.series[" + i + "].values 最多 64 项(收到 " + vs.length + " 项)");
+    for (j = 0; j < vs.length; j++) {
+      if (typeof vs[j] !== "number" || !isFinite(vs[j])) return wsErr("EINVAL", "chart.series[" + i + "].values[" + j + "] 必须是数值");
+    }
+    if (vs.length !== cats.length) {
+      return wsErr("EINVAL", "chart.series[" + i + "].values 长度(" + vs.length + ")必须等于 categories 长度(" + cats.length + ")");
+    }
+  }
+  return null;
+}
+/* set_header_footer 的 header / footer(schema:对象 + text 必填) */
+function officeTextObjErr(o, label) {
+  if (!o || typeof o !== "object" || o instanceof Array) return wsErr("EINVAL", "`" + label + "` 必须是对象({text:\"...\"})");
+  var k;
+  for (k in o) {
+    if (!officeOwn(o, k)) continue;
+    if (k !== "text") return wsErr("EINVAL", label + " 里不认识字段 `" + k + "`(只有 text)");
+  }
+  if (typeof o.text !== "string") return wsErr("EINVAL", label + ".text 必填且必须是字符串");
+  return null;
+}
+/* set_properties 的 properties(schema:additionalProperties=false ⇒ 未知字段报 EINVAL;
+   v1.3 起 `properties.page` 已移出 v1 —— 它不在 schema 内,这里按"未知字段"点名) */
+function officePropsErr(p) {
+  if (!p || typeof p !== "object" || p instanceof Array) return wsErr("EINVAL", "`properties` 必须是对象");
+  var k;
+  for (k in p) {
+    if (!officeOwn(p, k)) continue;
+    if (OFFICE_CORE_FIELDS.indexOf(k) < 0) {
+      return wsErr("EINVAL", "properties 里不认识的字段 `" + k + "`(只支持 " + OFFICE_CORE_FIELDS.join(" / ")
+        + ";v1.3 起 page 已移出 v1,不再接受页面设置)");
+    }
+    if (typeof p[k] !== "string") return wsErr("EINVAL", "properties." + k + " 必须是字符串");
+  }
+  return null;
+}
+/* 第 ⑤ 步:值域(enum / minimum / maximum / minLength / minItems / maxItems)+ 嵌套对象的逐字段 */
+function officeSpecCheckValues(a, op) {
+  var e, i, k, v;
+  var ints = [["head_limit", 1, 200], ["slide_index", 0, 1000000000], ["shape_index", 0, 1000000000],
+    ["paragraph_index", 0, 1000000000], ["layout_index", 0, 1000000000],
+    ["image_width_px", 16, 4096], ["image_height_px", 16, 4096]];
+  for (i = 0; i < ints.length; i++) {
+    k = ints[i][0]; v = a[k];
+    if (v == null) continue;
+    if (!officeIsInt(v)) return wsErr("EINVAL", "`" + k + "` 必须是整数(收到:" + JSON.stringify(v) + ")");
+    if (v < ints[i][1] || v > ints[i][2]) {
+      return wsErr("EINVAL", "`" + k + "` 超出取值范围(" + ints[i][1] + " ~ " + ints[i][2] + ",收到 " + v + ")");
+    }
+  }
+  var bools = ["replace_all", "slide_number", "first_page_different", "even_odd"];
+  for (i = 0; i < bools.length; i++) {
+    if (a[bools[i]] != null && typeof a[bools[i]] !== "boolean") {
+      return wsErr("EINVAL", "`" + bools[i] + "` 必须是 true / false");
+    }
+  }
+  var strs = ["content", "content_append", "new_string"];
+  for (i = 0; i < strs.length; i++) {
+    if (a[strs[i]] != null && typeof a[strs[i]] !== "string") return wsErr("EINVAL", "`" + strs[i] + "` 必须是字符串");
+  }
+  if (a.image_path != null && typeof a.image_path !== "string") return wsErr("EINVAL", "`image_path` 必须是字符串");
+  if (a.old_string != null) {
+    if (typeof a.old_string !== "string") return wsErr("EINVAL", "`old_string` 必须是字符串");
+    if (!a.old_string.length) return wsErr("EINVAL", "`old_string` 不能是空串(要删内容请用 delete)");
+  }
+  e = officeStrArrayErr(a.paragraphs, "paragraphs");
+  if (e) return e;
+  e = officeStrArrayErr(a.shape_text, "shape_text");
+  if (e) return e;
+  if (a.slides != null) { e = officeSlidesErr(a.slides, op); if (e) return e; }
+  if (a.table != null) { e = officeTableErr(a.table); if (e) return e; }
+  if (a.chart != null) { e = officeChartErr(a.chart); if (e) return e; }
+  if (a.header != null) { e = officeTextObjErr(a.header, "header"); if (e) return e; }
+  if (a.footer != null) { e = officeTextObjErr(a.footer, "footer"); if (e) return e; }
+  if (a.properties != null) { e = officePropsErr(a.properties); if (e) return e; }
+  return null;
+}
+/* 参数判据的唯一出口(方案 §2.2 的 ①–⑧)。**失败一律 EINVAL + 点名句**;任一步失败都不碰工作区。
+   返回 null = 通过,否则返回 wsErr。 */
+function officeSpecCheck(a) {
+  a = a || {};
+  var op = (a.operation == null) ? "" : String(a.operation), i, k;
+  /* ① operation 必须在 13 项 enum 内 */
+  if (OFFICE_OPS.indexOf(op) < 0) {
+    return wsErr("EINVAL", "operation 必填且必须是 " + OFFICE_OPS.join(" / ") + " 之一(收到:" + (op || "(空)") + ")");
+  }
+  /* ② path 必填 + 后缀 × file_type 一致 */
+  if (typeof a.path !== "string" || !a.path) {
+    return wsErr("EINVAL", "path 必填(工作区里以 / 开头的路径,后缀必须是 .docx 或 .pptx)");
+  }
+  var suf = wsSuffixOf(a.path);
+  if (suf !== "docx" && suf !== "pptx") {
+    return wsErr("EINVAL", "本工具只写 docx / pptx:path 后缀必须是 .docx 或 .pptx(收到「" + a.path + "」)");
+  }
+  if (a.file_type != null && a.file_type !== "docx" && a.file_type !== "pptx") {
+    return wsErr("EINVAL", "file_type 必须是 docx 或 pptx(收到:" + JSON.stringify(a.file_type) + ")");
+  }
+  if (op === "create" && a.file_type == null) {
+    return wsErr("EINVAL", "create 必须给 file_type(docx 或 pptx)");
+  }
+  var ft = (a.file_type == null) ? suf : String(a.file_type);
+  if (ft !== suf) {
+    return wsErr("EINVAL", "file_type(" + ft + ")与路径后缀(." + suf + ")不符 —— 请让两者一致,或省略 file_type 由后缀推断");
+  }
+  /* ③ 先按 file_type 选表,再逐参数判定(不在该 (file_type, operation) 合法集里的键一律 EINVAL;
+        文件类型绑定判据(第 ⑥ 步)的专属文案在 officeParamErrMsg 里;properties.page 也在这一步被点名) */
+  var scope = (OFFICE_SCOPE[ft] || {})[op];
+  if (!scope) {
+    return wsErr("EINVAL", "file_type=" + ft + " 不支持 operation:" + op + "(该类型支持 " + officeOpList(ft).join(" / ") + ")");
+  }
+  var allow = { operation: 1, path: 1, file_type: 1 };
+  for (i = 0; i < scope.need.length; i++) allow[scope.need[i]] = 1;
+  for (i = 0; i < scope.opt.length; i++) allow[scope.opt[i]] = 1;
+  for (k in a) {
+    if (!officeOwn(a, k) || a[k] === undefined) continue;
+    if (!allow[k]) return wsErr("EINVAL", officeParamErrMsg(ft, op, k));
+  }
+  /* ④ 必填缺失(值域在 ⑤,这里只判"有没有") */
+  for (i = 0; i < scope.need.length; i++) {
+    if (a[scope.need[i]] == null) {
+      return wsErr("EINVAL", "缺少必填参数 `" + scope.need[i] + "`(operation=" + op + ", file_type=" + ft + ")");
+    }
+  }
+  if (op === "append" && a.content_append == null && a.paragraphs == null) {
+    return wsErr("EINVAL", "append 需要 content_append 或 paragraphs 之一(至少给一个)");
+  }
+  if (op === "set_header_footer") {
+    var cnt = (ft === "docx")
+      ? ((a.header != null ? 1 : 0) + (a.footer != null ? 1 : 0))
+      : ((a.footer != null ? 1 : 0) + (a.slide_number != null ? 1 : 0));
+    if (!cnt) {
+      return wsErr("EINVAL", "set_header_footer 至少要给一个:"
+        + (ft === "docx" ? "header 或 footer" : "footer 或 slide_number"));
+    }
+  }
+  /* ⑤ 值域 + ⑥ 文件类型绑定(已在 ③ 的文案里)、⑦ 交叉一致性(table / chart 的嵌套判据) */
+  return officeSpecCheckValues(a, op);
+}
+/* create 的「不覆盖已存在的文件」(门 6 / A5 的 EEXIST):先查一次(快速失败、不白跑一次生成),
+   真写盘时再用 wsWriteBlob 的 mode:"create" 兜一次(同一事务内判存在 ⇒ 原子) */
+function officeTargetCheck(wsId, path, isCreate) {
+  if (!isCreate) return Promise.resolve(null);
+  return wsStat(wsId, path).then(function (st) {
+    if (wsIsErr(st)) return (st.code === "ENOENT") ? null : st;   /* 不存在 = create 的正常路径 */
+    if (st.type === "dir") return wsErr("EISDIR", "「" + path + "」是目录,不是文档", path);
+    return wsErr("EEXIST", "文件已存在(create 不会覆盖):" + path
+      + " —— 要替换请先换个文件名,或用 FileOps 删除后再建", path);
+  });
+}
+/* add_image 的第二份工作区文件(方案 §2.6 / N3):后缀白名单 ⇒ 存在性 ⇒ 单张大小,
+   并把图片字节一并交给载荷层(批 H 的接线:spec.images = [{bytes, path}])。
+   注意分工:这里只按**扩展名**放行(第一道门),魔数双判与单次张数 / 总量上限
+   在 window.OfficeWrite 的 normImagesOf 里做(唯一权威 = 方案 §14.2) */
+function officeImageGuard(wsId, args, op) {
+  if (op !== "add_image") return Promise.resolve(null);
+  var p = args.image_path;
+  if (typeof p !== "string" || !p) return Promise.resolve(wsErr("EINVAL", "add_image 必须给 image_path(工作区里的图片路径)"));
+  var ext = wsSuffixOf(p);
+  if (OFFICE_IMG_EXT.indexOf(ext) < 0) {
+    return Promise.resolve(wsErr("ENOTSUP", "add_image 只收 png 与 jpg / jpeg 图片(「" + p + "」是 ." + ext
+      + ");要插别的格式请先用 ExecutePython 转换", p));
+  }
+  return wsReadBlob(wsId, p).then(function (r) {
+    if (wsIsErr(r)) return r;                       /* ENOENT / EISDIR 原样上抛 */
+    var max = officeImgMaxBytes();
+    if ((r.size || 0) > max) {
+      return wsErr("E2BIG", "图片「" + p + "」超过单张上限 " + fmtBytes(max) + "(本次 " + fmtBytes(r.size) + ")", p);
+    }
+    return wsBlobBuffer(r.blob).then(function (buf) {
+      return { ok: true, bytes: new Uint8Array(buf), path: p, size: r.size || 0 };
+    });
+  });
+}
+/* OfficeWrite.run 的 spec:inputSchema 的字段名与 OfficeWrite 的 spec 字段**同名**(snake_case)⇒ 透传;
+   只有三处要归一:operation(别名 op)+ file_type(内部名 fileType)+ properties(内部名 props) */
+function officeSpecOf(args, op, ft) {
+  var spec = {}, k;
+  for (k in args) { if (officeOwn(args, k)) spec[k] = args[k]; }
+  spec.op = op;
+  spec.operation = op;
+  spec.fileType = ft;
+  spec.file_type = ft;
+  spec.props = args.properties;
+  return spec;
+}
+/* 工具实现(签名同 wsToolRun 的 impl:(wsId, args, ctx) ⇒ Promise<Result>)
+   数据流(方案 §2.6):参数判据 → create 查存在性 / 编辑类读目标文件 → add_image 读图片 →
+   OfficeWrite.run → **成功且非只读**才 wsWriteBlob。
+   ★ P2-1(批次 B 审查):`outline` 是只读 op,OfficeWrite 返回 readOnly:true 且**不含 bytes**
+     ⇒ 这里按 readOnly 分支,**绝不**走写盘 —— 自保,免得将来字段变动(或误取 undefined)写坏工作区。 */
+function officeToolRun(wsId, args, ctx) {
+  var bad = officeSpecCheck(args);
+  if (bad) return Promise.resolve(bad);
+  var op = String(args.operation);
+  var isCreate = (op === "create");
+  var suf = wsSuffixOf(args.path);
+  var ft = (args.file_type == null) ? suf : String(args.file_type);
+  var spec = officeSpecOf(args, op, ft);
+  var srcSize = 0;
+  return officeTargetCheck(wsId, args.path, isCreate).then(function (t) {
+    if (wsIsErr(t)) return t;
+    if (isCreate) return null;                       /* create 没有输入文件 */
+    return wsReadBlob(wsId, args.path).then(function (r) {
+      if (wsIsErr(r)) return r;
+      if ((r.size || 0) > OFFICE_MAX_BYTES) {
+        return wsErr("E2BIG", "「" + r.path + "」超过本工具的单文件上限 " + fmtBytes(OFFICE_MAX_BYTES)
+          + "(本次 " + fmtBytes(r.size) + ") —— 请拆分内容或另存为更小的文档", r.path);
+      }
+      return wsBlobBuffer(r.blob).then(function (buf) {
+        return { ok: true, bytes: new Uint8Array(buf), size: r.size || 0 };
+      });
+    });
+  }).then(function (src) {
+    if (wsIsErr(src)) return src;
+    if (src && src.size) srcSize = src.size;
+    return officeImageGuard(wsId, args, op).then(function (ig) {
+      if (wsIsErr(ig)) return ig;
+      /* add_image:把图片字节交给载荷层(批 H 接线;**扩展名判据已在上一关**,
+         载荷层再按魔数双判 / 单张与单次上限复核 —— 方案 §14.2) */
+      if (ig && ig.ok && ig.bytes) { spec.images = [{ bytes: ig.bytes, path: ig.path }]; }
+      var input = (src && src.ok) ? { bytes: src.bytes } : null;
+      return window.OfficeWrite.run(input, spec, { signal: ctx && ctx.signal });
+    });
+  }).then(function (res) {
+    /* 错误码**原样带回**:EINVAL / EBADZIP / ENOTSUP / EOFFICE / EABORT / EINTERNAL / E2BIG
+       (E2BIG 由 zipPrescan 产生,是本工具的合法返回码 —— 见方案 §2.3 与 §2.7) */
+    if (!res || res.ok !== true) {
+      var code = (res && res.code) || "EOFFICE";
+      var msg = (res && res.error) || "Office 写入没有完成";
+      return wsErr(code, msg + "(工具 Office,operation=" + op + ")", args.path);
+    }
+    if (res.readOnly === true) {
+      /* 只读 op(当前只有 outline):size 报**源文件字节数** —— OfficeWrite 对只读 op 给的 size=0
+         是「没有产出字节」的意思,直接透传给模型会被读成"文件是空的" */
+      return {
+        ok: true,
+        text: JSON.stringify({
+          path: args.path, file_type: ft, operation: op, readOnly: true, size: srcSize,
+          outline: res.outline, counts: res.counts || {}, warnings: res.warnings || []
+        })
+      };
+    }
+    var bytes = res.bytes;
+    if (!bytes || typeof bytes.length !== "number") {
+      /* 自保:成功体没给字节就**不写**(宁可报错,也不拿 undefined 去覆盖工作区文件) */
+      return wsErr("EOFFICE", "写入核心没有返回字节,本次没有改动工作区(工具 Office,operation=" + op + ")", args.path);
+    }
+    var mime = res.mime || "";
+    return wsWriteBlob(wsId, args.path, new Blob([bytes], { type: mime }),
+      { mode: isCreate ? "create" : "overwrite", mime: mime }).then(function (w) {
+      if (wsIsErr(w)) return w;                      /* ENOSPC 等配额 / 存在性错误原样带回 */
+      return {
+        ok: true,
+        text: JSON.stringify({
+          path: w.path, file_type: ft, operation: op,
+          size: w.size, sizeDelta: w.size - srcSize,
+          counts: res.counts || {}, warnings: res.warnings || []
+        })
+      };
+    });
+  });
+}
+
+/* ---- 单文件下载(内核,UI-free) ----
    同构于 appA 的 download():createObjectURL + a[download],4s 后 revoke;
-   降级链 a[download] → window.open(blobURL) → 提示改用「导出工作区」(zip) */
+   降级链 a[download] → window.open(blobURL) → ENOTSUP 如实文案 */
 function wsSafeFileName(name) {
   var n = String(name == null ? "" : name).replace(/[\\/:*?"<>|]+/g, "_").replace(/[\u0000-\u001f\u007f]/g, "").trim();
   n = n.replace(/^\.+/, "");
@@ -4501,7 +5652,10 @@ function wsFileDownload(wsId, path) {
     if (wsIsErr(r)) return r;
     var name = wsSafeFileName(r.name || wsPathName(path));
     if (!CAP.objectUrl) {
-      return wsErr("ENOTSUP", "当前浏览器不允许直接下载,请改用「下载整箱(zip)」");
+      /* 这条出路上不能再写「改用整箱 zip」——整箱同样依赖 URL.createObjectURL(既有误导债,[E8] 顺手修) */
+      return wsErr("ENOTSUP",
+        "当前浏览器不支持本地文件下载(缺少 `URL.createObjectURL` 能力),无法把文件交付到本机;" +
+        "要备份应用数据可在 设置 → 数据 里用『导出备份』试试——它走 data URL 兜底,但浏览器连 `a[download]` 也不允许时同样会失败");
     }
     if (!CAP.download) {
       /* 降级:a[download] 不可用时改在新标签页打开 blob URL(带 4s revoke) */
@@ -4514,7 +5668,7 @@ function wsFileDownload(wsId, path) {
       } catch (e) {
         if (u0) { try { URL.revokeObjectURL(u0); } catch (e2) {} }
       }
-      return wsErr("ENOTSUP", "当前浏览器不允许直接下载,请改用「下载整箱(zip)」");
+      return wsErr("ENOTSUP", "浏览器阻止了本次下载(既不能直接下载,也无法在新标签页打开),请检查浏览器的下载权限");
     }
     var url = null;
     try {
@@ -4528,6 +5682,46 @@ function wsFileDownload(wsId, path) {
       if (url) { try { URL.revokeObjectURL(url); } catch (e2) {} }
       return wsErr("EIO", "下载失败:" + wsMsg(e));
     }
+  });
+}
+
+/* ---- DownloadForUser 的工具侧适配器(内核 = appD 的 wsDownloadPath) ----
+   成功 ⇒ {ok,text}(结果 JSON 见方案 §2.3);wsErr ⇒ 原样返回(wsToolRun 拼「(错误码 X)」);
+   {ok:false,aborted:true}(无 code)⇒ 原样透传,toolRun 结算为 aborted 卡片 */
+function wsDownloadTool(wsId, args, ctx) {
+  var path = String((args && args.path) || "");
+  if (!path) return Promise.resolve(wsErr("EINVAL", "path 必填(工作区绝对路径,以 / 开头)"));
+  var msg = (ctx && ctx.msg) || null;
+  var last = 0;
+  function clearProg() { if (msg) delete msg.progressText; }
+  function onProg(done, total) {
+    if (!msg) return;
+    /* 节流 ≥250 ms(首个 0/N 与最后一个 N/N 一定写):大目录要给"还活着"的反馈,
+       但重绘一张工具卡不便宜,逐条目重绘会把打包本身拖慢 */
+    var now = Date.now();
+    if (now - last < 250 && done < total) return;
+    last = now;
+    msg.progressText = "正在打包 " + done + " / " + total;
+    if (typeof redrawToolCard === "function") redrawToolCard(msg);
+  }
+  return wsDownloadPath(wsId, path, {
+    signal: ctx && ctx.signal,
+    deadline: Date.now() + toolLimit("timeoutMs"),
+    onProg: onProg
+  }).then(function (r) {
+    clearProg();                                   /* 成功 / 失败 / 中止三条路都清空 */
+    if (r && r.aborted) return r;
+    if (wsIsErr(r)) return r;
+    return {
+      ok: true,
+      text: JSON.stringify({
+        path: r.path, type: r.kind, name: r.name, bytes: r.bytes, files: r.files,
+        zipBytes: r.zipBytes, mode: r.mode
+      })
+    };
+  }, function (e) {
+    clearProg();
+    return wsErr("EIO", "下载异常:" + wsMsg(e));
   });
 }
 
@@ -5258,7 +6452,7 @@ var PY_IDLE_TICK = 30 * 1000;
 /* Python 工具族的门控名单(6 名):activeTools() 按 name 判定,
    未就绪时整套一起隐藏。6 名全部登记为真实工具 */
 var PY_TOOL_NAMES = { ExecutePython: 1, TaskList: 1, TaskOutput: 1, TaskStop: 1, WaitFor: 1, PythonPackages: 1 };
-/* 工具面板「任务」分组的名单(文件 6 / 代码执行 2 / 任务 5)。
+/* 工具面板「任务」分组的名单(文件 7 / 代码执行 3 / 上下文 1 / 任务 5)。
    只用于分组渲染的推导,不新增任何工具定义字段 —— 门控仍然只看 PY_TOOL_NAMES。
    PythonPackages 归这里(它是"查解释器里的包",属任务/运行时侧,不是执行本身) */
 var PY_TASK_NAMES = { TaskList: 1, TaskOutput: 1, TaskStop: 1, WaitFor: 1, PythonPackages: 1 };
@@ -5280,7 +6474,8 @@ var PV_CARD_MS = 1000;                   /* 卡片任务行的 running 态重绘
    三段契约:
    · clipTailNote()     统一裁剪器(留尾 + 段首注记;cap 计入注记 ⇒ 结果长度严格 ≤ cap)
    · pySecFill()/pySecReserve()  水填充分配(初始份额只是上限;未用份额按 PY_SEC_ORDER 回填)
-   · RESULT_TAIL_TOOLS  ④ 层方向翻转白名单(只翻执行器族 6 名;其余工具逐字节保持留头行为)
+   · RESULT_TAIL_TOOLS  ④ 层方向翻转白名单(现为 8 名:原 7 名执行器/任务/压缩族 + Office;
+                         其余工具逐字节保持留头行为)
    ③ 层(traceback)与 ② 层(worker 单流 8KB)的常量值不变,只改方向。 */
 var PY_SEC_SHARE = { stdout: 0.40, stderr: 0.20, result: 0.25, tb: 0.15 };
 var PY_SEC_ORDER = ["result", "stdout", "stderr", "tb"];   /* 回填优先级:用户投诉面优先 */
@@ -5292,7 +6487,10 @@ var PY_LOAD_WINDOW_MS = 10 * 60 * 1000;  /* 装载窗口上限(默认值已定 =
                                             从 run 消息发出到 stage/exec 到达之间;到期即终止本次执行
                                             (文案"包装载超时",与脚本超时区分)。实施后校准只调这一处 */
 var PY_STAGE_THROTTLE_MS = 250;          /* 装载进度进 UI 的重绘节流(终态更新豁免,见 pyStageTick) */
-var RESULT_TAIL_TOOLS = { ExecutePython: 1, ExecuteJavaScript: 1, TaskList: 1, TaskOutput: 1, TaskStop: 1, WaitFor: 1, Compact: 1 };
+/* Office 也在这一族:它的结果正文是 {path,file_type,operation,size,sizeDelta,counts,warnings} 的
+   JSON(**warnings 在末尾**),被预算截断时必须留住 warnings —— 留尾正好保它;若改成留头,
+   长 outline 结果会把 warnings 切掉(方案 §3 S22 的"二选一"选了"进白名单") */
+var RESULT_TAIL_TOOLS = { ExecutePython: 1, ExecuteJavaScript: 1, TaskList: 1, TaskOutput: 1, TaskStop: 1, WaitFor: 1, Compact: 1, Office: 1 };
 
 /* 解压能力检测:DecompressionStream 与 JS 兜底二选一即可;两者都没有 → pyReady() 假 */
 var PY_INFLATE = { ds: false, js: false, init: false };
@@ -8880,7 +10078,19 @@ function pvRenderTaskSummary() {
    ============================================================================ */
 /* 全局单实例:同一时刻只允许一个压缩(Kimi: if (this._compacting) return false)。
    phase: idle | summarizing | applying;pending 仅工具路径用(defer=true) */
-var CX_RUN = { convId: null, ctrl: null, phase: "idle", source: "", startedAt: 0, pending: null, regen: false };
+var CX_RUN = { convId: null, ctrl: null, phase: "idle", source: "", startedAt: 0, pending: null, regen: false,
+  /* U-4 运行时态(全部不落盘):
+     statusNote = 状态行 / 运行卡 / 工具卡进度行 / 过程区的**唯一**来源(广播枢纽,禁止各写一份);
+     stages = 阶段流水({at,text},最多 8 条);stream = 流式草稿 tail(≤4000 字符,完整文本只在局部变量里);
+     noStream = 本次运行已回退非流式(连续 2 次流式失败置位;进入下一次运行时复位);
+     streamFails = 本次运行的连续流式失败计数;triggerReason = pct|reserve|overflow(只显示,不落盘);
+     runMsg = 工具路径那张真实工具卡的引用(供就地重绘;不往消息对象里写字段) */
+  statusNote: "", stages: [], stream: null, noStream: false, streamFails: 0,
+  triggerReason: "", runMsg: null };
+/* 运行外的一次性气泡态(按 convId):失败 / 取消 / 被新消息取代。只在本页内存,不落盘、不跨会话 */
+var CX_UI = {};
+/* 失败卡正文里的逐字句(正例 U4① 与"原文零改动"断言共用同一个出处) */
+var CX_FAIL_NOTE = "本次压缩没有改动任何消息，原文仍完整保留。";
 /* 每会话账本(内存,不持久化):
    lastAfter : 上次压缩后的估算用量(等价 Kimi lastCompactedTokenCount;按发起会话取,不做"切走即清")
    round     : 本 turn 内已自动压缩次数(上限 1,防环)
@@ -9484,6 +10694,21 @@ function cxRunActive() { return CX_RUN.phase !== "idle"; }
    · 超时用 timeoutSignal(每次请求各计);用户取消由**运行级** signal(opts.signal,来自
      CX_RUN.ctrl 的整段压缩运行)桥进本次请求的局部 ctrl —— 本函数**不再**自设/自清 CX_RUN.ctrl
    · 返回 {ok, kind, note, text, model, ms, usage, finish}:失败只报 kind/note,不写任何状态 */
+/* 流式草稿只保尾部:完整文本只活在 cxCallSummary 的局部变量里 ⇒ 内存与 DOM 成本受控 */
+function cxTextTail(s, n) {
+  s = String(s == null ? "" : s);
+  return s.length > n ? s.slice(s.length - n) : s;
+}
+/* 失败 / 取消 / 被取代的**唯一**记录点:只写本页运行时态(CX_UI),不落盘、不碰数据 */
+function cxFailRecord(convId, code, kind, note, source, instruction, attempts) {
+  if (!convId) return;
+  CX_UI[convId] = {
+    convId: convId, kind: kind || "fail", code: String(code || ""), note: String(note || ""),
+    at: Date.now(), attempts: attempts || 0, source: source || "manual",
+    instruction: String(instruction == null ? "" : instruction).slice(0, 200), dismissed: false
+  };
+}
+
 async function cxCallSummary(c, list, opts) {
   opts = opts || {};
   var t0 = Date.now();
@@ -9491,9 +10716,13 @@ async function cxCallSummary(c, list, opts) {
   var proto = (s.protocol === "anthropic") ? "anthropic" : "openai";
   var model = effectiveModel().trim();
   var budget = Math.max(1, Math.round(Number(opts.budget) || CX_SUMMARY_OUT_MIN));
+  /* U-4:摘要请求可流式(阶段行 + 正文 token 级);res.ok 但非 SSE ⇒ 走整体 JSON 解析;
+     noStream 置位后本次运行剩余尝试一律非流式 */
+  var useStream = (opts.stream !== false) && !CX_RUN.noStream;
+  CX_RUN.stream = null;   /* 每次尝试开始先清空草稿:重试期间不展示上一次尝试的半截文本 */
   var body = buildBody(
     (list || []).concat([{ role: "user", content: cxSummaryPrompt(opts.instruction) }]),
-    model, false, c, { maxTokens: budget, summary: true });
+    model, useStream, c, { maxTokens: budget, summary: true });
   var signal = opts.signal || null;
   var to = timeoutSignal(CX_SUMMARY_TIMEOUT_MS);
   var ctrl = new AbortController();
@@ -9527,6 +10756,65 @@ async function cxCallSummary(c, list, opts) {
       var cls = cxClassifySummaryFailure(res.status, errText, "", "");
       return { ok: false, kind: cls.kind, note: cls.note, text: "", status: res.status, ms: Date.now() - t0 };
     }
+    var ctype = "";
+    try { ctype = String((res.headers && res.headers.get("content-type")) || ""); } catch (eCT) { ctype = ""; }
+    if (useStream && ctype.indexOf("text/event-stream") > -1 &&
+        res.body && typeof res.body.getReader === "function") {
+      /* 读法照抄聊天主链(createSSEParser + getReader)。**只有干净读完的完整文本**才会返回
+         ok:true —— 半截流在"取文本这一步"就被切断,下游(apply)拿不到它(R10) */
+      var acc = "", sFinish = "", sUsage = null, sModel = "", sErr = "";
+      var sp = createSSEParser(function (dataStr) {
+        if (dataStr === "[DONE]") return;
+        var j;
+        try { j = JSON.parse(dataStr); } catch (eJ) { return; }
+        if (j.error || j.type === "error") { sErr = ((j.error && j.error.message) || "服务端返回错误"); return; }
+        var add = "";
+        if (proto === "openai") {
+          var cch = (j.choices && j.choices[0]) || {};
+          var dl = cch.delta || {};
+          if (typeof dl.content === "string") add = dl.content;
+          else if (Array.isArray(dl.content)) {
+            for (var qi = 0; qi < dl.content.length; qi++) {
+              var qp = dl.content[qi];
+              if (qp && qp.type === "text" && qp.text) add += qp.text;
+            }
+          }
+          if (cch.finish_reason) sFinish = cch.finish_reason;
+          if (j.usage) sUsage = j.usage;
+          if (j.model) sModel = j.model;
+        } else {
+          if (j.type === "message_start" && j.message) { if (j.message.model) sModel = j.message.model; }
+          else if (j.type === "content_block_delta") {
+            var dd = j.delta || {};
+            if (dd.type === "text_delta" && dd.text) add = dd.text;
+          } else if (j.type === "message_delta") {
+            if (j.delta && j.delta.stop_reason) sFinish = j.delta.stop_reason;
+            if (j.usage) sUsage = j.usage;
+          }
+        }
+        if (add) {
+          acc += add;
+          CX_RUN.stream = { text: cxTextTail(acc, 4000), chars: acc.length, at: Date.now() };
+          if (typeof cxLivePaint === "function") cxLivePaint();
+        }
+      });
+      var srd = res.body.getReader(), sdec = new TextDecoder("utf-8");
+      while (true) {
+        var sr = await srd.read();
+        if (sr.done) break;
+        sp(sdec.decode(sr.value, { stream: true }));
+      }
+      sp(sdec.decode(), true);
+      if (sErr) throw new Error(sErr);
+      var stxt = String(acc || "").trim();
+      var scls = cxClassifySummaryFailure(200, "", sFinish, stxt);
+      if (scls.kind) {
+        CX_RUN.stream = null;
+        return { ok: false, kind: scls.kind, note: scls.note, text: stxt, finish: sFinish, ms: Date.now() - t0 };
+      }
+      return { ok: true, kind: "", note: "", text: stxt, model: sModel || model,
+               ms: Date.now() - t0, usage: sUsage, finish: sFinish };
+    }
     var jr = await res.json();
     var txt = "", finish = "";
     if (proto === "openai") {
@@ -9545,6 +10833,14 @@ async function cxCallSummary(c, list, opts) {
     return { ok: true, kind: "", note: "", text: txt, model: (jr && jr.model) || model,
              ms: Date.now() - t0, usage: (jr && jr.usage) || null, finish: finish };
   } catch (e) {
+    /* 任何异常路径都先丢草稿(R10:草稿残留必须在结构上不可能) */
+    CX_RUN.stream = null;
+    if (useStream) {
+      /* 流式失败与既有失败走同一条计数路径(attempts++ / 分类 / 缩窗 / 退避照旧);
+         连续 2 次流式失败 ⇒ 本次运行剩余尝试一律非流式 */
+      CX_RUN.streamFails = (CX_RUN.streamFails || 0) + 1;
+      if (CX_RUN.streamFails >= 2) CX_RUN.noStream = true;
+    }
     if (e && e.name === "AbortError") {
       if (to && to.signal && to.signal.aborted) {
         return { ok: false, kind: "timeout", ms: Date.now() - t0,
@@ -9554,7 +10850,7 @@ async function cxCallSummary(c, list, opts) {
     }
     /* 网络层错误(fetch 抛 TypeError 等)归可重试(Kimi 的 connection 类同义) */
     return { ok: false, kind: "http_retryable", ms: Date.now() - t0,
-             note: "网络错误:" + safeJson(errText(e), 120) };
+             note: (useStream ? "流式读取中断:" : "网络错误:") + safeJson(String((e && e.message) || e), 120) };
   } finally {
     if (to && to.abort) { try { to.abort(); } catch (e4) {} }
   }
@@ -9580,9 +10876,27 @@ async function cxSummaryWithLadder(c, opts) {
   function fail(kind, note) {
     return { ok: false, code: "ECOMPACT_FAIL", kind: kind || "", note: note || "", stats: mkStats() };
   }
+  var lastStage = "";
+  /* 阶段行:相邻同文去重、上限 8 条(超出丢最旧)—— 这就是"阶段行流式"的唯一来源 */
+  function cxStagePush(txt) {
+    if (!txt || txt === lastStage) return;
+    lastStage = txt;
+    if (!Array.isArray(CX_RUN.stages)) CX_RUN.stages = [];
+    CX_RUN.stages.push({ at: Date.now(), text: txt });
+    while (CX_RUN.stages.length > 8) CX_RUN.stages.shift();
+  }
   function statusTick() {
     var el = Math.round((Date.now() - (CX_RUN.startedAt || t0)) / 1000);
     setConn("busy", "正在压缩上下文…(" + statusNote + " / 已用 " + el + " 秒)");
+    /* 同一来源喂四处:状态行 / 运行中卡 / 工具卡进度行 / 过程区(广播枢纽,禁止各写一份) */
+    CX_RUN.statusNote = statusNote;
+    cxStagePush(statusNote);
+    /* 工具路径那张真实卡:进度行就地重绘(本 tick 的 1s 节拍即 ≥1s 节流),草稿仍不写进消息 */
+    if (CX_RUN.runMsg && typeof redrawToolCard === "function") {
+      CX_RUN.runMsg.progressText = cxRunProgressText();
+      redrawToolCard(CX_RUN.runMsg);
+      if (typeof cxLivePaint === "function") cxLivePaint(true);
+    } else if (typeof cxLivePaint === "function") cxLivePaint();
   }
   var payload = await cxSummaryPayload(c, mediaLevel);
   var list = payload.list;
@@ -9750,6 +11064,13 @@ async function cxApplyCompaction(convObj, plan, summary, meta) {
   }
   var fromId = c.messages[0] ? c.messages[0].id : "";
   var toId = c.messages[plan.split - 1] ? c.messages[plan.split - 1].id : "";
+  /* U-4 追加的三个可选字段:被丢弃区间的 createdAt 边界 + 本次压缩的自定义侧重。
+     非有限数 ⇒ 0(0 = 不可用,旧记录同款);instruction 落盘前 ≤200 字符 */
+  var fromAt = Number(c.messages[0] && c.messages[0].createdAt);
+  if (!isFinite(fromAt) || fromAt <= 0) fromAt = 0;
+  var toAt = Number(c.messages[plan.split - 1] && c.messages[plan.split - 1].createdAt);
+  if (!isFinite(toAt) || toAt <= 0) toAt = 0;
+  var insText = (meta && typeof meta.instruction === "string") ? meta.instruction.slice(0, 200) : "";
   /* ③ 移除(只收集 + splice;不释放、不 await) */
   var r = cxDropMessages(c, 0, plan.split - 1);
   /* ④ 重插(同步、零 await):[head][elision?][tail][summary] —— 摘要置尾。
@@ -9781,7 +11102,8 @@ async function cxApplyCompaction(convObj, plan, summary, meta) {
     before: before, after: after, released: rel.todo.length, freedBytes: rel.freed,
     model: summary.model || "", ms: (st.ms || summary.ms || 0),
     attempts: st.attempts || 0, shrinks: st.shrinks || 0, inputDropped: st.inputDropped || 0,
-    inputShrunk: st.inputShrunk ? 1 : 0, mediaLevel: st.mediaLevel || 0
+    inputShrunk: st.inputShrunk ? 1 : 0, mediaLevel: st.mediaLevel || 0,
+    fromAt: fromAt, toAt: toAt, instruction: insText
   };
   c.compactMeta = stats;
   summaryMsg.compactMeta = {
@@ -9789,7 +11111,8 @@ async function cxApplyCompaction(convObj, plan, summary, meta) {
     before: stats.before, after: stats.after, released: stats.released, freedBytes: stats.freedBytes,
     model: stats.model, ms: stats.ms, from: fromId, to: toId,
     attempts: stats.attempts, shrinks: stats.shrinks, inputDropped: stats.inputDropped,
-    inputShrunk: stats.inputShrunk, mediaLevel: stats.mediaLevel
+    inputShrunk: stats.inputShrunk, mediaLevel: stats.mediaLevel,
+    fromAt: stats.fromAt, toAt: stats.toAt, instruction: stats.instruction
   };
   c.updatedAt = now;
   saveState(true);
@@ -9832,7 +11155,16 @@ async function cxCompactNow(convObj, opts) {
       opts.signal.addEventListener("abort", function () { try { runCtrl.abort(); } catch (eB1) {} });
     }
   }
+  /* U-4:过程区 / 运行卡的运行时态初始化(全部不落盘;每次运行独立复位 ⇒ "本次运行内生效") */
+  CX_RUN.statusNote = "";
+  CX_RUN.stages = [];
+  CX_RUN.stream = null;
+  CX_RUN.noStream = false;
+  CX_RUN.streamFails = 0;
+  CX_RUN.triggerReason = (opts && opts.triggerReason) || "";
+  CX_RUN.runMsg = (opts && opts.runMsg) || null;
   setConn("busy", "正在压缩上下文…");
+  if (conv && conv.id === c.id && typeof renderChat === "function") renderChat();
   var prefix = cxPrefixSnapshot(c, plan.split);
   var hash = cxHistoryHash(c);
   try {
@@ -9847,6 +11179,8 @@ async function cxCompactNow(convObj, opts) {
               note: "压缩流程异常:" + safeJson(String((eL && eL.message) || eL), 120) };
     }
     if (!lad || !lad.ok) {
+      cxFailRecord(c.id, (lad && lad.code) || "ECOMPACT_FAIL", (lad && lad.kind) || "",
+        (lad && lad.note) || "", source, opts.instruction, (lad && lad.stats && lad.stats.attempts) || 0);
       return { ok: false, code: (lad && lad.code) || "ECOMPACT_FAIL", kind: (lad && lad.kind) || "",
                note: (lad && lad.note) || "", error: (lad && lad.note) || "摘要生成失败" };
     }
@@ -9861,13 +11195,23 @@ async function cxCompactNow(convObj, opts) {
     }
     var applied = await cxApplyCompaction(c, plan, sum, { source: source, expectHash: hash, prefix: prefix });
     applied.stats = sum.stats || lad.stats || null;   /* 界面读数:缩窗 / 尝试次数如实上报(§3.9) */
+    /* 成功率真源:只有 apply 真的成功才清失败卡;失败/漂移一律登记(原文零改动) */
+    if (!applied || !applied.ok) {
+      cxFailRecord(c.id, (applied && applied.code) || "ECOMPACT_DRIFT", "drift",
+        "应用前会话已变动,本次压缩未生效", source, opts.instruction, (sum.stats && sum.stats.attempts) || 0);
+    } else delete CX_UI[c.id];
     return applied;
   } finally {
+    /* 草稿的**唯一**清空落点(R10):成功 / 失败 / 取消 / 超时四条路径都经这里 */
+    CX_RUN.stream = null;
+    CX_RUN.runMsg = null;
     CX_RUN.ctrl = null;
     CX_RUN.phase = "idle";
     CX_RUN.convId = null;
     CX_RUN.source = "";
+    CX_RUN.triggerReason = "";
     if (!generating) setConn("ok", "已连接");
+    if (conv && conv.id === c.id && typeof renderChat === "function") renderChat();
   }
 }
 /* 工具路径的应用点(唯一):pending 不存在或不属于该会话 ⇒ null。
@@ -9879,14 +11223,25 @@ async function cxApplyPending(c) {
   if (c && c.id && p.convId !== c.id) return null;
   var target = getConv(p.convId);
   CX_RUN.pending = null;
-  if (!target) return { ok: false, code: "ECOMPACT_DRIFT" };
+  if (!target) {
+    cxFailRecord(p.convId, "ECOMPACT_DRIFT", "drift", "会话已被删除,本次压缩未生效", "tool",
+      (p.meta && p.meta.instruction) || "", 0);
+    if (conv && conv.id === p.convId) renderChat();
+    return { ok: false, code: "ECOMPACT_DRIFT" };
+  }
   var meta = {
     source: (p.meta && p.meta.source) || "tool",
     instruction: (p.meta && p.meta.instruction) || "",
     expectHash: p.hash, prefix: p.prefix
   };
   /* 应用成功且是该会话时的重绘在 cxApplyCompaction 的 ⑤ 里已经做过(不重复绘) */
-  return await cxApplyCompaction(target, p.plan, p.summary, meta);
+  var ap = await cxApplyCompaction(target, p.plan, p.summary, meta);
+  if (!ap || !ap.ok) {
+    cxFailRecord(p.convId, (ap && ap.code) || "ECOMPACT_DRIFT", "drift",
+      "应用前会话已变动,本次压缩未生效", "tool", meta.instruction, 0);
+    if (conv && conv.id === p.convId) renderChat();
+  } else delete CX_UI[p.convId];
+  return ap;
 }
 /* ---- 溢出恢复 ---- */
 function cxIsOverflowError(err) {
@@ -9898,9 +11253,12 @@ function cxIsOverflowError(err) {
 async function cxOverflowRecover(c) {
   if (!c) return false;
   var L = cxLedger(c.id);
-  if ((L.round || 0) >= 1) return false;      /* 本 turn 内最多恢复 1 次 */
+  /* 本 turn 内最多恢复 CX_OVERFLOW_PER_TURN_MAX 次(U-4 借鉴-1;计数在 sendMessage 里随 round 一起复位)。
+     round 语义收窄为"本 turn 自动路径已压次数"的读数,不再当闸用(溢出路径**没有** lastAfter 去重闸) */
+  if ((L.ovfCount || 0) >= CX_OVERFLOW_PER_TURN_MAX) return false;
+  L.ovfCount = (L.ovfCount || 0) + 1;
   L.round = (L.round || 0) + 1;
-  var r = await cxCompactNow(c, { source: "auto", mode: "auto" });
+  var r = await cxCompactNow(c, { source: "auto", mode: "auto", triggerReason: "overflow" });
   if (r && r.ok) {
     L.lastAfter = ctxSnapshot(c).used;
     toast("上下文超出模型窗口,已自动压缩一次并重试本轮请求", "warn", 6000);
@@ -9923,7 +11281,8 @@ async function cxCompactTool(args, ctx) {
   }
   var r = await cxCompactNow(c, {
     source: "tool", mode: "manual",
-    instruction: args && args.instruction, defer: true
+    instruction: args && args.instruction, defer: true,
+    runMsg: (ctx && ctx.msg) ? ctx.msg : null
   });
   if (!r.ok) {
     if (r.code === "ECOMPACT_BUSY") return { ok: false, error: cxCodeText(r.code), logs: [], ms: Date.now() - t0 };
@@ -9936,8 +11295,8 @@ async function cxCompactTool(args, ctx) {
       "其中 " + (p.droppedBlobs || 0) + " 个附件键会按共享引用重算后释放(仍被别的消息/会话引用的会保留)",
     "- 摘要模型:" + ((r.summary && r.summary.model) || effectiveModel().trim() || "—") +
       " · 摘要耗时 " + Math.round(((r.summary && r.summary.ms) || 0) / 1000) + "s",
-    "- 生效后:较早的消息与其附件被彻底删除(聊天里的气泡会消失,不可回看);" +
-      "工作区文件与后台任务不受影响",
+    "- 摘要已生成为一个「压缩上下文」工具气泡(在对话记录里可展开查看);生效后较早的消息与其附件被彻底删除" +
+      "(聊天里的气泡会消失,不可回看);工作区文件与后台任务不受影响",
     "- 若这期间会话被改动(用户编辑 / 清空 / 你后来又发了别的工具),本次压缩会被放弃 —— 不报错,如实说明即可",
     "- 本轮你可以继续用其它工具;它们的结果会照常进入上下文"
   ];
@@ -9965,6 +11324,7 @@ async function cxCompactUIApply(convId, instruction) {
   var msg = "将丢弃 " + plan.dropped + " 条较早的消息(约 " + num(plan.droppedTokens) + " tok / " +
     fmtCtxNum(plan.before) + " → " + fmtCtxNum(plan.after) + " tok 估算);" +
     "其中 " + plan.droppedBlobs + " 个附件(约 " + fmtBytes(plan.freedBytes) + ")会在核对共享引用后立即释放。" +
+    "摘要会生成为一个「压缩上下文」工具气泡(在对话记录里,可展开查看),位置就在这次压缩发生的地方。" +
     "此操作不可撤销(被丢弃的消息气泡会消失,系统提示词 / 工作区文件 / 后台任务不受影响),建议先「导出全部(JSON)」备份。";
   /* 与「携带历史条数上限」叠加时的提醒(§9.1):不改 ctxMsgs 语义,只如实说明会叠加生效 */
   if (state.settings.ctxMsgs > 0) {
@@ -9988,13 +11348,16 @@ async function cxCompactUIApply(convId, instruction) {
             ? ";本次摘要是在缩窗输入下生成的:最早的 " + stt.inputDropped + " 条未进摘要"
             : ";本次摘要中部分图片已降级省略";
         }
-        toast("已压缩:丢弃 " + r.dropped + " 条消息" + (r.released ? "、释放 " + r.released + " 个附件" : "") +
+        toast("摘要已生成:丢弃 " + r.dropped + " 条消息" + (r.released ? "、释放 " + r.released + " 个附件" : "") +
           ",约 " + num(r.before) + " → " + num(r.after) + " tok" +
-          (Number(r.after) > Number(r.before) ? "（本次摘要比被丢弃内容更长，属正常）" : "") + extra, "success", 5600);
+          (Number(r.after) > Number(r.before) ? "（本次摘要比被丢弃内容更长，属正常）" : "") + extra +
+          ";摘要作为工具气泡留在对话记录里(在原位置,可展开查看)", "success", 5600);
+        if (typeof scrollToBottom === "function") scrollToBottom();
         return;
       }
       var code = (r && r.code) || "ECOMPACT_FAIL";
-      toast("压缩未执行:" + cxCodeText(code, code === "ECOMPACT_NOSPACE", r && r.note), "warn", 6200);
+      toast("压缩未执行:" + cxCodeText(code, code === "ECOMPACT_NOSPACE", r && r.note) +
+        "(原文未改动,详见对话末尾的失败卡)", "warn", 6200);
     });
   });
 }
@@ -10002,14 +11365,24 @@ async function cxCompactUIApply(convId, instruction) {
 /* Ctrl+X / 停止生成时中止进行中的压缩(**不读模块级 abortCtrl**:发送前窗口里它是 null);
    待应用的压缩(pending)一并作废 —— 用户在压缩准备期间按了停止,就不该再改数据 */
 function cxAbortActive(reason) {
+  /* 用户主动中止(取消按钮 / Ctrl+X / 发送冲突)才记失败卡:无压缩在跑时不记 */
+  var rec = CX_RUN.convId;
+  var src = CX_RUN.source || "manual";
+  var live = (CX_RUN.phase !== "idle");
   if (CX_RUN.ctrl) { try { CX_RUN.ctrl.abort(); } catch (e) {} }
   CX_RUN.pending = null;
+  CX_RUN.stream = null;      /* 草稿即时消失(U5:不得残留半截摘要) */
+  if (live && rec) {
+    cxFailRecord(rec, "ECOMPACT_ABORT", "abort", String(reason || "已取消"), src, "", 0);
+    if (conv && conv.id === rec) renderChat();
+  }
 }
 /* 精确清一条(deleteConvNow / wipeAllNow 用)。**不得**挂 selectConv:
    那会打掉 lastAfter 去重 —— 切走再切回同一水位就会重复压一次,白花一次摘要请求 */
 function cxForgetConv(convId) {
   if (!convId) return;
   delete CX_LEDGER[convId];
+  delete CX_UI[convId];
   if (CX_RUN.pending && CX_RUN.pending.convId === convId) CX_RUN.pending = null;
 }
 /* 账本收敛:只清「会话已不存在」的条目(与 pvAutoLoopPurge 同源语义);挂 selectConv */
@@ -10020,7 +11393,7 @@ function cxPurgeLedger() {
   }
   for (k in CX_LEDGER) {
     if (!Object.prototype.hasOwnProperty.call(CX_LEDGER, k)) continue;
-    if (!alive[k]) delete CX_LEDGER[k];
+    if (!alive[k]) { delete CX_LEDGER[k]; delete CX_UI[k]; }
   }
   if (CX_RUN.pending && !getConv(CX_RUN.pending.convId)) CX_RUN.pending = null;
 }

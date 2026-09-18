@@ -424,7 +424,7 @@ function makeGroupEl(list) {
 
   var avatar = document.createElement("div");
   avatar.className = "avatar assistant" + (streaming ? " thinking" : "");
-  avatar.innerHTML = icon("robot");
+  avatar.innerHTML = icon("cat");
   wrap.appendChild(avatar);
 
   var body = document.createElement("div");
@@ -472,6 +472,222 @@ function makeToolSlot(m) {
   renderToolCard(slot, m);
   return slot;
 }
+/* ===========================================================================
+   U-4 · 压缩「工具气泡」渲染族(opt-in:只有 m.cxCard === true 的合成消息走这一族)
+   位置契约:完成卡 = 摘要消息在**原数组位置**上的渲染(不迁位 / 不置顶 / 不复制到顶部);
+   运行中卡与失败卡 = renderChat 在消息循环**之后**追加的运行时尾巴(不是 conv.messages 成员)。
+   安全契约:摘要正文来自模型(不可信) ⇒ 一律 streamMarkdown + enhanceBlocks(DOMPurify 在内);
+   chips / 状态 / 耗时等动态文本一律 textContent。
+   =========================================================================== */
+/* 摘要正文:剥掉 cxApplyCompaction 写入的三个已知包裹(找不到标记就保留原样,不做脆弱切片) */
+function cxSummaryBody(text) {
+  var s = String(text == null ? "" : text);
+  var marks = [CX_SUMMARY_PREFIX, CX_RECOVERY_FOOTER, CX_CONTINUATION_NOTE];
+  for (var i = 0; i < marks.length; i++) {
+    if (!marks[i]) continue;
+    s = s.split(marks[i]).join("");
+  }
+  return s.trim();
+}
+function cxChipsOf(m) {
+  var meta = m.compactMeta || {};
+  var out = [];
+  if (meta.dropped) out.push("丢弃 " + num(meta.dropped) + " 条");
+  if (meta.before || meta.after) out.push("≈" + fmtCtxNum(meta.before) + " → " + fmtCtxNum(meta.after) + " tok");
+  if (meta.released) out.push("释放 " + num(meta.released) + " 个附件" + (meta.freedBytes ? " · " + fmtBytes(meta.freedBytes) : ""));
+  if (meta.inputShrunk === 1) {
+    out.push(Number(meta.inputDropped) > 0
+      ? "摘要输入曾缩窗(丢 " + num(meta.inputDropped) + " 条)"
+      : "摘要输入曾缩窗(图片降级,未丢消息)");
+  }
+  if (Number(meta.attempts) > 1) out.push("尝试 " + num(meta.attempts) + " 次");
+  out.push(meta.source === "auto" ? "自动" : (meta.source === "tool" ? "模型调用" : "手动"));
+  if (meta.at) out.push(fmtTime(meta.at));
+  return out;
+}
+/* 参数区:只从 compactMeta 派生;缺字段(旧记录)⇒ 整键省略,不补默认值、不报错 */
+function cxArgsOf(m) {
+  var meta = m.compactMeta || {};
+  var o = {};
+  o["丢弃"] = num(meta.dropped || 0) + " 条(" + num(meta.droppedTokens || 0) + " tok)";
+  if (Number(meta.fromAt) > 0 && Number(meta.toAt) > 0) {
+    o["时间范围"] = fmtTime(meta.fromAt) + " → " + fmtTime(meta.toAt);
+  }
+  o["附件释放"] = num(meta.released || 0) + " 个" + (meta.freedBytes ? "(" + fmtBytes(meta.freedBytes) + ")" : "");
+  o["保留"] = fmtCtxNum(meta.after) + " tok(压缩前 " + fmtCtxNum(meta.before) + " tok)";
+  if (meta.instruction) o["侧重"] = String(meta.instruction);
+  o["来源"] = (meta.source === "auto" ? "自动" : (meta.source === "tool" ? "模型调用" : "手动"));
+  return o;
+}
+/* 摘要消息 → 合成工具消息。id **必须** = 摘要消息 id:头部折叠键的取值走 findMsg 命中真实消息,
+   再由 redrawToolCard 的 compact === "summary" 分流重绘;另造 id 会让点击静默 no-op */
+function cxSummaryMsgOf(m) {
+  var meta = m.compactMeta || {};
+  var body = cxSummaryBody(m.content);
+  var args = cxArgsOf(m);
+  return {
+    id: m.id, role: "tool", toolName: "Compact", status: "ok",
+    args: args, argsText: JSON.stringify(args, null, 2),
+    content: body, resultText: "",
+    toolOpen: !!m.toolOpen,
+    cxCard: true, resultMd: true,
+    cxChips: cxChipsOf(m),
+    cxSummary: "摘要正文 " + num(body.length) + " 字" + (meta.model ? " · " + meta.model : ""),
+    resultNote: "以上是本次压缩生成的摘要正文,它替换了被丢弃的较早消息。",
+    cxOps: [{ act: "copy-md", label: "复制摘要 Markdown" }]
+  };
+}
+/* 完成卡壳:div.msg.cx-sum.cx-card —— 宿主即壳自身(renderToolCard 先清空宿主 ⇒ 重绘幂等) */
+function makeCxCardEl(m) {
+  var el = document.createElement("div");
+  el.className = "msg cx-sum cx-card";
+  el.setAttribute("data-id", m.id);
+  el.setAttribute("data-msg-last", m.id);
+  renderToolCard(el, cxSummaryMsgOf(m));
+  return el;
+}
+/* 运行中卡:来源 + 触发原因(触发原因只显示、不落盘) */
+function cxRunChips() {
+  var out = ["运行中"];
+  var tr = CX_RUN.triggerReason;
+  if (tr === "reserve") out.push("预留");
+  else if (tr === "overflow") out.push("溢出恢复");
+  else if (tr === "pct") out.push("阈值");
+  out.push(CX_RUN.source === "tool" ? "模型调用" : (CX_RUN.source === "auto" ? "自动" : "手动"));
+  return out;
+}
+/* 进度行:唯一来源 = CX_RUN.statusNote(广播枢纽) + 草稿累计字符数 */
+function cxRunProgressText() {
+  var st = CX_RUN.stream || null;
+  return "正在压缩上下文…" + (CX_RUN.statusNote ? "(" + CX_RUN.statusNote + ")" : "") +
+    (st ? " · 已生成 " + num(st.chars) + " 字符" : "");
+}
+function cxRunArgsOf() {
+  var tr = CX_RUN.triggerReason;
+  return {
+    "来源": CX_RUN.source === "tool" ? "模型调用" : (CX_RUN.source === "auto" ? "自动" : "手动"),
+    "触发原因": tr === "pct" ? "阈值触发" : (tr === "reserve" ? "预留触发" : (tr === "overflow" ? "溢出恢复" : "手动发起"))
+  };
+}
+function makeCxLiveEl() {
+  var el = document.createElement("div");
+  el.className = "msg cx-run cx-card";
+  el.setAttribute("data-cx-run", "");
+  var args = cxRunArgsOf();
+  renderToolCard(el, {
+    id: "cx-run", role: "tool", toolName: "Compact", status: "running",
+    args: args, argsText: JSON.stringify(args, null, 2), content: "", resultText: "",
+    cxCard: true, cxLive: true, cxNoToggle: true, toolOpen: true,
+    progressText: cxRunProgressText(),
+    cxChips: cxRunChips(),
+    cxOps: [{ act: "cancel", label: "取消压缩" }]
+  });
+  /* 首绘不在这里:本函数返回的壳还没被 renderChat 挂进 #chat-inner,
+     此刻 cxLivePaint 查不到宿主(首绘会被丢弃) ⇒ 由 renderChat 在 appendChild 之后补一次 */
+  return el;
+}
+/* 过程区就地重绘(节流 ≤250ms):阶段行列表 + 草稿 tail + 已用秒。
+   内容**只从 CX_RUN 读** —— 不造第二份状态,草稿绝不写进消息对象。
+   读屏:阶段行/草稿全部 aria-hidden,只有宿主外那个 .sr-only[aria-live=polite] 播报阶段变化 */
+var CX_PAINT_AT = 0;
+function cxLivePaint(force) {
+  var hosts = elChatInner.querySelectorAll("[data-cx-live]");
+  if (!hosts.length) return;
+  var now = Date.now();
+  if (!force && now - CX_PAINT_AT < 250) return;
+  CX_PAINT_AT = now;
+  var st = CX_RUN.stream || null;
+  var secs = Math.round((now - (CX_RUN.startedAt || now)) / 1000);
+  var list = CX_RUN.stages || [];
+  /* 播报文本只在阶段/尝试次数变化时改写 —— 每秒重新赋值会把读屏刷屏 */
+  var note = "正在压缩上下文" + (CX_RUN.statusNote ? "(" + CX_RUN.statusNote + ")" : "");
+  for (var i = 0; i < hosts.length; i++) {
+    var h = hosts[i];
+    var pa = h.parentNode;
+    var ann = pa ? pa.querySelector(".cx-ann") : null;
+    if (!ann && pa) {
+      ann = document.createElement("div");
+      ann.className = "sr-only cx-ann";
+      ann.setAttribute("aria-live", "polite");
+      pa.insertBefore(ann, h);
+    }
+    if (ann && ann.textContent !== note) ann.textContent = note;
+    while (h.firstChild) h.removeChild(h.firstChild);
+    for (var j = 0; j < list.length; j++) {
+      var ln = document.createElement("div");
+      ln.className = "cx-stage";
+      ln.setAttribute("aria-hidden", "true");
+      ln.textContent = String((list[j] && list[j].text) || "");
+      h.appendChild(ln);
+    }
+    var dr = document.createElement("div");
+    dr.className = "cx-stream";
+    dr.setAttribute("aria-hidden", "true");
+    if (st && st.text) dr.textContent = st.text;
+    else dr.setAttribute("hidden", "");
+    h.appendChild(dr);
+    /* 滚到底(P4)必须落在 appendChild **之后**:元素不在文档里时 scrollTop 无布局可依、写入被丢弃 */
+    if (st && st.text) dr.scrollTop = dr.scrollHeight;
+    var tm = document.createElement("div");
+    tm.className = "cx-elapsed";
+    tm.setAttribute("aria-hidden", "true");
+    tm.textContent = "已用 " + secs + " 秒" + (st ? " · 已生成 " + num(st.chars) + " 字符" : "");
+    h.appendChild(tm);
+  }
+}
+/* 失败 / 取消 / 被新消息取代卡:壳带 data-id="cx-fail-<convId>";正文逐字含 CX_FAIL_NOTE */
+function cxFailMsgOf(rec) {
+  rec = rec || {};
+  var aborted = (rec.kind === "abort");
+  var srcText = (rec.source === "tool") ? "模型调用" : (rec.source === "auto" ? "自动" : "手动");
+  var note;
+  if (aborted) note = "已取消(原文未改动)。" + CX_FAIL_NOTE;
+  else if (rec.kind === "cancelledBySend") note = "已被新消息取代,本次压缩没有应用。" + CX_FAIL_NOTE;
+  else note = (rec.note ? (String(rec.note) + "。") : "") + CX_FAIL_NOTE;
+  return {
+    id: "cx-fail", role: "tool", toolName: "Compact", status: aborted ? "aborted" : "error",
+    args: { "来源": srcText, "失败分类": String(rec.code || ""), "尝试次数": num(rec.attempts || 0) },
+    content: String(rec.note || ""), resultText: "",
+    cxCard: true, cxNoToggle: true, toolOpen: true,
+    cxChips: [aborted ? "已取消" : "失败", srcText],
+    cxSummary: String(rec.note || ""),
+    resultNote: note,
+    cxOps: [{ act: "retry", label: "重试压缩" }, { act: "dismiss", label: "知道了" }]
+  };
+}
+function makeCxFailEl(rec) {
+  var el = document.createElement("div");
+  el.className = "msg cx-fail cx-card";
+  el.setAttribute("data-id", "cx-fail-" + String((conv && conv.id) || ""));
+  renderToolCard(el, cxFailMsgOf(rec));
+  return el;
+}
+/* 压缩气泡操作行的唯一处理点(合成卡不在 conv.messages ⇒ 每条分支自带空值守卫) */
+function cxAct(act, btn) {
+  if (!conv) return;
+  if (act === "cancel") { cxAbortActive("用户点击取消压缩"); return; }
+  if (act === "dismiss") {
+    if (CX_UI[conv.id]) { CX_UI[conv.id].dismissed = true; renderChat(); }
+    return;
+  }
+  if (act === "copy" || act === "copy-md") {
+    var card = (btn && btn.closest) ? btn.closest(".msg") : null;
+    var mid = card ? String(card.getAttribute("data-id") || "") : "";
+    var m = mid ? findMsg(mid) : null;
+    if (m) { copyText(cxSummaryBody(m.content), "已复制摘要正文"); return; }
+    var dr = elChatInner.querySelector("[data-cx-live] .cx-stream");
+    if (dr && dr.textContent) copyText(dr.textContent, "已复制当前草稿");
+    return;
+  }
+  if (act === "retry") {
+    var ins = (CX_UI[conv.id] && CX_UI[conv.id].instruction) || "";
+    delete CX_UI[conv.id];
+    renderChat();
+    cxCompactNow(conv, { source: "manual", mode: "manual", instruction: ins });
+    return;
+  }
+}
+
 /* 压缩产物气泡(§5.2;conv.messages 里 compact:"summary"/"elision" 的条目):
    · 元素形态必须满足既有定位:class 带 `msg` + data-id ⇒ msgElementFor 的第三条选择器命中,
      查找栏 / 滚动定位 / redrawMessage 都不需要另走一套;
@@ -545,7 +761,7 @@ function makeMsgEl(msg, animate, toolMsgs) {
 
   var avatar = document.createElement("div");
   avatar.className = "avatar " + msg.role + (msg.streaming && msg.role === "assistant" ? " thinking" : "");
-  avatar.innerHTML = icon(msg.role === "user" ? "user" : (msg.role === "tool" ? "terminal" : "robot"));
+  avatar.innerHTML = icon(msg.role === "user" ? "user" : (msg.role === "tool" ? "terminal" : "cat"));
   wrap.appendChild(avatar);
 
   var body = document.createElement("div");
@@ -687,6 +903,9 @@ function makeToolMediaRow(m, open) {
 }
 function renderToolCard(host, m) {
   while (host.firstChild) host.removeChild(host.firstChild);
+  /* U-4 opt-in:只有压缩工具气泡(m.cxCard === true)走本批新增形态;其余工具卡逐像素不变
+     (负例 N5 咬的就是这道守卫) */
+  var cx = (m.cxCard === true);
   var st = (m.needsApproval || askUserPending(m)) ? "wait" : (m.status === "ok" ? "ok" :
     (m.status === "error" || m.status === "denied" || m.status === "aborted") ? "err" : "");
   var open = toolCardOpen(m);
@@ -703,8 +922,27 @@ function renderToolCard(host, m) {
   head.innerHTML = icon(toolStatusIcon(m), "sm") +
     '<span class="tc-name">' + escapeHtml(toolDisplayName(m.toolName)) + "</span>" +
     '<span class="tc-status">' + escapeHtml(toolStatusText(m)) + "</span>" +
-    '<span class="tc-sum">' + escapeHtml(toolCardSummary(m)) + "</span>" +
+    '<span class="tc-sum">' + escapeHtml((cx && m.cxSummary) ? m.cxSummary : toolCardSummary(m)) + "</span>" +
     '<span class="tc-arrow">' + icon("down", "sm") + "</span>";
+  /* U-4:语义 chip 行(来源 / 触发原因 / 读数);textContent 写入,不走 innerHTML */
+  if (cx && Array.isArray(m.cxChips) && m.cxChips.length) {
+    var chipsRow = document.createElement("span");
+    chipsRow.className = "cx-chips";
+    for (var ci = 0; ci < m.cxChips.length; ci++) {
+      var cch = document.createElement("span");
+      cch.className = "cc-chip";
+      cch.textContent = String(m.cxChips[ci]);
+      chipsRow.appendChild(cch);
+    }
+    head.appendChild(chipsRow);
+  }
+  /* 合成卡(运行中 / 失败)不在 conv.messages ⇒ findMsg 必查无 ⇒ 摘掉折叠 affordance;
+     与 CSS 隐藏 .tc-arrow 同一条口径:默认展开、不可折叠是结构事实,不是"能聚焦但点了没反应" */
+  if (cx && m.cxNoToggle === true) {
+    head.removeAttribute("data-tool-toggle");
+    head.removeAttribute("aria-expanded");
+    head.tabIndex = -1;
+  }
   card.appendChild(head);
 
   var ops = "";
@@ -718,6 +956,22 @@ function renderToolCard(host, m) {
     opRow.className = "tc-ops";
     opRow.innerHTML = ops;
     card.appendChild(opRow);
+  }
+  /* U-4:压缩气泡操作行(复制摘要 / 取消压缩 / 重试 / 知道了);
+     合成卡不在 conv.messages ⇒ 处理分支自带空值守卫(见 elChatInner 的 [data-cx-act] 分支) */
+  if (cx && Array.isArray(m.cxOps) && m.cxOps.length) {
+    var cxRow = document.createElement("div");
+    cxRow.className = "tc-ops cx-ops";
+    for (var oi = 0; oi < m.cxOps.length; oi++) {
+      var op = m.cxOps[oi] || {};
+      var ob = document.createElement("button");
+      ob.type = "button";
+      ob.className = "btn sm" + (op.act === "retry" ? " primary" : "");
+      ob.setAttribute("data-cx-act", String(op.act || ""));
+      ob.textContent = String(op.label || "");
+      cxRow.appendChild(ob);
+    }
+    card.appendChild(cxRow);
   }
 
   var body = document.createElement("div");
@@ -743,7 +997,21 @@ function renderToolCard(host, m) {
     lab2.className = "tc-lab";
     lab2.textContent = "返回值";
     body.appendChild(lab2);
-    body.appendChild(makeCodeEl("json", m.content || (m.status === "ok" ? "(没有输出)" : "(无错误信息)")));
+    var resText = m.content || (m.status === "ok" ? "(没有输出)" : "(无错误信息)");
+    if (cx && m.resultMd === true) {
+      var mdBox = document.createElement("div");
+      mdBox.className = "msg-content cx-sum-body";
+      mdBox.setAttribute("data-mid", m.id);
+      mdBox.innerHTML = streamMarkdown(resText, false);
+      enhanceBlocks(mdBox, false);
+      body.appendChild(mdBox);
+    } else body.appendChild(makeCodeEl("json", resText));
+    if (cx && m.resultNote) {
+      var noteEl = document.createElement("div");
+      noteEl.className = "tc-note";
+      noteEl.textContent = String(m.resultNote);
+      body.appendChild(noteEl);
+    }
   } else if (m.status === "denied" || m.status === "aborted") {
     var d = document.createElement("div");
     d.className = "tc-note";
@@ -754,11 +1022,26 @@ function renderToolCard(host, m) {
        会让所有"正在执行…"的卡片失去说明行。AskUser 的待答卡片改由表单承载,不要放行文案 */
     var w = document.createElement("div");
     w.className = "tc-note";
-    /* 审批/执行中的说明文案按工具名取:文件工具绝不能再出现「浏览器沙箱」字样 */
+    /* 审批/执行中的说明文案按工具名取:文件工具绝不能再出现「浏览器沙箱」字样。
+       执行中若工具有细粒度进度(目前只有 DownloadForUser 的打包),用它们自己的进度行 */
     w.textContent = m.status === "wait"
       ? toolApprovalNote(m.toolName)
-      : "正在执行…";
+      : (m.progressText || "正在执行…");
     body.appendChild(w);
+  }
+  /* U-4 过程区宿主:内容不来自 m(阶段行 / 草稿由 cxLivePaint 就地填充,流式草稿绝不写进消息对象)。
+     互斥:只挂"当前正在运行的那一张" —— 合成运行卡,或模型入口那张真实工具卡。
+     m.status === "running" 与 m.cxCard !== true 两道守卫缺一不可:否则第二次压缩进行中,
+     任何一次 renderChat 都会给每一张历史 Compact 卡挂上**当前运行**的过程区
+     ⇒ 多实例 + 跨卡状态泄漏 */
+  var cxLiveHost = cx ? (m.cxLive === true)
+    : (m.toolName === "Compact" && m.status === "running" && CX_RUN.phase === "summarizing" &&
+       !!conv && CX_RUN.convId === conv.id);
+  if (cxLiveHost) {
+    var liveEl = document.createElement("div");
+    liveEl.className = "cx-live";
+    liveEl.setAttribute("data-cx-live", "");
+    body.appendChild(liveEl);
   }
   /* 工具读取的图片(Read 的 m.media):折叠态一行文字 / 展开态缩略图(P2-8) */
   if (m.media && m.media.length) body.appendChild(makeToolMediaRow(m, open));
@@ -944,6 +1227,15 @@ function appendAskBody(body, m) {
 }
 /* 工具卡片可能嵌在助手消息里,重绘要找到它真正所在的容器 */
 function redrawToolCard(m) {
+  /* 摘要消息的重绘**必须**经合成消息:真实摘要消息没有 toolName / cxCard / resultMd /
+     resultNote / cxOps ⇒ 直接 renderToolCard 会把卡片画坏(chips 行、结果区、折叠行、
+     操作行全丢,状态回落"准备中…")。选择器不受新增壳类影响(多类名不改匹配) */
+  if (m && m.compact === "summary") {
+    var elS = document.querySelector('#chat-inner .msg.cx-sum[data-id="' + cssEscape(m.id) + '"]');
+    if (!elS) { renderChat(); return; }
+    renderToolCard(elS, cxSummaryMsgOf(m));
+    return;
+  }
   var el = document.querySelector('#chat-inner .tool-card[data-id="' + cssEscape(m.id) + '"]');
   if (!el || !el.parentNode) { renderChat(); return; }
   renderToolCard(el.parentNode, m);
@@ -995,8 +1287,13 @@ function renderChat() {
   if (!conv || !conv.messages.length) { renderWelcome(); sqRender(); return; }
   for (var i = 0; i < conv.messages.length; i++) {
     var m = conv.messages[i];
-    /* 压缩产物(交接总结 / 省略说明)不是真实对话:走独立的摘要气泡,不参与 turnId 合泡 */
-    if (m.compact) { elChatInner.appendChild(makeCompactEl(m)); continue; }
+    /* 压缩产物(交接总结 / 省略说明)不是真实对话:走独立的摘要气泡,不参与 turnId 合泡。
+       summary 走工具气泡族(makeCxCardEl:壳 = .msg.cx-sum.cx-card,内容 = 合成工具消息),
+       elision 仍走原 .compact-card */
+    if (m.compact) {
+      elChatInner.appendChild(m.compact === "summary" ? makeCxCardEl(m) : makeCompactEl(m));
+      continue;
+    }
     /* 同一 turnId 的消息(工具调用轮 + 工具结果 + 后续正文)合并成一个气泡 */
     var group = m.turnId ? groupOfMsg(m.id) : null;
     if (group) {
@@ -1008,6 +1305,17 @@ function renderChat() {
     if (attached) i += attached.length;
     elChatInner.appendChild(makeMsgEl(m, false, attached));
   }
+  /* U-4 运行时尾巴(只在"属于当前会话"时追加;顺序固定:先运行中卡,后失败卡)。
+     模型入口(source === "tool")**不建**尾巴卡 —— 那条路径已有既有 Compact 工具卡,
+     再建一张会双挂 [data-cx-live](两个过程区 + 两个「取消压缩」) */
+  if (CX_RUN.phase !== "idle" && CX_RUN.source !== "tool" && CX_RUN.convId === conv.id) {
+    elChatInner.appendChild(makeCxLiveEl());
+  }
+  var cxUiRec = CX_UI[conv.id];
+  if (cxUiRec && !cxUiRec.dismissed) elChatInner.appendChild(makeCxFailEl(cxUiRec));
+  /* 过程区首绘:运行卡(上面那一支)与模型入口那张真实工具卡都刚刚才挂进 #chat-inner,
+     在这里补一次 —— 否则首绘被丢,过程区要等下一次 statusTick 才有内容 */
+  cxLivePaint(true);
   applyCodeWrap();
   elChat.scrollTop = keepTop;
   if (!conv.messages.length) scrollToBottom(true);
@@ -1037,6 +1345,10 @@ function renderWelcome() {
   elChatInner.appendChild(root);
 }
 elChatInner.addEventListener("click", function (e) {
+  /* U-4:压缩气泡操作行(合成卡不在 conv.messages ⇒ 自带空值守卫)。
+     这些按钮只带 data-cx-act,不带任何其它 data-*,不会与下面的既有分支互相误触 */
+  var cxb = e.target.closest ? e.target.closest("[data-cx-act]") : null;
+  if (cxb) { cxAct(cxb.getAttribute("data-cx-act"), cxb); return; }
   var tip = e.target.closest ? e.target.closest(".tip") : null;
   if (tip) {
     var text = tip.getAttribute("data-tip");

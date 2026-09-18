@@ -22,7 +22,8 @@ pdfjs.part      │   (按固定顺序拼装,统一 LF 归一)
 tesseract.part  │
 office.part     │
 pyodide*.part   │
-appA–appE.part ─┘
+jupyterlite.part│
+appA–appE.part ─┘  (appJ.part 插在 appD 与 appE 之间)
 ```
 
 `build.js` 的拼装顺序（改动顺序会导致 ID / 函数引用错乱）：
@@ -36,7 +37,9 @@ head.part        先替换 /*__KATEX_CSS__*/ 占位符为 src/katex-embedded.css
 + office.part    缺文件 → 同上，办公附件自动降级
 + pyodide 载荷   按档取 src/pyodide.part（full）或 src/pyodide-{normal,minimal}.part；
                  显式档位缺载荷即 exit 1；默认档缺载荷时整族 Python 工具降级
-+ appA.part + appB.part + appC.part + appD.part + appE.part
++ jupyterlite.part  缺文件 → 打印警告并注入 JL_AVAILABLE=false 的极小占位段（不 exit 1），Jupyter 标签页不可用
++ appA.part + appB.part + appC.part + appD.part + appJ.part + appE.part
+     ↑ appJ 插在 appD 与 appE 之间（同一 IIFE 的分段，不得提前闭合；appE 仍必须是最后一段）
 ```
 
 拼装完成后立即用检查链验证：
@@ -50,7 +53,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 ### 1.2 应用分段（同一个 IIFE）
 
-`appA`–`appE` 只是把一万多行 JS 按功能切开的**分段**，拼起来必须是一个完整 IIFE：各段靠函数声明提升与模块级 `var` 共享作用域，拆开单独看会报「未定义」。**只有 `appE.part` 结尾收 IIFE 与 `</script></body></html>`**——新增分段不得提前闭合。
+`appA`–`appE` 与插在 `appD` / `appE` 之间的 `appJ` 只是把一万多行 JS 按功能切开的**分段**，拼起来必须是一个完整 IIFE：各段靠函数声明提升与模块级 `var` 共享作用域，拆开单独看会报「未定义」。**只有 `appE.part` 结尾收 IIFE 与 `</script></body></html>`**——新增分段不得提前闭合。
 
 | 分段 | 职责 |
 | --- | --- |
@@ -58,6 +61,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | `appB.part` | 数学公式（抽取 + KaTeX 渲染回填） |
 | `appC.part` | 代码块增强 / 消息渲染 / 滚动 / 流式渲染调度 |
 | `appD.part` | 会话 / 输入区 / 附件 / API 调用 / 交互 / 弹层 / 设置面板 / 命令面板 / 语音输入 |
+| `appJ.part` | JupyterLite 宿主（主页面侧）：独立标签页与子文档引导 / 工作区 ↔ Jupyter Contents 镜像同步与租约 / 右键「通过 JupyterLab 打开」扩展项 |
 | `appE.part` | 工具框架（注册表 / 权限 / 限额 / 沙箱 / 审计）+ Python 运行时与任务层 + 初始化入口 |
 
 ⚠️ **新增函数名前先全局搜重名**：同名函数后声明者会静默覆盖先声明者（历史 bug「新建会话空白页」的根因就是 `appE` 里的桩函数覆盖了 `appC` 的真实现）。
@@ -68,9 +72,9 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 | 档位 | 预置包 | 产物体积（实测） | 载荷来源 |
 | --- | --- | --- | --- |
-| `full`（默认） | 151 个 wheel | 209,165,053 B（≈199.4 MiB） | `src/pyodide.part`（入库） |
-| `normal` | 99 个 wheel | 137,116,299 B（≈130.7 MiB） | `src/pyodide-normal.part`（本地生成） |
-| `minimal` | 33 个 wheel | 55,619,364 B（≈53.0 MiB） | `src/pyodide-minimal.part`（本地生成） |
+| `full`（默认） | 151 个 wheel | **227,449,375 B**（2026-09-18 取件时刻；终编以构建打印值为准） | `src/pyodide.part`（入库） |
+| `normal` | 99 个 wheel | **155,400,621 B**（同上口径） | `src/pyodide-normal.part`（本地生成） |
+| `minimal` | 33 个 wheel | **73,903,686 B**（同上口径） | `src/pyodide-minimal.part`（本地生成） |
 
 档位名单 / 分组 / 落盘路径 / 体积对账值的**唯一权威** = `scripts/pyodide-profiles.json`；生成期与构建期断言（C1–C9）保证「名单不许漂移、轻档不缺依赖、被裁包的理由不许撒谎」，未知档位直接 `exit 1`。轻档载荷里带一段 `pyodide-profile.json`，运行时据此显示真实档位与包数（缺段 = 完整版）。
 
@@ -118,15 +122,19 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | DOMPurify | 3.1.6 | HTML 净化（XSS 防线） | `src/libs.part` |
 | highlight.js | 11.9.0 | 代码高亮 | `src/libs.part` |
 | KaTeX | 0.16.11 | 数学公式（20 个 woff2 字体 base64 内联） | `src/katex.min.js` + `src/katex-embedded.css` |
-| pdf.js（pdfjs-dist legacy） | 6.3.289 | PDF 文字抽取 + 页面渲染（已修 CVE-2024-4367） | `src/pdfjs.part` ≈ 1.85 MB |
+| pdf.js（pdfjs-dist legacy） | 6.3.289 | PDF 文字抽取 + 页面渲染（已修 CVE-2024-4367） | `src/pdfjs.part` ≈ 1.80 MiB（1,882,880 B，2026-09-18 现取） |
 | Tesseract.js（+ core） | 7.0.0 | 图片 OCR（eng + chi_sim，tessdata_fast） | `src/tesseract.part` ≈ 6.37 MB |
 | mammoth | 1.12.3 | docx 文字 + 正文图片 | `src/office.part` |
 | SheetJS CE | 0.20.3 | xlsx / xls → CSV | `src/office.part` |
 | @jose.espana/docstream | 0.1.3 | pptx / doc / ppt 文字 + 图像 | `src/office.part` |
-| fflate | 0.8.3 | ZIP 结构预扫描（ZIP 炸弹防线） | `src/office.part` ≈ 2.93 MB 合计 |
+| fflate | 0.8.3 | ZIP 结构预扫描（ZIP 炸弹防线） | `src/office.part` ≈ 3.08 MiB 合计（3,225,317 B，2026-09-18 现取） |
 | pyodide（+ CPython 3.14.2 标准库） | 314.0.6 | Python 运行时 | `src/pyodide.part` ≈ 186.7 MB |
+| JupyterLite（jupyterlite-core + lab 站点） | 0.8.3 | JupyterLab 站点（独立标签页、工作区为根） | `src/jupyterlite.part` ≈ 16.3 MiB（17,099,161 B，2026-09-18 现取） |
+| JupyterLab（含 lumino / CodeMirror 等运行期依赖） | 4.6.3 | lab 站点构建 | 同上 |
+| jupyterlite-pyodide-kernel | 0.8.6 | Jupyter 内核（复用 `src/pyodide.part` 的核心集，不重复打包） | 同上 |
+| jedi / parso | 0.19.2 / 0.8.6 | 内核属性补全（子批 B 落位） | 同上（`pyodide/*.whl`） |
 
-三份产物内的 SVG 图标为手写图标精灵（62 个 symbol），不依赖图标字体。内嵌的 wasm / 训练数据放在 `<script type="text/plain">` 里（不会被当成 JS 执行，也不会被语法检查误报）。`syntax.js` 必须跳过这类块，否则会报一堆语法错误、把真正的问题淹掉。
+三份产物内的 SVG 图标为手写图标精灵（**66** 个 symbol；2026-09-18 现取，以取件时刻为准），不依赖图标字体。内嵌的 wasm / 训练数据放在 `<script type="text/plain">` 里（不会被当成 JS 执行，也不会被语法检查误报）。`syntax.js` 必须跳过这类块，否则会报一堆语法错误、把真正的问题淹掉。
 
 ---
 
@@ -150,6 +158,39 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **会话现在在 IndexedDB，自动化脚本别再读 `localStorage.conversations`**：要读会话得打开 `chatgpt-webui-blobs` 的 `convs` 区 `getAll()`。
 - **启动是异步的，脚本要等 `data-boot="done"`**：会话从 IndexedDB 装回发生在初始化第二步，只有 `#welcome` / `.msg` 出现不代表初始化完成（早写 localStorage / 点按钮会被随后的保存覆盖）。
 - **判「还在生成」要看 `.gen-line` 的 `display`，别看 `textContent`**：该行是**故意不重绘**的（动画才连续），收尾时只把 `style.display` 置 `none`——拿 `textContent.indexOf('正在生成')` 做断言会**永远为真**。
+- **下载链只有一条内核（`wsDownloadPath`）**：单文件、目录打包（`wsDirPackPlan` + `wsZipBuildLazy`）、整箱（`dir="/"`）都走它；zip 字节格式只有一份实现（`wsZipWriteOpen`）。要点：`WS_ZIP_MAX` = 128 MB 是**内存硬顶**（超了报 `E2BIG`，不许提高）；`CompressionStream("deflate-raw")` **有则压（method 8）、无则原样存（method 0）**，压不小也退回 store；懒加载**逐文件读**（每文件一个只读事务，读完即压缩入块并释放原始字节）；Blob 只在 `finish()` 时构造 ⇒ 中止/失败**不产半成品**；**只有模型发起的那条路能被 `Ctrl+X` 中断**——`wsDownloadTool` 透传 `ctx.signal` 并带 `deadline`（`toolLimit("timeoutMs")`），而 UI 路径（工具栏「整箱 zip」的 `wsZipWorkspace`、右栏「下载」的 `wsDownloadPathUI`）调内核时只传 `onProg`，**不带 signal/deadline** ⇒ 打包中按 `Ctrl+X` 停不下它（与批前一致的既有行为，不是本批回归）。**打包与上传双向互斥**（`WS_DL.running` ↔ `WS_UPLOAD.running`，冲突报 `EBUSY`）——这是 0.2.0 起的**有意行为变更**：批前「打包中再点单文件下载」会成功，现在会被闸挡住。清单来源必须是 `wsReadTx` 的 `env.meta.tree`（**不要**读 `WS_META_CACHE`，缓存冷/陈旧时会打出缺文件的包）。`wsZipBuild`（全量内存版）产品内**已无调用者**，保留它是为了让装置的 D12 逐字节对拍有"新实现"这一条腿。
+
+### 工作区右键菜单（0.2.0 起）
+
+- **`#pop-menu` 是单例**：新使用者一律 `closeMenus()` 开、自己的 `data-*` 分派分支收，且分支必须插在 `data-convact` 分支**之前**——再往后就是 palette 兜底 `runPaletteAction(null)`，落到那里等于点了空（菜单关了、什么都没发生）。菜单的"上下文"必须跟菜单一起失效：`closeMenus()` 与关浮层的 document click 都清掉 `WS_CTX`，否则点下一次会拿着上一个目标的路径去动作。
+- **定点弹出用 `placeMenuAt`，不要复用 `placeMenu`**：后者是"贴着锚点上方"语义、必须有真实锚点元素；右键没有锚点，要的是"以鼠标位置为左上角 + 四边夹紧 + 超高时自身滚动"。两者并列存在，别合并。
+- **列表重绘会冲掉行上的临时态**：剪切标记（`.wsr-cut`）与选中态都**只存路径**，重绘时按当前状态重算（`wsrRowExtraClass(wsId, path)` 带 `wsId`）+ 在状态变更处显式 `renderWsFiles`。带 `wsId` 是硬要求：`WS_RAIL_SEL` 有多条写入路径，跨工作区会误标同名路径（同一路径在两个工作区里都存在是常态）。
+- **工作区内部剪贴板 ≠ 系统剪贴板**：不进系统剪贴板、刷新即失、跨工作区禁用（换工作区清、删的正是来源工作区才清）。粘贴与"复制副本"一律**先算唯一名**（`name (2).ext`）+ `overwrite:false`／`mode:"create"`，**永不覆盖**用户文件；先算名与执行之间被并发抢先（`EEXIST`）时重算一次再试，仍失败如实报错，不静默。
+- **行选中集（多选）只在「同一工作区 + 同一目录」内有效**：键 = `String(wsId) + "|" + WS_CWD`（`WS_SEL_KEY`），**键一变即清** —— 判据在 `renderWsFiles()` 入口判一次，一条判据同时覆盖「换目录」「换工作区」「删掉当前目录后被兜回父目录」三条路径。此外还有**三个明确的清空落点**：① 右键落在空白/特殊行（`wsCtxContextFromEvent` → `wsSelClear()`，全库唯一调用点）；② 侧栏点选换工作区的 `"pick"` 分支（显式置空）；③ **任何动作改动后**（`wsCtxAfterChange` —— 路径可能已被改名/移走，留着只会是过期路径）。注意 `wsSelClear()` 只是"置空 + 就地刷"的封装，**只有 ① 走它**，②③ 直接置空 `WS_SEL` / `WS_SEL_ANCHOR`；新增清空路径时**两条纪律都要守**（清键所指的那一份状态、且必须 `wsSelPaint()` 或触发重绘）。选中集与剪贴板同性质：**纯内存**，不进 settings / IDB。
+- **列表行的点击语义是「单击只选中、双击才打开」**：闸门只有一处 —— `wsrRowActivate(e, b)` 返回 `e.detail >= 2`，挂在 `onWsRailClick` 的 `go` / `enter` / `preview` 分支上。**不要把这个闸门搬到别处、也不要给它加"例外"**：行内按钮（`.wsr-ops` / `.wsr-caret`）、面包屑、无 `data-wst` 的特殊行之所以"照旧"，靠的是 `wsrRowActivate` 内部两行提前 `return true`（判 `classList.contains("wsr-row")` 与 `data-wst` 是否存在），不是分支里的额外判断。选中态与剪切标记 `.wsr-cut` **共用** `wsrRowExtraClass(wsId, path)` 这一个渲染出口（重绘后自动重算），只有 `.wsr-sel` 另有一条**就地刷**的路 —— `wsSelPaint()` 只增删类名、**不整列表重绘**（重绘会丢滚动位置与树展开态），所以改选中逻辑时"重绘出口"与"就地刷"两条路都要照顾。
+- **批量动作必须「串行 + 如实聚合」**：批量删除 / 下载 / 粘贴一律经 `wsCtxBatchRun(label, items, fn)`（**逐条串行**，进度走既有 `#wsr-prog` 状态行）+ `wsCtxBatchReport(label, st)` 收口。报告纪律写死在 `wsCtxBatchReport` 里：全成 ⇒ success toast；**只要有一条失败 ⇒ error toast（成功数 + 失败数 + 前 3 条明细）＋ 完整明细灌进 `wsSetReport` ⇒ 右栏 `#wsr-report` 可"展开全部 N 条失败"** —— **部分失败绝不静默**，不允许"整批报成功"或"只弹最后一条错误"的写法。状态容器形状 = `{ total, i, ok, done:[], fails:[{path,name,code,msg}], aborted }`（`aborted` 由单条返回的 `r.aborted` 触发，已完成的项按"已写入不回滚"如实登记）。
+
+### 桌面快捷方式（`.url` / `.ico`，0.2.0 起）
+
+- **桌面上的 `.html` 文件本身的图标改不了**：那是操作系统外壳按「扩展名 → 文件类型 → 注册表图标」定的，网页侧没有任何 API 能改写自己这个本地文件的 OS 图标。唯一的可行形态 = 生成 Windows 原生 InternetShortcut（`.url`），把它的 `IconFile=` 指向我们自己生成的 `.ico`。产品文案必须把这条如实说出来，否则用户会以为"设置里开了就生效"。
+- **`IconFile=` 必须是绝对路径**：同目录下的相对文件名（`IconFile=azusa.ico`）实测**无效** —— 外壳给的是与"完全没有 IconFile"一样的默认图标；`%VAR%` 形式同样不解析。而 **File System Access API 不暴露所选目录的完整路径**（`FileSystemDirectoryHandle` 只有 `name`，即叶子名）。⇒ 「一键写入」通道的 `.url` 只能引用**本页所在目录**（由 `location` 唯一确定）；用户选中的目录与它不同时，必须给**显式提示**让用户把 `.ico` 搬过去，**不许静默产出一个引用错路径的 `.url`**。
+- **`showDirectoryPicker()` 必须在用户手势的同一个任务里同步调用**：它要 *transient user activation*，而一次 `await`（例如"先把图标渲染成 ICO 再选目录"）就会把它耗尽 ⇒ 选择器被 `NotAllowedError` 拒。正确次序 = 点击处理器里**先同步取 picker**，拿到 handle 之后再渲染、再写（handle 上的 `createWritable/write/close` 不需要手势）。
+- **原生目录选择框是操作系统 UI，不可自动化**：CDP / PowerShell / UI Automation / SendKeys 都点不了「选择文件夹」那个按钮（实测其 UIA 控件是 `ControlType.Pane`，不支持 `InvokePattern`/`LegacyIAccessiblePattern`）。硬闯的代价 = 反复弹出用户可见的对话框 + 把验证脚本自己搞崩。**这类验证只能走「用户侧手工读数」**：写一份可直接复制给用户的 30 秒步骤（做什么 → 看什么 → 回报什么）。同理适用文件选择框、打印对话框、证书/权限原生弹窗、UAC。
+- **`.url` 的编码分支**：内容全 ASCII ⇒ UTF-8 **无 BOM**；含非 ASCII（中文用户名 / 中文目录）⇒ **UTF-16LE + `FF FE` BOM**（逐字节手写，不要借 `TextEncoder`）。实测 UTF-8 / ANSI 都解析不了中文路径。注意验证时 `Buffer.toString("utf16le")` **不会剥掉 BOM** —— 断言要从**字节偏移 2** 起解码，否则必然把 U+FEFF 当成内容而误判。非 ASCII 时提示必须放在状态行**首行**（默认展开），不能在长文案末尾藏一句。
+- **ICO 的 6 条目结构**（16/32/48/64/128 = DIB，256 = PNG）：DIB 条目 = `BITMAPINFOHEADER(40B)` + XOR 位图（**自下而上**、BGRA、alpha 直存）+ AND 掩码（同样自下而上，每行 `((w+31)>>5)*4` 字节，**bit=1 表示透明**）；`biHeight` 要写**两倍**高。**别为省体积砍条目**：实测单 16×16 条目的 ICO 外壳不采用，6 条目才全效果（该观察来自方案审查期的 Win11 旧读数，本批未复测；**很可能与下面第 7 条那个 SVG 源缺陷同源** —— 一个 2×2 像素的小点当然不会被外壳采用）。**结构对 ≠ 画对**：实测过「6 条目结构全部合法、图案却被画进左上角一小块」的产物 ⇒ 校验必须带**像素级**判据（**非零 alpha 覆盖率 ≥ 10%·s²** ∧ **外接框四边留白 ≤ `max(2, 10%·s)`**），而 `alpha > 0`（4 个像素也满足）**不算判据**；**两条来源都要跑**（默认 SVG 源 + 用户自定义位图源），并留一份修前产物当负例（证明判据不是恒 PASS）。
+- **渲染取「中心正方区域」再缩放，但 SVG 源必须先光栅化成位图**（与 `faviconDraw` 同口径）：默认 favicon 是内嵌 SVG，**没有 `width`/`height` 属性**（只有 `viewBox`），直接按宽高各自拉伸有变形风险。**别把「先中心裁方」当成"不依赖源图固有尺寸"的保证 —— 它对 SVG 源不成立**：对 SVG 源用「显式源矩形」的 9 参 `drawImage(img, dx,dy,sw,sh, 0,0,s,s)` 时，Chromium（实测 122）**先按目标尺寸光栅化、再把源矩形按固有尺寸坐标系解释**，图案因此只占画布左上角 `s²/固有边长` 个像素（实测六档 16→4 / 32→49 / 48→247 / 64→742 / 128→11455，只有 256 正常；**同一个 9 参调用打在位图源上完全正确**）。⇒ 正确做法 = **先按最大档边长（256）用 4 参 `drawImage(img, 0,0,n,n)` 把 SVG 光栅化成真正的位图**（矢量源在这一步按该尺寸重绘，不失真），**之后一律走位图源路径**（`dskIconSource()` 就是这道归一化；非 SVG 源原样返回 ⇒ 位图路径字节级不变）。**别把这一步当成可省的开销**：把 SVG 直接喂给 9 参 = 回到上面那 5 个错档。
+- **图标名用内容哈希**（`<base>-icon-<crc8>.ico`，`crc8` = ICO 字节的 CRC32 十六进制）：资源管理器对外壳图标有缓存，换图标而名字不变时可能仍显示旧图标。注意 `padStart` 在本项目的手写段是**禁用**的（ES5 口径），要自己补前导零。
+- **`.url` 是危险扩展名**：新版 Chrome 会把下载的 `.url` 改名成 `.download`（目标环境 Thorium 122 实测无此问题）⇒ 界面上给"手动改回 `.url`"的指引；另外 `.url` 双击由**系统默认浏览器**接管，不一定是本浏览器，文案要写清。
+- **路径卫生（`.url` 行注入的纵深防御）**：`IconFile` 值里出现 C0/C1 控制字符（含 CR/LF）或 `[` / `]` 时**拒绝生成**（Windows 文件名本不允许这些字符 ⇒ 一旦出现就是有人在构造额外行）；`URL=` 行同样过控制字符检查。
+- **非 `file:` 协议一律不出按钮**：dev server（`http://`）下 `location` 给不出本机路径，状态行写明「只对 `file://` 打开的单文件版本有效」并把两个下载按钮置灰。`showDirectoryPicker` 除协议门外还要**能力探测**（`typeof window.showDirectoryPicker === "function"`），缺任一 ⇒ 「写入文件夹…」按钮保持 `hidden`（不交付无法验收的分支）。
+
+### JupyterLite 宿主与镜像（0.2.0 起）
+
+- **`file://` 下「真实 URL 子页」与 opener 的跨文档访问必被拒（J-TAB-1 的由来）**：Jupyter 标签页的现有形态把子文档承载在 `about:blank` / 伪源站点上（注入式引导，主页面与子页在同一文档上下文里互操作）；一旦改成"可刷新、有真地址"的形态（历史 J1 尝试），`file://` 下子页与 opener 互相读不到对方 ⇒ 镜像 / 内核资产 / 跨页命令**整体断链**，该路线已撤回（`batch-j1-revert`）。⇒ 现状 = 已知限制 **J-TAB-1**（子标签页依赖主页面：`about:blank`、刷新白屏，重新「通过 JupyterLab 打开」即恢复、不丢数据）；根治 = A1 子页内核资产自举 + A2 传输迁 localStorage + `storage` 事件（0.2.1 备选）。**没做 A1/A2 之前，不要动子页的承载形态。**
+- **镜像仲裁必须先做时间戳归一，否则「比较」恒为假**：工作区侧记的是数值毫秒（`mtime`），Jupyter Contents 侧给的是 ISO 字符串（`last_modified`）——`ch.lm + 1000` 落在字符串上会变成**字符串拼接**，两侧比较恒 `false` ⇒ 拉方向**无条件获胜**，工作区里刚写的新内容会在 ≤1 s 内被陈旧副本**静默还原**。修法 = 两侧统一走 `jlMirrorLmMs()` 归一 + **平局（同一毫秒）判外部/工作区侧胜**。改仲裁前先读 `specs/jtab3-conflict-fix-plan.md` 的甲/乙清单（行号会漂，按符号锚点找）。
+- **冲突轮不更新同步基线**（`conflict-base-hold`）：两侧自基线以来都变过时不选边——限频提示（8 s）点名文件，且**该轮不得写回基线**；否则下一轮比较只剩「单侧较新」，冲突被静默吞掉。计数面在 `data-jl-mirror-stat` 的 `conflicts` 字段。
+- **「打开中的文档跟随」的三条硬前提**（缺一即变成"表面通过的死代码"）：① 路径比对**按段归一**——子文档 `context.path` 不带前导斜杠（`seed.txt`）而镜像侧带（`/seed.txt`），直接 `===` 永不成立；② 跟随 = `await c.revert()` 且检查失败，**不得静默假成功**；③ 成功后 `clearUndoHistory()`——否则用户一次 `Ctrl+Z` 就把跟随事务撤掉、静默写回旧内容。dirty（有未保存修改）一律跳过；子窗口已聚焦时也跳过（`hasFocus()` 读不到就保守跳过）。
+- **已有标签页的「真打开」= want 投递 + 等落位**：目标文件由 `JL_LAB_PATH` 承载，`JL_LAB_WANT_SEQ` **只增不减**（句柄丢弃不归零，旧回执不得吞掉新 want）；看门狗**只在有目标文件时才允许开**（`if (JL_LAB_PATH) …` + `JL_LAB_WANT_AT > 0` 守卫）——无 want 时开了会误报「标签页没有回应打开请求」（实测 t+1.15 s 假警告）；等待预算 `JL_LAB_WANT_WATCH_MS` 45 s / `JL_LAB_WANT_BOOT_MS` 120 s，超时必须出**可见**横幅（不静默）。
 
 ### 布局、主题与样式
 
@@ -167,6 +208,9 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **自绘浮层要压过弹窗**：`.modal-mask` 是 `z-index: 200`；所有挂在 body 上的自绘浮层统一用 **z-index 400**，否则在设置弹窗里展开时浮层被盖住、肉眼完全看不见。
 - **浮层开关**：打开浮层的按钮要带 `data-menu-opener`，否则文档上的「点别处收起」会把它刚打开就关掉；自绘浮层的开关是「切换」语义——箭头按钮要在 `mousedown` 里 `preventDefault` 防止抢焦点导致浮层刚展开就被失焦延时任务收掉。
 - **编辑框里的提示文字要显式设色**：通用提示样式只在特定选择器下生效，放进编辑框会继承正文色，在深色主题下就是刺眼的近白色。
+- **浮窗定位按「布局盒」量，不按渲染矩形量**：`placeMenu` 用 `offsetWidth` / `offsetHeight`（与 `transform` 无关）——动画（`popIn` 140 ms）期间量 `getBoundingClientRect()` 拿到的是缩放中的尺寸，首开与稳定态不一致（实测 7 px 级漂移，用户视角就是「第一次点开位置不对，再点一次才对」）。改量法前先看 `shared/progress/u2-fix-done.md` 的仪器陷阱（连点 3 次、每次 +80 ms 采样会落在动画内 ⇒ 假 `distinct=2`）。
+- **浮层打开时 `scrollTop` 归零，且落点必须在「cap 之后」**：`placeMenu` / `placeMenuAt` 的 `menu.scrollTop = 0` 必须写在函数**末行**（高度上限 / 溢出设置之后）——写在前面会被浏览器在 cap 落地时还原的旧偏移吃掉（探针实证：中间态重开仍读到 200）。`#cmd-list` / `#ctx-pop` / `#params-pop` 的同类残留同因同修（打开即回 0，键盘选中项才不会落在可视区外）。
+- **右栏行高 +2px（36 → 38）是命中区修复的必然导出**：`.wsr-row .wsr-ops button` 22→24、`.wsr-caret` 20→24 后行内容 max = 24，`align-items:center` 上下各 +1。**别用降 `padding` 的方式把它压回 36px**——不含 ops/caret 的行（如「上一级」）会反向缩到 32.25px、引入新的行高不一致。
 
 ### 渲染与流式
 
@@ -191,6 +235,13 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **工具卡片渲染会先清空宿主**：多张卡片**不能共用一个容器**，每张要有自己的 `.tool-slot`，否则后渲染的会把前面的清掉。
 - **气泡里的工具卡片要留间距**：卡片与上下正文之间留 14px，紧贴会显得挤。
 
+### 上下文压缩的界面（0.2.0 起）
+
+- **压缩卡位置 = 原位，永不挪位、不置顶**：三态（运行中 / 完成 / 失败）都挂在同一个工具气泡（`.msg.cx-card`）上、就地插在消息流里。任何"把压缩卡挪到对话最上方"的写法都已被否掉（方案与负例都按「原位」口径建）；改这块先读 `shared/specs/compact-ui-plan.md` 与它的 ③.5/复查报告。
+- **运行卡与失败卡不得退化成可折叠工具卡**：运行 / 失败卡撤掉 `data-tool-toggle` / `aria-expanded` / `.tc-arrow`（可折叠的只有「完成卡的摘要」这一件事）。运行的活体标记 `[data-cx-live]` 挂载条件是**互斥**的——`status === "running"` ∧ **非工具入口**（`source !== "tool"`），收敛即消失；漏掉后半句会让模型入口双挂。
+- **流式草稿的所有权 = 每次尝试前清空 + 失败 / 取消清空**：草稿由 `cxCallSummary` 的流式分支逐字写，`finally` / 异常路径 / 中止一律清掉——失败**不能**残留半截草稿（用户会把半截当结果），失败与取消对 `conv.messages` 的改动数必须为 0。
+- **失败卡正文固定一句「本次压缩没有改动任何消息，原文仍完整保留。」** + 「重试 / 知道了」；手动压缩的 `Ctrl+X` 走 `cxRunActive → cxAbortActive`（**不**调 `stopGenerating`，避免误杀沙箱 / 工具等待 / 自动续跑）。
+
 ### Python 执行与装载
 
 - **工具结果一旦被截断，方向就只有一种：留尾**。执行器族（`ExecutePython` / `ExecuteJavaScript` / 4 个任务工具）走这条；`Read` / `Grep` / `Glob` / `PythonPackages` 是分页与结构化检查类工具，**保持留头**（否则文件开头 / 摘要头 / ① 段先丢）。族的名单是 `RESULT_TAIL_TOOLS`，白名单外的工具行为必须逐字节不变（改这里等于改四种工具语义）。
@@ -210,11 +261,11 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **`state` 与 `state.settings` 不要放错**：要持久化的数据（如模型窗口记录）必须写在 `state.settings.*`（加载与迁移只认 settings 里的字段），写错位置刷新后就读不到了。
 - **弹出 async 函数别忘 `await`**：测试助手改成 async 后漏了 `await`，断言拿到 Promise 直接变成 `{}`，看起来像断言失败。改造助手时一起检查调用点。
 - **写含反斜杠的 JS 字符串要用文件工具**：批量替换脚本经过多层工具会吃掉一层反斜杠，把脚本写坏。要么用文件写入工具直接落盘，要么别在字符串里写反斜杠。
-- **非视觉模型的「图文按序融合」有三条不能破的线**：① `o.ocr`（「没有文本层才 OCR」）的语义**不得扩展**——Read 侧用独立标志 `o.fuseImgs`，入口条件唯一 = 非视觉 **且** 有候选图；② 视觉路径一字不变（不探页图、不做 OCR）；③ 无图 / 纯文本文档的输出逐字节不变（融合入口一律在「有图」判定之后）。三批改动都靠负例断言守着（请求体既不含「本机 OCR」也不含夹具暗号）。
-- **附件侧 PDF 的融合条件是「非视觉**且有图**」，不是「文本为空」**：`PDFKit.extractText` 对任何 ≥1 页 PDF 都会写页分隔标记（`----- 第 N 页 -----`）⇒ `text.trim()` 永不为空，「有没有文字层」必须用 `realText`（剥掉页分隔标记）判定。Read 侧早已按 `realText` 修过；附件侧本轮**只加融合、没顺带重构**那条分支——它对 ≥1 页 PDF 本就不可达（批前实测：`scan.pdf` 交付的正文只有 `----- 第 1 页 -----`，**不是**拒收），扫描件于是由融合兜住：页图 OCR 进正文。
+- **非视觉模型的「图文按序融合」有三条不能破的线**：① `o.ocr`（「没有文本层才 OCR」）的语义**不得扩展**——ReadOffice 侧用独立标志 `o.fuseImgs`，入口条件唯一 = 非视觉 **且** 有候选图；② 视觉路径一字不变（不探页图、不做 OCR）；③ 无图 / 纯文本文档的输出逐字节不变（融合入口一律在「有图」判定之后）。三批改动都靠负例断言守着（请求体既不含「本机 OCR」也不含夹具暗号）。
+- **附件侧 PDF 的融合条件是「非视觉**且有图**」，不是「文本为空」**：`PDFKit.extractText` 对任何 ≥1 页 PDF 都会写页分隔标记（`----- 第 N 页 -----`）⇒ `text.trim()` 永不为空，「有没有文字层」必须用 `realText`（剥掉页分隔标记）判定。ReadOffice 侧早已按 `realText` 修过；附件侧本轮**只加融合、没顺带重构**那条分支——它对 ≥1 页 PDF 本就不可达（批前实测：`scan.pdf` 交付的正文只有 `----- 第 1 页 -----`，**不是**拒收），扫描件于是由融合兜住：页图 OCR 进正文。
 - **图片从「丢弃」改成「OCR 融合」时三处必须同步**：`att.text`（融合后正文）、`att.textChars`（chip 的「文本 N 字」）、`att.ocrImgs`（新计数；旧数据无此键 = 0，不做迁移）。`imgCount` 保持原义（作为图片发出去的张数）——非视觉下融合的图不进 `att.images`，所以它仍是 0；把融合的图算进 `skippedImgs` 同样错（`skippedImgs` 只数解析层跳过的不支持格式 / 超限图）。
 - **附件侧 OCR 的时长预算是「整次解析共享」，而且只覆盖 OCR 阶段**：`ATT_OCR_TIMEOUT_MS`(60s) 不是每图预算，达到张数 / 时长 / 字符任一预算**立即停**并如实注记（与 Read 侧 `READ_OCR_TIMEOUT_MS` 同口径）；它**不是整条解析链的墙钟上限** —— 取图调用 `pageImages` / `renderCrops` / `renderPages` 各另带一次 60 s 超时（同一常量），取图极慢时整条解析会超过 60 s。`OCRKit.recognize` 单次调用不可中断（只能 `terminate`）⇒ 中止 / 超时的生效点只在两张之间。
-- **CORS 的失败在页面侧一律同形**：预检（OPTIONS）被拒、实际响应缺 `Access-Control-Allow-Origin`、网络不可达，浏览器都只给一条 `TypeError: Failed to fetch` —— 只报「无法连接到服务器」等于让用户猜。要分三层报：① 四条探针（`corsProbe()`：简单 GET / 带应用头 GET / 简单 POST / 真实 POST）只判「浏览器读不读得到响应」（4xx/5xx 也算读到），再用一条 `mode:"no-cors"` 辅助探针把「读不到」分成断网与跨域拦截；② 族文案（`CORS_FAMILY_TEXT`：预检被拒 / 实际响应无 ACAO / 网络不可达 / 服务端不解析 `text/plain` / 服务端未在超时内回话）按族给可执行下一步（这份文案只有两条消费路径 —— 诊断面板的结论行与「预检规避兼容模式」开关的拒绝 note；`friendlyError` / `connectHint` 的族参数分支在产线不可达，见代码注释）；③ 探针只能推出「哪一层被拦」，分不出 OPTIONS 是 500 还是 200-但缺 `Allow-*` 头（两者同形）⇒ 文案不写死单一诊断，细节让用户看 DevTools 的 OPTIONS 状态码。
+- **CORS 的失败在页面侧一律同形**：预检（OPTIONS）被拒、实际响应缺 `Access-Control-Allow-Origin`、网络不可达，浏览器都只给一条 `TypeError: Failed to fetch` —— 只报「无法连接到服务器」等于让用户猜。要分三层报：① 四条探针（`corsProbe()`：简单 GET / 带应用头 GET / 简单 POST / 真实 POST）只判「浏览器读不读得到响应」（4xx/5xx 也算读到），再用一条 `mode:"no-cors"` 辅助探针把「读不到」分成断网与跨域拦截；② 族文案（`CORS_FAMILY_TEXT`：预检被拒 / 实际响应无 ACAO / 网络不可达 / 服务端不解析 `text/plain` / 服务端未在超时内回话）按族给可执行下一步（这份文案有三条消费路径 —— 诊断面板的结论行、开关**被拒时**的红字 note、开关**开启成功**时的绿字 note（`setCorsBypass` 成功分支）；`friendlyError` / `connectHint` 的族参数分支在产线不可达，见代码注释）；③ 探针只能推出「哪一层被拦」，分不出 OPTIONS 是 500 还是 200-但缺 `Allow-*` 头（两者同形）⇒ 文案不写死单一诊断，细节让用户看 DevTools 的 OPTIONS 状态码。
 - **服务端要补的头（诊断面板「CORS 分层」段用的同一份文本）**：`Access-Control-Allow-Origin: *`（**`file://` 下浏览器发的 `Origin` 是 `null`**，用 `*` 最省事）；`Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access`；`Access-Control-Allow-Methods: POST, GET, OPTIONS`；**OPTIONS 预检直接返回 204**（不要 500、也不要只在 200 里回 JSON）；**错误响应（4xx/5xx）同样要带 `Access-Control-Allow-Origin`** —— nginx 用 `add_header … always;`，Apache / 自研网关在 500 与 `ErrorDocument` 分支同样要补（只给 200 加头是最常见的漏点）。替代方案 = 同源反向代理（页面与接口同源 ⇒ 浏览器不做跨域检查）。
 - **「预检规避兼容模式」只能救一种病**（设置 → 模型 → 高级(兼容性)，默认关、带前置探针）：它把请求改成「简单请求」（`Content-Type: text/plain;charset=UTF-8` + 不带任何自定义头）⇒ 浏览器不发 OPTIONS。**三条死路线写在界面上**：① 有自定义头（`Authorization` / `x-api-key` / `anthropic-version` / `application/json`）就必预检；② 服务端实际响应没有 ACAO 时，简单请求同样被拦；③ Anthropic 协议必带 `anthropic-version` 等头 ⇒ 一律禁用。门控 = **协议 × 是否有 Key 双条件**（`corsBypassGate()`），开启前跑四探针、只有「简单 POST 能读到响应」才允许打开（`setCorsBypass()`），否则拒绝并给族文案；开关关闭时请求头 / 体**逐字节不变**（`headersFor()` 首行短路）。
 - **外部 MCP 的请求自建头、不走 `headersFor()`**：`mcpPost()`（`src/appE.part`）自己拼 `Content-Type: application/json` + `Accept` +（有则）`Authorization` / `Mcp-Session-Id` / `MCP-Protocol-Version` ⇒ 它恒是非简单请求、必过 OPTIONS 预检 —— 因此**既不被「预检规避兼容模式」覆盖，也不受它保护**（开不开该模式，这一路都一样）。外部 MCP 服务器要么自己放行预检（补齐 `Access-Control-Allow-*`），要么走同源反向代理。
@@ -228,6 +279,8 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **本机 8090–8123 端口段被 Windows 保留**（`listen EACCES`）：无头验证脚本与静态服务器统一用 9000+。
 - **无头脚本的就绪判定要盯住「换过文档了」**：`Page.navigate` 之后旧文档还在，只判「有 `.msg` / `#welcome`」会在旧文档上立刻返回 true；带种子数据时旧文档里同样有 `.msg`，所以必须用 `performance.timeOrigin` 变化来确认换过文档。
 - **多套件别并行跑**：同一台机器上并行会因负载互相干扰出假失败，串行跑。
+- **看门狗超时必须大于「正常总耗时 + 充足余量」**：看门狗到点只是**驱动侧放弃等待**——被掐断的套件在页面里**仍会继续跑**（`main()` 的 promise 被丢弃但没停），随即污染下一套件的读数。实测（需求 9）：预算从 540 s 提到 1200 s 后同一套件给出干净读数 `卡片数=1 / files:9 / bytes:50331659`，而"被掐断"轮留下的是 `files:11 / bytes:50331723` ⇒ 差值 `64 B = 20 B + 44 B`，恰是后台残跑写的两个小文件（算术坐实：不是判据松，是读数脏）。
+- **中止类断言必须配负例对照，且要防空转式假假**：只断言"中止之后没有成功"会与"压根没跑起来"混为一谈。做法是另跑一轮**撤掉中止动作**的对照（夹具要足够大），让**同一条判据**对着它求值 ⇒ 必须为 `false`（证明这条判据对"中止没生效"有咬合力）；负例轮还要独立断言"确实跑起来过"（出现进行中状态、只留一张卡、结果文本含 `"ok":true`），否则判假的原因是空转而非缺陷。
 - **`file://` 只能自己开无头 Chrome 验**：WebBridge 打不开 `file://`；用 CDP 的 `Page.navigate` 到 `file:///…` 再 `Runtime.evaluate`。
 
 ### 构建与产物
@@ -236,6 +289,19 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **改 `src/*.part` 后必跑构建链**：`node scripts/build.js && node scripts/syntax.js && node scripts/lint.js`；产物 html 是构建结果，手改会被下一次构建覆盖。
 - **JS 代码里的 `</script` 序列会提前终止脚本块**：内嵌载荷的生成脚本统一把它转义成 `<\/script`（语义等价），并断言 `<!--` / `<script` 出现即报错中止。
 - **新增分段不得提前闭合 IIFE**：只有 `appE.part` 结尾收 IIFE 与 `</html>`。
+- **`jupyterlite.part` 的读取口径与 pyodide 载荷逐字同款、无捷径**：按字节读 + **含 CR 即 `exit 1`**（该载荷按**字符数**记长，CRLF→LF 归一会让段长整体错位——不要"顺手统一行尾"）；**缺 `src/jupyterlite.part` 不是错误**：`build.js` 打印警告 + 注入 `JL_AVAILABLE=false` 的**极小占位段**（不 `exit 1`，只让 Jupyter 入口整体不可用）。`appJ.part` 插在 `appD` 与 `appE` 之间，`appE` 仍必须是最后一段。
+- **`make-jupyterlite-part.js` 的载荷不含 pyodide core**：`pyodide.asm.mjs` / `pyodide.asm.wasm` / `python_stdlib.zip` / `pyodide.js` 由主页面 `#pyodide-assets` 在运行期复用（有强断言守着，重复打包会让三档体积白涨）；一次生成三件交付物（站点段 + Jupyter 专用锁 + 合并后的 `all.json`）；站点 5 处程序化改写的**唯一权威表** = `scripts/jupyterlite-patches.json`（要改站点行为改它，不在 `vendor/` 上手改——`vendor/` 是只读取件区）。
+- **`src/*.part` 有超长行：Bash `grep`/`cat` 直扫会把工具层打崩**：`src/*.part` 最长行 **18,426,328 字符**（`pyodide.part`，`pyodide-normal.part` 同值），`≥100 KB` 的行共 **175 条**。⇒ **禁止** Bash `grep`/`cat`/`sed -n p` 直扫 `src/*.part`；**一律**用 `Grep` 工具（"全库"语义**须 `include_ignored=true`**：它默认遵守 `.gitignore`，会静默跳过 `src/pyodide-{normal,minimal}.part` 与 `AzusaAI-WebUI-*.html`）或 `grep -c`；必须在 Bash 里扫时，输出**必须 `| head -c N` 字节封顶** —— **`head -20` 只封行数、不封字节**（实测 `grep -n … src/*.part | head -20` 命中 3 行、输出 **15,122,637 B**，`head -20` 一行都没滤掉）。**由来**：同一类缺陷（grep 判据的**作用域 / 形状 / 期望值**）在本项目**第三次复发** —— `desktop-icon` 方案 §3 S0 ① 的 `# 期望：空` 实测 **3 行 / 15,122,637 B** ⇒ **连崩三任 Worker**（工具层 `RangeError: Maximum call stack size exceeded`；`grep` 自身退出码正常 ⇒ 报错不指向凶手）；取证报告 = `shared/progress/desktop-icon-s0-crash-rca.md`；方案审查口径见 `shared/decisions/plans-decision-gates.md`「常设审查项 · grep 判据三查（E-10）」。
+
+### 验证取证纪律（0.2.0 起固化）
+
+- **多轮跑必须逐轮落「轮次子目录」**：`shared/tmp/{批}/out/r1/`、`out/r2/`… —— **共用一个 `out/` 会被末轮覆盖**，于是报告里「全部留档 / 中间 FAIL 轮已留档」的说法与磁盘实际不符（本项目**真的发生过一次**：某批第 2 任的 3 个 FAIL 轮被末轮覆盖，全库 grep 无留存，审查只能记一条「声明与磁盘不符」）。
+- **报告里凡写「已留档」的，落笔前必须 `ls` 复核一次**。这是同一条纪律的另一半：光有子目录还不够，"我以为留了"不算留。
+- **证据三件套**：① **stdout 全量日志**（不得只留摘要）② 读数 JSON ③ 截图；且**权威交付路径只能有一份**（`shared/progress/{批}-done.md`），并发的第二实例必须写进自己的私有子目录（`shared/tmp/{批}/mine/`），报告头部写明**自己的实例标识（端口 / profile）**。
+- **判据文件的 mtime 必须早于末次运行**：改了判据不复跑 ⇒ 结论作废。改判据（断言、期望值、预算/超时、计数口径）必须写全**四段范式** = 原判据是什么 / 为何不成立 / 新判据是什么 / **新判据为何仍能抓住真缺陷**；**改动方向是「放宽」时**还必须配**负例注入**证明新判据会 FAIL。
+- **看门狗预算要大于「正常总耗时 + 充足余量」**（理由与实测见上面 `file://` 段的同名条目：被掐断的套件会在后台继续跑并污染下一轮读数）。
+- **改判据装置必须留档「改前原文 + 装置自身 md5」**（D3 装置留档纪律）：每次改验证装置（`*-inpage.js` / 运行器 / `lib.js` 一类）都要落**当轮**的 `out/rN/criteria-before.md`（改前原文 + 四段范式），并把**装置自身的 md5** 写进**当轮** `env.json`。只记文件名会让后续审计无法判定"这条读数属于哪一版装置"—— 本项目实际发生过两回：① 某一轮装置改判据既**没有** `criteria-before.md`、源码注释还把版本归属标错，审计者按注释去查的是一份**不存在**的留档；② `env.json` 的装置 md5 只自第 13 轮起才有，前 12 轮一律 `undefined`，该段读数**无法归属**。
+- **"翻转型负例"必须给 `ORIG_MD5` 守卫 + `.bak` 字节级还原证明**：证明"某一条款承重"最省的做法是一次性翻转器（形态 = `node patch-*.js apply | revert | status`，**批内临时件、用完即删，不进 `scripts/`**），它至少要满足：① `apply` 前**现取**源码 md5 并与脚本内的 `ORIG_MD5` 比对，不符即 `REFUSE`（防在非终态 / 非本批交付态上误翻转）；② **锚点唯一性检查**（目标串命中数 ≠ 1 即 `REFUSE`）；③ `apply` 先把原文写 `.bak`、**只改一行**；④ 翻完必须 `build` → 跑完 → `revert` → **再 `build`**，且 `revert` 用 `.bak` 做**字节级还原**并回报 `md5 / 字节数 / ok`；⑤ 负例轮与对照轮用**同一装置、同一臂**，只差那一个开关 —— 否则无法把"判据有判别力"与"装置/环境变了"分开。样板见本项目 `patch-d2-bite.js`（D2 分离双向轮：`apply` ⇒ 删除传播臂 `C6DEL` FAIL（件仍在、状态行"本轮不判任何删除"）/ `revert` ⇒ 逐位回原值 ⇒ PASS）。
 
 ---
 
@@ -313,6 +379,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | `CX_TRIGGER_DEF` / `CX_TRIGGER_MIN` / `CX_TRIGGER_MAX` | 85 / 60 / 95 | 自动压缩阈值（%），设置面板可调；`settings.compactTriggerPct` |
 | `CX_WARN_GAP` | 15 | 近极限系统提醒阈值 = 触发阈值 − 15（下限 50），与自动压缩同源 |
 | `CX_RESERVE_MIN` | 16384 | 冗余触发项：`reserve = min(max(本值, win×0.05), win×0.5)`（照 Kimi 的 `reserved < max` 守卫） |
+| `CX_OVERFLOW_PER_TURN_MAX` | 3 | 溢出恢复**每次生成轮**的次数上限（借鉴-1；达到后不再自动重试，交由用户处置） |
 | `CX_KEEP_RATIO` / `CX_KEEP_MIN_TOK` / `CX_KEEP_MAX_TOK` | 0.15 / 8192 / 20000 | 保留尾部预算 = `clamp(round(win×0.15), 8k, 20k)` |
 | `CX_HEAD_TOK` | 2000 | 最早的用户输入保留预算（`keepHead`，整条原文，不截断） |
 | `CX_KEEP_MAX_MSGS` | 8 | 保留尾部最多几条消息（`auto` 向左扩展时的约束） |
@@ -341,19 +408,22 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 **摘要与用量环**：摘要请求的 token 消耗**不进**用量环与累计统计（它是管理开销）；压缩成功后目标会话的实测锚点作废（`usage.exact = false`、`lastMsgId = ""`，累计量不动），否则用量环不下降、去重与触发判定失真。
 
+**界面口径（0.2.0 · U-4）**：压缩在对话里是**工具气泡原位 + 实时流式**——运行中卡带阶段行（去重、≤8 行）与摘要草稿逐字增长（活体标记 `[data-cx-live]`，收敛即消失）；完成卡带 chips（丢弃条数 / 时间范围 / 释放量 / 尝试次数；输入曾缩窗另标「摘要输入曾缩窗（丢 N 条）」）；失败卡正文固定「本次压缩没有改动任何消息，原文仍完整保留。」+「重试 / 知道了」。**位置 = 原位、永不挪位（不置顶）**；运行 / 失败卡**不得**退化为可折叠工具卡（无 `data-tool-toggle` / `aria-expanded` / 箭头）。失败与取消对 `conv.messages` 的改动数必须为 0、不残留半截草稿。三入口（`/compact`、`Compact` 工具、设置「立即压缩」）共用同一条运行链；`Ctrl+X` 取消走 `cxRunActive → cxAbortActive`（**不**调 `stopGenerating`）。触发侧两条口径：溢出恢复每轮至多 `CX_OVERFLOW_PER_TURN_MAX`(3) 次；冗余预留 `CX_RESERVE_MIN` 参与 `reserve` 计算（上限 `win×0.5`）。
+
 **版本号唯一口径**：`APP_VERSION`（`appA.part`）是用户可见版本号的唯一权威 —— 环境面板、环境信息、导出备份的 `version`、MCP `clientInfo`、关于弹窗、`<meta name="version">`（启动时同步）全部读它；不要在别处再写版本字面量。
 
-### 4.6 文件工具的多媒体读取（Read 图片 / 办公文档 / PDF）
+### 4.6 文件工具的多媒体读取（Read 文本 / 图片 · ReadOffice 办公文档 / PDF）
 
-**路径双写（唯一权威句 `WS_PATH_DUAL_NOTE`，`appE.part`）**：工作区 6 个文件工具一律用 `/…`（`wsNormPath` 只认 `/` 开头、禁 `..` 与反斜杠），而 Python 解释器里同一份数据挂载在 `/workspace`（`PY_MOUNT` / `pyContainerPath`）——**两者指向同一份文件**。这句话同时进 `【工作区】` 上下文块（每轮请求的 system，≈100–130 token 成本）、6 个文件工具与两个执行工具的 `modelDesc`、`PV_TASK_COMMON`（4 个任务类工具共用尾段）。两条定向纠错都只改错误文案：工作区工具路径以 `/workspace` 开头且报 ENOENT 时，`wsToolRun` 追加口径提醒，且**只在"去掉前缀后的路径确实存在"**（同步查 `WS_META_CACHE[wsId].tree`，缓存缺失就不确指）时给出「你要的可能是 /x」；Python 侧的 `__pyShimOpen` 在 `FileNotFoundError` 分支里对 `not p.startswith(_KIMI_MOUNT) and os.path.exists(_KIMI_MOUNT + p)` 的情形补一句「这个文件在工作区里是 "/workspace" + 原路径」——**只覆盖 `builtins.open`**：`os.open` 是另一个引用，`pathlib.Path.open/read_text` 走的是 `io.open`（**不在覆盖内**），`pandas.read_csv` / `PIL.Image.open` 等最终走 `builtins.open` 的路径在内；**只加文案、不改异常类型**（仍是 `FileNotFoundError`）。两点实现约束（回归教训）：① 挂载点由 JS 侧 `JSON.stringify(__PY_MOUNT)` 拼成 **Python 字面量** `_KIMI_MOUNT` 注入 —— 裸写 `__PY_MOUNT` 是 worker 的 JS 变量，Python 命名空间里不存在（会 `NameError`，把 `FileNotFoundError` 换成更难读的报错）；② wrapper 的安装与「本次有没有超预载上限文件」**解耦**（工作区挂载即安装，`_KIMI_REMOTE` 每次 run 重写），否则没有超限文件时该提示永不生效；安装失败往 stderr 打一行诊断而不是静默吞掉。
+**路径双写（唯一权威句 `WS_PATH_DUAL_NOTE`，`appE.part`）**：工作区 9 个文件工具一律用 `/…`（`wsNormPath` 只认 `/` 开头、禁 `..` 与反斜杠），而 Python 解释器里同一份数据挂载在 `/workspace`（`PY_MOUNT` / `pyContainerPath`）——**两者指向同一份文件**。这句话同时进 `【工作区】` 上下文块（每轮请求的 system，≈100–130 token 成本）、其中 8 个文件工具（第 9 个 `DownloadForUser` 用**引用式**一句「同其它工作区工具」，不复制原文）与 `ExecutePython` 的 `modelDesc`（`ExecuteJavaScript` 为手抄同句）、`PV_TASK_COMMON`（4 个任务类工具共用尾段）。两条定向纠错都只改错误文案：工作区工具路径以 `/workspace` 开头且报 ENOENT 时，`wsToolRun` 追加口径提醒，且**只在"去掉前缀后的路径确实存在"**（同步查 `WS_META_CACHE[wsId].tree`，缓存缺失就不确指）时给出「你要的可能是 /x」；Python 侧的 `__pyShimOpen` 在 `FileNotFoundError` 分支里对 `not p.startswith(_KIMI_MOUNT) and os.path.exists(_KIMI_MOUNT + p)` 的情形补一句「这个文件在工作区里是 "/workspace" + 原路径」——**只覆盖 `builtins.open`**：`os.open` 是另一个引用，`pathlib.Path.open/read_text` 走的是 `io.open`（**不在覆盖内**），`pandas.read_csv` / `PIL.Image.open` 等最终走 `builtins.open` 的路径在内；**只加文案、不改异常类型**（仍是 `FileNotFoundError`）。两点实现约束（回归教训）：① 挂载点由 JS 侧 `JSON.stringify(__PY_MOUNT)` 拼成 **Python 字面量** `_KIMI_MOUNT` 注入 —— 裸写 `__PY_MOUNT` 是 worker 的 JS 变量，Python 命名空间里不存在（会 `NameError`，把 `FileNotFoundError` 换成更难读的报错）；② wrapper 的安装与「本次有没有超预载上限文件」**解耦**（工作区挂载即安装，`_KIMI_REMOTE` 每次 run 重写），否则没有超限文件时该提示永不生效；安装失败往 stderr 打一行诊断而不是静默吞掉。
 
-**Read 的类型路由**（`wsReadTool`，顺序即优先级）：文本（含 svg；输出逐字节不变）→ 办公 / PDF（后缀或 magic）→ 图片（magic 命中且 mime 是 `image/*`，或后缀 ∈ 可解码集合 png/jpg/jpeg/gif/webp/bmp/avif/ico/tif/tiff）→ 宏格式单独拒 → 其余二进制给新 EBINARY 文案（`zipfile` 解包再 Read 是新增的真实出路）。
+**Read 的类型路由**（`wsReadTool`，顺序即优先级）：文本（含 svg；输出逐字节不变）→ 办公 / PDF（后缀或 magic）⇒ **不再代读，直接返回 `EINVAL` 重定向**（按后缀逐类给词「办公文档 / 演示文稿 / 表格 / PDF」+ 可照抄的 `path` JSON 指向 `ReadOffice`；判据用 `wsDocKindOf` 的返回值而非后缀 ⇒ magic 兜底时不会误判）→ 图片（magic 命中且 mime 是 `image/*`，或后缀 ∈ 可解码集合 png/jpg/jpeg/gif/webp/bmp/avif/ico/tif/tiff（= `WS_READ_IMG_EXT`，与 `README.md` 的枚举同集；tif/tiff 的真 TIFF 本机浏览器解不开，进图片路径只为拿到「无法解码 + 提示先转换」的可读错误））→ 宏格式单独拒 → 其余二进制给新 EBINARY 文案（`zipfile` 解包再 Read 是新增的真实出路）。重定向分支**不产生任何解析副作用**（不调解析库、不 OCR）；对称地，`ReadOffice` 遇纯文本 / 图片也返回 `EINVAL` 指向 `Read`。
+**ReadOffice 的类型路由**（`wsReadOfficeTool`，校验与路由都在**解析之前**完成）：`path` 必填 → 三条参数互斥校验（`page_offset` 与 `line_offset` 互斥 / `column_offset` 不能与 `page_offset` 同给 / `column_offset` 不能与负数 `line_offset` 同给，均为 `EINVAL`）→ 纯文本指 `Read` → 办公六格式或 PDF 走既有解析链 → 图片指 `Read` → 宏格式沿用 EBINARY（「请另存为 .docx / .xlsx / .pptx 后再用 ReadOffice 读」）→ 其余二进制走 `wsBinaryErr`。
 
 **图片预算（单一权威 `READ_*` / `TOOL_MEDIA_CHAT_*`，`appE.part`）**：最长边 ≤ `READ_IMG_MAX_EDGE`(2000) 且与 `imgMaxSide()` 取小；尽力压到 `READ_IMG_BYTE_BUDGET`(256 KiB)，梯子 = PNG（保 alpha）→ JPEG 0.8/0.6/0.4 → 边长回退 2000/1000/768/512/384/256；**单张硬顶 = 单次总量 = `READ_IMG_HARD_MAX` = 1 MiB**（压不到就报错、**不发原图**）；单次交付 `READ_MEDIA_MAX_IMAGES`(4) 张、累计 ≤ `READ_MEDIA_TOTAL_BYTES`(1 MiB)，超出按读取顺序保留并在状态行写「另有 N 张超出单次上限未附带」；直通（字节 ≤ 256 KiB、边 ≤ 上限、mime ∈ `SAFE_IMG_MIME`）**仍会解码验证一次**再交付原字节——这一层挡住"截断/损坏但 IHDR 还写着小尺寸"的假直通。解码两道门：像素 `READ_IMG_DECODE_MAX_PX`(40M，先用 `wsImgSniffDims` 嗅 PNG/JPEG/GIF/BMP/WebP 尺寸头，**嗅不到尺寸的 avif/ico 只能在解码后复核**，这是已知残差) + 字节 `READ_IMG_DECODE_MAX`(32 MiB)，取与。交付 mime 收敛到 `{image/png,image/jpeg}`（重编码）∪ `SAFE_IMG_MIME`（直通）——**源 mime 不在 SAFE 集时不走「压不动回原字节」**（否则交付 mime 会落在收敛集合之外，例如 1×1 BMP 交付 `image/bmp`），改为交付最佳重编码（仍 ≤ 单张硬顶）。
 
-**非视觉 → OCR**：`wsOcrTextOf` 是唯一出口；输入是**按上表缩放后的画布 dataURL**（与附件 `maybeOcrImage` 同形）；超时 = **整次 Read 的总预算** `min(READ_OCR_TIMEOUT_MS(120 s), toolLimit("timeoutMs"))`，多页共享、页间查 `ctx.signal.aborted`、文本累加到工具结果预算即停；引擎不可用 / 超时 / 无文字各有独立可读文案（**不写"请重试"**）。
+**非视觉 → OCR**：`wsOcrTextOf` 是唯一出口；输入是**按上表缩放后的画布 dataURL**（与附件 `maybeOcrImage` 同形）；超时 = **整次读取的总预算** `min(READ_OCR_TIMEOUT_MS(120 s), toolLimit("timeoutMs"))`（`Read` 读图片与 `ReadOffice` 读文档图片共用同一常量），多页共享、页间查 `ctx.signal.aborted`、文本累加到工具结果预算即停；引擎不可用 / 超时 / 无文字各有独立可读文案（**不写"请重试"**）。
 
-**图文按序融合（非视觉模型的 PDF / 办公文档，批 B；落地记录 `shared/progress/netdocs-B2b-done.md`）**：Read 侧与附件侧共用 `appD.part` 的三个助手——`ocrSeqCands`（逐张 `wsImgFitForModel` → `wsOcrTextOf` + 预算 / 中止 + 计数，**不做任何文案**）、`ocrBlockText`（块头唯一来源，空 / 纯空白 ⇒ `""`）、`docFusePages`（按页插块；无块 ⇒ 原样返回）。块格式（唯一口径）：`【第 N 页 · 图 k · 本机 OCR】`；office 段内不分区 ⇒ `【图 k · 本机 OCR】`（label 由 OfficeKit 给）；整页兜底 ⇒ `【第 N 页 · 整页图像 OCR(含文字层重复,可能有误差)】`（这条**不带**「· 本机 OCR」）。预算：Read 侧 `READ_DOC_OCR_MAX_IMAGES`(12) / `READ_DOC_OCR_MAX_PAGES`(8) / `READ_OCR_TIMEOUT_MS`(120 s)；附件侧 `ATT_OCR_MAX_IMAGES`(6) / `ATT_OCR_TIMEOUT_MS`(60 s，**整次解析共享、只覆盖 OCR 阶段**；取图调用各另带 60 s 超时)/ 扫描页数 = `min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES)`；字符预算两边都 = `max(512, toolLimit("maxOut") - 512)`，附件侧另受 `ATTACH_TEXT_MAX` 截断。取图 = `PDFKit.pageImages`（**只有 `mode:"rect"` 的页用 rect**，`mode:"full"` 走整页护栏）→ `renderCrops`，失败单调降级到整页 `renderPages` 并注记。落点：Read 侧进工具结果 + 状态行；附件侧进 `att.text` / `att.ocrImgs` / `att.degraded`（视觉路径与无图文档逐字节不变）。
+**图文按序融合（非视觉模型的 PDF / 办公文档，批 B；落地记录 `shared/progress/netdocs-B2b-done.md`）**：ReadOffice 侧与附件侧共用 `appD.part` 的三个助手——`ocrSeqCands`（逐张 `wsImgFitForModel` → `wsOcrTextOf` + 预算 / 中止 + 计数，**不做任何文案**）、`ocrBlockText`（块头唯一来源，空 / 纯空白 ⇒ `""`）、`docFusePages`（按页插块；无块 ⇒ 原样返回）。块格式（唯一口径）：`【第 N 页 · 图 k · 本机 OCR】`；没有页 / 表标记的 office 段内不分区 ⇒ `【图 k · 本机 OCR】`（label 由 OfficeKit 给）；整页兜底 ⇒ `【第 N 页 · 整页图像 OCR(含文字层重复,可能有误差)】`（这条**不带**「· 本机 OCR」）。**插入位置（P2 的 S15 起）**：`wsDocumentPack` 的融合分支按 `kind` 选布局 —— `kind === "pdfPage"`（PDF，以及 **pptx**——它的正文自带 `----- 第 N 页 -----` 幻灯标记）⇒ `layout:"pages"`，块插到**对应页 / 幻灯段之后**（`docFusePages`；未匹配到页号的块追加文末并注明 `(原页未在文本中找到)`）；其余 office（docx / xlsx）⇒ `layout:"flat"`（正文之后按序接）。**附件侧（`attOcrFuse`）不受 S15 影响**：office 三格式仍一律 `flat`，只有 PDF 用 `pages`。预算：ReadOffice 侧 `READ_DOC_OCR_MAX_IMAGES`(12) / `READ_DOC_OCR_MAX_PAGES`(8) / `READ_OCR_TIMEOUT_MS`(120 s)；附件侧 `ATT_OCR_MAX_IMAGES`(6) / `ATT_OCR_TIMEOUT_MS`(60 s，**整次解析共享、只覆盖 OCR 阶段**；取图调用各另带 60 s 超时)/ 扫描页数 = `min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES)`；字符预算两边都 = `max(512, toolLimit("maxOut") - 512)`，附件侧另受 `ATTACH_TEXT_MAX` 截断。取图 = `PDFKit.pageImages`（**只有 `mode:"rect"` 的页用 rect**，`mode:"full"` 走整页护栏）→ `renderCrops`，失败单调降级到整页 `renderPages` 并注记。落点：ReadOffice 侧进工具结果 + 状态行；附件侧进 `att.text` / `att.ocrImgs` / `att.degraded`（视觉路径与无图文档逐字节不变）。
 
 **媒体怎么进模型（`m.media` 内联 + 协议双形态）**：消息上唯一新字段 `m.media[]`（`kind/mime/data/w/h/bytes/path/label/from/srcW/srcH/scaled`；`resultText` 只写文本 + 「已附带 N 张」）。payload 项内部字段 `media` 由 `payloadMessages` 带出：**Anthropic** 走 `tool_result.content` 内容块数组（文本 + image）；**OpenAI 兼容**走"tool 文本 + **按工具轮分组**的一条合成 user 消息"（连续 `role==="tool"` 段 = 同一工具轮，组内 media 合并、插在段末最后一条 tool 之后，跨段不合并 ⇒ 不产生 `tool→user→tool` 交错）；合成消息**只存在于请求体**，不落盘、不进界面。工具轮内还有一个 `msgList.push({role:"tool"})`（续答轮），**必须带上同一个 media**，漏了就是"本轮模型看不到刚读的图"。
 
@@ -363,13 +433,28 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 **存储代价（如实）**：媒体内联在消息里（不新增 blob 键 ⇒ 不触碰释放链），单条消息最大 ≈1.4 MB base64；三条放大面 = 每次 `saveState(true)` 整条会话写、导出备份整份 `JSON.stringify`、历史图片逐轮重发（软护栏封顶）。**「优化存储」可回收**（`stripAttachmentData` 在 `m.content` 早退之前删 `m.media`，`keepIds` 保护口径不变）。**计量口径**：`storageBytes()` 量的是 localStorage 设置串，**不是会话存量** —— 报告占用请用 `navigator.storage.estimate()` / IDB 实测，不要拿它宣称"媒体存储已计量"。
 
-**Read 复用办公 / PDF 引擎的边界**：复用引擎（`OfficeKit.parse` / `PDFKit.extractText|renderPages` / `OCRKit.recognize`）与数值（`ATTACH_TEXT_MAX`、`officeSizeCap()`、`pdfDpi()`、`pdfMaxPages()`、`ocrLangs()`、`SAFE_IMG_MIME`、`IMAGE_EXT/OFFICE_EXT/MACRO_EXT`），**不复用** `resolveOffice/resolvePdf/resolveImage` 的 File+vision+toast 包装（Read 的入参是 Blob + 目标会话，包装会引入"生成期间切走会话"的判定错会话问题）；PDF 走文本优先、不吃 `pdfMode()` 设置。文档状态的"文件:…"信息一律并入**末尾状态行**（不占行号，`line_offset` 语义与文本读一致），`clipped` 在状态行标注。
+**ReadOffice 复用办公 / PDF 引擎的边界**：复用引擎（`OfficeKit.parse` / `PDFKit.extractText|renderPages` / `OCRKit.recognize`）与数值（`ATTACH_TEXT_MAX`、`officeSizeCap()`、`pdfDpi()`、`pdfMaxPages()`、`ocrLangs()`、`SAFE_IMG_MIME`、`IMAGE_EXT/OFFICE_EXT/MACRO_EXT`），**不复用** `resolveOffice/resolvePdf/resolveImage` 的 File+vision+toast 包装（ReadOffice 的入参是 Blob + 目标会话，包装会引入"生成期间切走会话"的判定错会话问题）；PDF 走文本优先、不吃 `pdfMode()` 设置。文档状态的"文件:…"信息一律并入**末尾状态行**（不占行号，`line_offset` 语义与文本读一致），`clipped` 在状态行标注。
+
+**ReadOffice 的两级偏移坐标（页 / 表 / 幻灯 + 图片序号；本节为正式口径）**
+
+| 槽位 | 参数 | 语义（唯一权威 = 工具条目的 `inputSchema.description`） |
+|---|---|---|
+| 第一级 · 页 / 表 / 幻灯 | `page_offset` + `n_pages` | 1 起；负数从末尾倒数（-1 = 最后一页）；省略即从头；省略 `n_pages` 即到文档末尾（仍受 `max_chars` 约束）。定位靠**文档自带标记**：PDF 与 **pptx** 都用 `----- 第 N 页 -----`（`PDF_PAGE_SEP_RE`，与附件侧同一字面量；pptx 标记由 office 胶水写，见 `docs/OFFICE-NOTES.md §6`）、xlsx / xls 用胶水写的 `# <表名>` 段头 |
+| 第二级 · 全局行号 | `line_offset` + `n_lines` | 行号是**整篇的全局行号**（与文本读同一坐标系、含尾换行的计法一致）⇒ 可与页 / 表坐标互相换算；给出 `page_offset` 时不得同给 `line_offset` |
+| 续读超长行 | `column_offset` | 只用于按行读的续读；与 `page_offset` **或**负数 `line_offset` 同给都报 `EINVAL` |
+| 图片序号 | `image_offset` + `n_images` | 1 起、按文档顺序编号（**pptx** 的候选图带真幻灯号 ⇒ 可直接用于块头标注与 `page=0` 判别；docx / xlsx 的解析层页码只是"拿不到真页码时的兜底序号"—— **两者都只按 `image_offset` 取窗口**，pptx 的真幻灯号**不参与**页窗口过滤：该过滤只存在于 `wsPdfImgCands`、也只由 PDF 调用点传 `pageFrom/pageTo`）；给出 `image_offset` 时**只回图片不回正文** |
+| 单次返回量 | `max_chars` | 默认取本次可用预算上限，硬上限 65536 |
+
+- **三种 `kind`**（`docSectionIndex` / `wsDocPageView`）：`pdfPage`（自带页标记：PDF 与 **pptx**）、`sheet`（xlsx / xls 的表段头）、`none`（docx / doc / ppt **没有任何页 / 表信息** ⇒ 给 `page_offset` 一律 `EINVAL`「本格式没有页/表标记…请用 line_offset 按行读」，状态行写「页标记:无」）。**pptx 在 P2 之前是第四种 `slides`**（有真实幻灯数但没有幻灯标记 ⇒ 保留「共 N 页」、按页定位报错）；S11 给 pptx 补上幻灯标记后它**并入 `pdfPage` 族**（S15 把 `appE` 的 `kind` 映射改到该族，`slides` 这个值已退役）。**空幻灯没有正文 ⇒ 没有标记 ⇒ 段号会缺号**：段序按标记出现先后（在"第 4 张为空幻灯"的样件上 `page_offset=4` 命中「第 5 页」段），段数 ≠ 幻灯数。
+- **窗口透传**：页 / 表窗口（`meta.window = {start,end}` 的全局行闭区间）由 `wsDocPageView` → `wsLinePageResult` 一路透传；漏传 ⇒ 窗口不滑动（表读仍从第 1 行起）。`Read` 的文本路径**永不**传 `meta.window` ⇒ 恒走旧语义。
+- **状态行（正文视图）**：`[file 路径 · 格式 · 共 N 页/表 · 本次 第 a-b 页 · total 总行数 · shown 显示范围 · eof 是否到末尾 · size 字节数 · mtime 修改时间 · next 续读参数]`；图片视图以「图片 共 N 张 · 本次 第 a-b 张」开头。`next {…}` 由 `wsDocNextArgs` 生成，是**紧凑 JSON、不含 `path`、可直接照抄**进下一次调用的增量参数，且**仅在续读坐标存在时生成**（只被 `truncatedExtra` 置真而无续读坐标的例子不算截断例）。其中「共 N 页/表」是**解析层声明的总数**（pptx = `docProps/app.xml` 的幻灯数，**含空幻灯**）；有标记的**段数**与之不等时（空幻灯没有正文 ⇒ 没有标记）补写段数，形如「共 6 页(5 段有标记)」—— 让它与越界文案（按**段数**计）的两个数在第一次读到时就在一起。
+- **超范围不静默**（S3b）：office 抽取文本超过胶水的 `TEXT_MAX`（**默认 131,072 字符**，P2 的 `S12` 起可由包装层按次覆盖 —— `OfficeKit.parse(buf, ext, {textMax: n})`，缺省 / `0` / 非法值退回默认；`ReadOffice` 工具自己没有这个参数、恒用默认）时，超限部分已被 `slice` 掉（**任何偏移都取不到**）⇒ 状态行如实注记「仅前 N 字符,剩余内容本工具读不到」；PDF 正文抽取上限 = `READ_PDF_TEXT_MAX_PAGES`(200 页) 与 `READ_PDF_MAX_CHARS`(400,000 字符)，命中则给「仅前 N 页 / 仅前 N 字符…（分窗读属后续批次）」，两条原因可同时成立。**两条硬边界都不许用 `ExecutePython` 去拆**，如实告诉用户即可。
 
 ### 4.7 提示词风格契约（模型可见文本的唯一风格口径）
 
 > 适用面 = 内置 `AGENT_TOOLS` 的 `modelDesc` + 四个系统注入块（`wsContextBlock` / `pvTaskBlockText` / `mcpInstructionsBlock` / `cxContextBlock`）+ 工具结果注记 + 附件部件文本。**外部 MCP 工具描述与 `mcpHistoryPlaceholder` 显式豁免**（内容由服务器直通，不满足本契约属正常）。
 
-- **骨架（S1/S2）**：首行 = 单句总述（6 个文件工具与任务 / 压缩类工具沿用**边界句**首行，功能句紧随其后；`ExecuteJavaScript` / `ExecutePython` / `AskUser` / `PythonPackages` 为功能句首行）→ 空行 → `- ` 要点；要点 >8 条或跨 ≥2 话题时分节（`**短标题**` 独占一行；`ExecutePython` 五节）。**唯一例外**：`WS_PATH_DUAL_NOTE`（b26 路径口径句）在文件工具 `modelDesc` 里保持「首句后独立一行」的原位 —— 它是每轮 system 里唯一的路径口径来源、被 9 处引用，不为空行形态挪位。
+- **骨架（S1/S2）**：首行 = 单句总述（9 个文件工具与任务 / 压缩类工具沿用**边界句**首行，功能句紧随其后；`ExecuteJavaScript` / `ExecutePython` / `AskUser` / `PythonPackages` 为功能句首行）→ 空行 → `- ` 要点；要点 >8 条或跨 ≥2 话题时分节（`**短标题**` 独占一行；`ExecutePython` 五节）。**唯一例外**：`WS_PATH_DUAL_NOTE`（b26 路径口径句）在文件工具 `modelDesc` 里保持「首句后独立一行」的原位 —— 它是每轮 system 里唯一的路径口径来源、被 10 处引用，不为空行形态挪位。
 - **语气（S3/S4/S13）**：中文祈使管做什么、陈述管是什么；强约束用加粗，**不引英文强调词**（`NEVER` / `DO NOT` / `MUST` 0 命中）；每条「禁止 / 必须」附理由。
 - **反例与替代（S5）**：每个「不要用 / 不能」都要给出替代或指路（如 `Read` 的「二进制 → 用 ExecutePython 以 `"rb"` 读」，且明说**不要重试**）。
 - **参数权威（S6）**：参数事实（必填性 / 默认 / 单位 / 上限 / 省略行为）的**唯一权威 = `inputSchema.description`**；`modelDesc` 只留「关键参数」要点。凡 `modelDesc` 删掉或弱化的参数事实，必须能在 schema 里逐条找到（审查时对拍，见 4.7 表）。
@@ -398,3 +483,4 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - 工具结果的可视化渲染（表格 / 图片 / 链接）而不只是 JSON 代码块。
 - 把 Tesseract 的训练数据块在解码后从 DOM 里删掉（现在常驻约 9MB）。
 - 附件：图片压缩质量可调、按页选 PDF、OCR 语言按图片自动判断。
+- **Jupyter 子页的独立性（0.2.1 备选）**：现形态子标签页依赖主页面（`about:blank`、刷新白屏 = J-TAB-1）；解法 = A1 子页内核资产自举 + A2 传输迁 localStorage + `storage` 事件。落地前不要动子页的承载形态（理由见 §3「JupyterLite 宿主与镜像」）。

@@ -9,8 +9,9 @@ const dir = path.join(__dirname, '..', 'src');
      当前无被掩盖的真缺陷,但这是结构性的假阴性通道,所以按组隔离声明集合)。
    两个 office 源文件另有构建期保障(make-office-part.js 的块结构编译探针 + 十条断言),两者互补 */
 const GROUPS = [
-  { label: 'appA-appE', files: ['appA.part', 'appB.part', 'appC.part', 'appD.part', 'appE.part'] },
+  { label: 'appA-appJ', files: ['appA.part', 'appB.part', 'appC.part', 'appD.part', 'appJ.part', 'appE.part'] },
   { label: 'officekit.src.js', files: ['officekit.src.js'] },
+  { label: 'officewrite.src.js', files: ['officewrite.src.js'] },
   { label: 'office-worker.src.js', files: ['office-worker.src.js'] }
 ];
 

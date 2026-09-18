@@ -783,6 +783,378 @@ function syncFaviconUI() {
   else cur.textContent = custom ? ("自定义图标(" + fmtBytes(custom.length) + ")") : "默认图标(青色小猫)";
   var up = $("btn-fav-upload");
   if (up) up.disabled = !can;
+  dskSyncUI();
+}
+
+/* ================= 桌面快捷方式(.url + 自定义 .ico):需求 8 =================
+   `.html` 文件**本身**的图标由系统按「扩展名 → 文件类型 → 注册表图标」决定,网页无法改写它;
+   可行通道 = 生成 Windows 原生 InternetShortcut(.url),其 IconFile 指向我们按内容哈希命名的 .ico。
+   三条通道:① 两次下载(.ico / .url;主干,永远可用) ② showDirectoryPicker 一键写入(能力 + 协议
+   双门控,不支持则按钮 hidden) ③ 手动方式(界面文案兜底,任何浏览器可用)。
+   格式契约:.url 恰 4 行、CRLF;内容全 ASCII ⇒ UTF-8(无 BOM),含非 ASCII ⇒ UTF-16LE + BOM;
+   IconFile **必须是绝对路径**(同目录相对名实测无效);路径含控制字符或方括号 ⇒ 拒绝生成。
+   命名 `<base>-icon-<crc8>.ico`(crc8 = ICO 内容的 CRC32 十六进制)⇒ 换图标即换文件名,天然绕开
+   资源管理器图标缓存。不新增设置项 / 不新增 IDB 存储区 / 不动 schema / 不暴露任何全局接口。 */
+var DSK_ICO_SIZES = [16, 32, 48, 64, 128, 256];   /* ≤128 写 DIB 条目,256 写 PNG 条目 */
+var DSK_ICO_DIB_MAX = 128;
+/* SVG 源的预光栅化边长 = 最大档尺寸(不再放大,已够各档下采样)。 */
+var DSK_ICO_RASTER_SIDE = 256;
+var DSK_URL_NAME_EXT = ".url";
+/* 图标文件名缓存:src 一旦**尝试过**(含失败)就记下 —— 否则 dskSyncUI() → 后台构建 → 完成后再进
+   dskSyncUI() 会自我重入成死循环。 */
+var DSK_ICON_CACHE = { src: null, name: "" };
+var DSK_ICON_PENDING = null;
+
+function dskSrcDataUri() { return state.settings.customIcon || DEFAULT_FAVICON; }
+function dskSrcLabel() {
+  var custom = state.settings.customIcon || "";
+  return custom ? ("自定义图标(" + fmtBytes(custom.length) + ")") : "默认图标(青色小猫)";
+}
+/* file:// 的 pathname/host → Windows 路径。百分号解码失败(畸形转义) ⇒ 整体放弃、返回 null,
+   由调用方给出可读原因;host 非空 = UNC(``file://server/share/a.html`` → ``\\server\share\a.html``)。 */
+function dskPathToWin(pathname, host) {
+  if (!pathname || typeof pathname !== "string") return null;
+  var raw = pathname.split("/"), out = [], i, s;
+  for (i = 0; i < raw.length; i++) {
+    s = raw[i];
+    if (!s) continue;
+    try { s = decodeURIComponent(s); } catch (e) { return null; }
+    if (!s) continue;
+    out.push(s);
+  }
+  if (!out.length) return null;
+  var joined = out.join("\\");
+  var h = String(host == null ? "" : host);
+  return h ? ("\\\\" + h + "\\" + joined) : joined;
+}
+function dskDirOfWinPath(p) {
+  var s = String(p == null ? "" : p);
+  var i = s.lastIndexOf("\\");
+  return i < 0 ? "" : s.slice(0, i);
+}
+/* 本页文件名去扩展名(即 .ico / .url 的名字前缀);非 file:// 或解析异常 ⇒ 固定兜底名。
+   方括号与控制字符会毁掉 Windows 文件名,一并换成下划线。 */
+function dskBaseName() {
+  var name = "azusa-webui";
+  try {
+    if (String(location.protocol) === "file:") {
+      var parts = String(location.pathname || "").split("/");
+      var last = parts.length ? parts[parts.length - 1] : "";
+      last = last.replace(/\.html?$/i, "");
+      if (last) {
+        try { last = decodeURIComponent(last); } catch (e) { last = ""; }
+        last = last.replace(/[\\\/:*?"<>|\x00-\x1f\x7f]/g, "_");
+        if (last) name = last;
+      }
+    }
+  } catch (e2) {}
+  return name;
+}
+/* 8 位小写十六进制、前导零补齐(= 32 位 CRC32 的十六进制)。ES5 口径:不用 padStart。 */
+function dskCrc8Hex(bytes) {
+  var h = (wsCrc32(bytes) >>> 0).toString(16);
+  return ("0000000" + h).slice(-8);
+}
+function dskIconFileName(icoBytes) { return dskBaseName() + "-icon-" + dskCrc8Hex(icoBytes) + ".ico"; }
+function dskShortcutFileName() { return dskBaseName() + DSK_URL_NAME_EXT; }
+/* -> { text, asciiOnly } | null(null = 卫生检查拒绝)。IconFile 里的 CR/LF/控制字符或方括号可以伪造
+   出额外的 `.url` 行(行注入) ⇒ 直接拒绝,由调用方提示改用「手动方式」。 */
+function dskShortcutText(href, iconPath) {
+  var h = String(href == null ? "" : href);
+  var ico = String(iconPath == null ? "" : iconPath);
+  if (!h || !ico) return null;
+  if (/[\x00-\x1f\x7f\[\]]/.test(ico)) return null;
+  if (/[\x00-\x1f\x7f]/.test(h)) return null;
+  var text = "[InternetShortcut]\r\nURL=" + h + "\r\nIconFile=" + ico + "\r\nIconIndex=0\r\n";
+  return { text: text, asciiOnly: !/[^\x00-\x7F]/.test(text) };
+}
+/* 全 ASCII ⇒ UTF-8 无 BOM;含非 ASCII(中文用户名 / 中文目录)⇒ UTF-16LE + BOM。
+   实测:ANSI / UTF-8 都解析不了中文路径,UTF-16 可以(逐字节手写,不借 TextEncoder 的转码)。 */
+function dskShortcutBytes(text) {
+  var s = String(text == null ? "" : text);
+  if (!/[^\x00-\x7F]/.test(s)) return new TextEncoder().encode(s);
+  var out = new Uint8Array(s.length * 2 + 2);
+  out[0] = 0xFF; out[1] = 0xFE;
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    out[2 + i * 2] = c & 0xFF;
+    out[2 + i * 2 + 1] = (c >>> 8) & 0xFF;
+  }
+  return out;
+}
+/* 源图规格化 —— **SVG 源必须先过这里**。SVG 源没有可信的位图固有尺寸(默认小猫实测
+   naturalWidth/Height = 150×150),而「显式源矩形」的 9 参 drawImage 对 SVG 源在 Chromium(实测
+   122)下是:先按【目标尺寸】光栅化,再把源矩形按【固有尺寸】坐标系解释 ⇒ 图案只占左上角
+   s²/固有边长 个像素(实测六档 16→4 / 32→49 / 48→247 / 64→742 / 128→11455,只有 256 正常)。
+   对策 = 先按最大档边长把 SVG 光栅化成**真正的位图**(矢量源在这一步按该尺寸重绘,不失真),
+   之后一律走位图源的既有路径 —— 位图源的 9 参(含中心裁方)实测正确。
+   非 SVG(用户自定义位图图标)原样返回 ⇒ 那条路径字节级不变(不回归)。
+   非方形 SVG 按固有宽高比放进 n×n,再由 dskIcoDraw 走中心裁方,与位图源同口径。 */
+function dskIconSource(img) {
+  var src = "";
+  try { src = String(dskSrcDataUri() || ""); } catch (e) { src = ""; }
+  if (!/^data:image\/svg\+xml/i.test(src)) return img;
+  var iw = img.naturalWidth || img.width || 0;
+  var ih = img.naturalHeight || img.height || 0;
+  var n = DSK_ICO_RASTER_SIDE, cw = n, ch = n;
+  if (iw > 0 && ih > 0 && iw !== ih) {
+    if (iw > ih) ch = Math.max(1, Math.round(n * ih / iw));
+    else cw = Math.max(1, Math.round(n * iw / ih));
+  }
+  var c = document.createElement("canvas");
+  c.width = cw; c.height = ch;
+  var g = c.getContext("2d");
+  if (g.imageSmoothingEnabled !== undefined) g.imageSmoothingEnabled = true;
+  if (g.imageSmoothingQuality !== undefined) g.imageSmoothingQuality = "high";
+  g.clearRect(0, 0, cw, ch);
+  g.drawImage(img, 0, 0, cw, ch);   /* 4 参 = 整幅 → 目标尺寸;对 SVG 源这才是正确形态 */
+  return c;
+}
+/* ---- ICO(ICONDIR):6 条目(16/32/48/64/128 = DIB,256 = PNG) ----
+   取中心正方区域再缩放(与既有 faviconDraw 同口径)⇒ 无论源图宽高比如何都不会被拉伸。
+   ⚠️ 本函数只对**位图源**正确;SVG 源必须先经 dskIconSource() 光栅化(见其注释)。 */
+function dskIcoDraw(img, size) {
+  var iw = img.naturalWidth || img.width || size;
+  var ih = img.naturalHeight || img.height || size;
+  var side = Math.min(iw, ih) || size;
+  var dx = Math.round((iw - side) / 2), dy = Math.round((ih - side) / 2);
+  var c = document.createElement("canvas");
+  c.width = c.height = size;
+  var g = c.getContext("2d");
+  if (g.imageSmoothingEnabled !== undefined) g.imageSmoothingEnabled = true;
+  if (g.imageSmoothingQuality !== undefined) g.imageSmoothingQuality = "high";
+  g.clearRect(0, 0, size, size);
+  g.drawImage(img, dx, dy, side, side, 0, 0, size, size);
+  return c;
+}
+/* DIB 条目 = BITMAPINFOHEADER(40B) + XOR 位图(自下而上 BGRA,alpha 直存) + AND 掩码(自下而上,
+   每行 ((w+31)>>5)*4 字节,alpha==0 置 1) */
+function dskIcoDibEntry(img, size) {
+  var c = dskIcoDraw(img, size);
+  var px = c.getContext("2d").getImageData(0, 0, size, size).data;
+  var maskRow = ((size + 31) >> 5) * 4, xorLen = size * size * 4, maskLen = maskRow * size;
+  var out = new Uint8Array(40 + xorLen + maskLen), dv = new DataView(out.buffer);
+  dv.setUint32(0, 40, true);            /* biSize */
+  dv.setInt32(4, size, true);           /* biWidth */
+  dv.setInt32(8, size * 2, true);       /* biHeight = 2×高度(XOR + AND 两张图叠放) */
+  dv.setUint16(12, 1, true);            /* biPlanes */
+  dv.setUint16(14, 32, true);           /* biBitCount = 32bpp BGRA */
+  /* biCompression / biSizeImage / xppm / yppm / clrUsed / clrImportant 全 0(Uint8Array 已置零) */
+  var o = 40, row, col, i;
+  for (row = size - 1; row >= 0; row--) {
+    for (col = 0; col < size; col++) {
+      i = (row * size + col) * 4;
+      out[o] = px[i + 2]; out[o + 1] = px[i + 1]; out[o + 2] = px[i]; out[o + 3] = px[i + 3];
+      o += 4;
+    }
+  }
+  var m = 40 + xorLen;
+  for (row = 0; row < size; row++) {
+    var sy = size - 1 - row;
+    for (col = 0; col < size; col++) {
+      if (px[(sy * size + col) * 4 + 3] === 0) out[m + row * maskRow + (col >> 3)] |= (0x80 >> (col & 7));
+    }
+  }
+  return out;
+}
+function dskIcoPngEntry(img, size) {
+  var c = dskIcoDraw(img, size);
+  var b64 = String(c.toDataURL("image/png")).split(",")[1] || "";
+  var bin = atob(b64), out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xFF;
+  return out;
+}
+function dskIcoBuildBytes(img) {
+  var entries = [], i, n = DSK_ICO_SIZES.length;
+  var src = dskIconSource(img);   /* SVG 源先光栅化成位图(一次),再走既有的位图路径 */
+  for (i = 0; i < n; i++) {
+    entries.push(DSK_ICO_SIZES[i] <= DSK_ICO_DIB_MAX ? dskIcoDibEntry(src, DSK_ICO_SIZES[i])
+                                                     : dskIcoPngEntry(src, DSK_ICO_SIZES[i]));
+  }
+  var head = 6 + 16 * n, total = head;
+  for (i = 0; i < n; i++) total += entries[i].length;
+  var out = new Uint8Array(total), dv = new DataView(out.buffer);
+  dv.setUint16(0, 0, true);            /* reserved */
+  dv.setUint16(2, 1, true);            /* type = 1(图标) */
+  dv.setUint16(4, n, true);            /* count */
+  var off = head;
+  for (i = 0; i < n; i++) {
+    var e = 6 + i * 16, sz = DSK_ICO_SIZES[i];
+    out[e] = sz >= 256 ? 0 : sz;       /* 目录项宽/高:256 用 0 表示 */
+    out[e + 1] = sz >= 256 ? 0 : sz;
+    /* out[e+2] colors / out[e+3] reserved 保持 0 */
+    dv.setUint16(e + 4, 1, true);      /* planes */
+    dv.setUint16(e + 6, 32, true);     /* bitCount */
+    dv.setUint32(e + 8, entries[i].length, true);
+    dv.setUint32(e + 12, off, true);
+    off += entries[i].length;
+  }
+  var p = head;
+  for (i = 0; i < n; i++) { out.set(entries[i], p); p += entries[i].length; }
+  return out;
+}
+function dskIconBuild() {
+  var kind = state.settings.customIcon ? "custom" : "default";
+  return loadImageEl(dskSrcDataUri()).then(function (img) {
+    var bytes = dskIcoBuildBytes(img);
+    return { bytes: bytes, name: dskIconFileName(bytes), srcKind: kind };
+  });
+}
+/* showDirectoryPicker 的门控(能力探测;协议门另在 dskState 里)。 */
+function dskCanPick() {
+  try { return typeof window.showDirectoryPicker === "function"; } catch (e) { return false; }
+}
+/* 单一状态源:UI、文案、按钮可用性、写入通道可见性都从它读。 */
+function dskState() {
+  var proto = "", href = "", pathname = "", host = "";
+  try {
+    proto = String(location.protocol || "");
+    href = String(location.href || "");
+    pathname = String(location.pathname || "");
+    host = String(location.host || "");
+  } catch (e) {}
+  var base = dskBaseName();
+  var isFile = (proto === "file:");
+  var iconName = (DSK_ICON_CACHE.src === dskSrcDataUri() && DSK_ICON_CACHE.name) ? DSK_ICON_CACHE.name : "";
+  var dir = "", ok = false, reason = "", nonAscii = false;
+  if (!isFile) {
+    reason = "桌面快捷方式只对 file:// 打开的单文件版本有效(当前协议:" + (proto || "未知") + ")";
+  } else {
+    var full = dskPathToWin(pathname, host);
+    dir = full ? dskDirOfWinPath(full) : "";
+    if (!dir) {
+      reason = "无法从当前地址解析出本机路径,请改用「手动方式」";
+    } else {
+      /* crc8 只含十六进制字符 ⇒ 用占位名判 nonAscii 与用真实名**等价**,不必等图标构建完成 */
+      var probe = dskShortcutText(href, dir + "\\" + (iconName || (base + "-icon-00000000.ico")));
+      if (!probe) reason = "当前路径含不允许的字符,请改用「手动方式」";
+      else { ok = true; nonAscii = !probe.asciiOnly; }
+    }
+  }
+  return {
+    ok: ok, reason: reason, dir: dir, href: href, base: base,
+    iconName: iconName, iconReady: !!iconName,
+    urlName: base + DSK_URL_NAME_EXT,
+    srcLabel: dskSrcLabel(),
+    canWrite: ok && dskCanPick(),
+    nonAscii: nonAscii
+  };
+}
+function dskHintText(st, iconName) {
+  var dir = st.dir || "(本页所在文件夹)";
+  var s = "";
+  s += "① 先把 " + st.base + ".html 放到最终位置(如桌面)再生成。② 下载 .ico 与 .url。" +
+       "③ 把两个文件都放到 " + dir + "。④ 把 " + st.urlName + " 拖到桌面。⑤ 图标没变就按 F5。\n";
+  s += "图标会引用 " + dir + "\\" + iconName + " —— 请把 .ico 留在该文件夹里(换文件夹就把 .ico 一起搬过去)。\n";
+  if (st.canWrite) s += "本浏览器支持直接写入:点「写入文件夹…」选中 " + dir + ",两个文件一次写好(也可以只用下载)。\n";
+  s += "`.html` 文件本身的图标由系统按文件类型决定,网页无法改写它;桌面上带自定义图标的是 `.url` 快捷方式。\n";
+  s += "手动方式(任何浏览器都行):下载 .ico → 右键 `.html`「发送到 → 桌面快捷方式」→ 右键该快捷方式「属性 → 更改图标」→ 选中 .ico。\n";
+  s += "最干净的放法:`.html` 与 `.ico` 放进一个文件夹,桌面只留 `.url`。\n";
+  s += "若下载后的文件名变成 `.download`(新版 Chrome 把 `.url` 当危险扩展名改名),手动改回 `.url` 即可;" +
+       "`.url` 双击由系统默认浏览器打开(不一定是本浏览器)。";
+  return s;
+}
+/* 图标文件名的后台预热(文件名的 crc8 来自 ICO 内容 ⇒ 必须先渲染一次) */
+function dskEnsureIconName() {
+  var src = dskSrcDataUri();
+  if (DSK_ICON_CACHE.src === src) return;
+  if (DSK_ICON_PENDING === src) return;
+  DSK_ICON_PENDING = src;
+  dskIconBuild().then(function (r) {
+    DSK_ICON_PENDING = null;
+    DSK_ICON_CACHE = { src: src, name: r.name };
+    dskSyncUI();
+  }).catch(function () {
+    DSK_ICON_PENDING = null;
+    DSK_ICON_CACHE = { src: src, name: "" };
+    dskSyncUI();
+  });
+}
+/* 状态行 + 步骤文案 + 按钮可用性(幂等;由 syncFaviconUI 在启动/改图标时调用) */
+function dskSyncUI() {
+  var st = dskState();
+  var el = $("dsk-state"), hint = $("dsk-hint");
+  if (!el) return;
+  var iconName = st.iconReady ? st.iconName : (st.base + "-icon-<crc8>.ico");
+  var lines = [];
+  if (!st.ok) lines.push(st.reason);
+  else if (st.nonAscii) lines.push("当前路径含中文等非 ASCII 字符:快捷方式按 UTF-16LE+BOM 编码,若不生效请改用「手动方式」。");
+  lines.push("图标来源:" + st.srcLabel + ";快捷方式将引用 " + (st.dir ? (st.dir + "\\" + iconName) : "—") + "。");
+  el.textContent = lines.join("\n");
+  if (hint) hint.textContent = dskHintText(st, iconName);
+  var bIco = $("btn-dsk-ico"), bUrl = $("btn-dsk-url"), bWr = $("btn-dsk-write");
+  if (bIco) bIco.disabled = !st.ok;
+  if (bUrl) bUrl.disabled = !st.ok;
+  if (bWr) { bWr.hidden = !st.canWrite; bWr.disabled = !st.ok; }
+  dskEnsureIconName();
+}
+function dskDownloadIco() {
+  dskIconBuild().then(function (r) {
+    DSK_ICON_CACHE = { src: dskSrcDataUri(), name: r.name };
+    if (!wsBlobDownload(new Blob([r.bytes], { type: "image/x-icon" }), r.name)) {
+      toast("当前浏览器不支持下载,无法导出图标", "error", 4200); return;
+    }
+    dskSyncUI();
+    toast("已下载 " + r.name, "success");
+  }).catch(function (e) {
+    toast((e && e.message) ? e.message : "图标生成失败", "error", 4200);
+  });
+}
+function dskDownloadUrl() {
+  var st = dskState();
+  if (!st.ok) { toast(st.reason || "当前环境下无法生成快捷方式", "error", 4200); return; }
+  dskIconBuild().then(function (r) {
+    DSK_ICON_CACHE = { src: dskSrcDataUri(), name: r.name };
+    var sc = dskShortcutText(st.href, st.dir + "\\" + r.name);
+    if (!sc) { toast("路径含不允许的字符,请改用「手动方式」", "error", 4600); return; }
+    if (!wsBlobDownload(new Blob([dskShortcutBytes(sc.text)], { type: "application/internet-shortcut" }), st.urlName)) {
+      toast("当前浏览器不支持下载,无法导出快捷方式", "error", 4200); return;
+    }
+    dskSyncUI();
+    toast(sc.asciiOnly ? ("已下载 " + st.urlName) : ("已下载 " + st.urlName + "(UTF-16 编码,适配中文路径)"), "success");
+  }).catch(function (e) {
+    toast((e && e.message) ? e.message : "快捷方式生成失败", "error", 4200);
+  });
+}
+/* 一键写入(门 1-A 的增强通道)。showDirectoryPicker **必须在用户手势的同一个任务里**调用 ——
+   中间隔一次 await 会耗尽 transient activation,选择器直接被拒(NotAllowedError)。 */
+function dskWriteFile(dir, name, bytes) {
+  return dir.getFileHandle(name, { create: true }).then(function (fh) {
+    return fh.createWritable();
+  }).then(function (w) {
+    return w.write(bytes).then(function () { return w.close(); }, function (e) {
+      try { w.abort(); } catch (e2) {}
+      throw e;
+    });
+  });
+}
+function dskWriteToFolder() {
+  if (!dskCanPick()) { toast("当前浏览器不支持直接写入文件夹,请改用下载方式", "warn", 4200); return; }
+  var st = dskState();
+  if (!st.ok) { toast(st.reason || "当前环境下无法生成快捷方式", "error", 4200); return; }
+  var pick = null;
+  try { pick = window.showDirectoryPicker({ id: "dsk-write", mode: "readwrite", startIn: "desktop" }); }
+  catch (e) { toast("打开文件夹选择器失败:" + ((e && e.message) ? e.message : e), "error", 4600); return; }
+  pick.then(function (dir) {
+    return dskIconBuild().then(function (r) {
+      DSK_ICON_CACHE = { src: dskSrcDataUri(), name: r.name };
+      /* IconFile 恒为**本页所在目录**的绝对路径 —— File System Access API 不暴露所选目录的完整
+         路径,相对名又不生效,所以只有这一条永远正确的写法;所选目录不同时下面给显式提示。 */
+      var sc = dskShortcutText(st.href, st.dir + "\\" + r.name);
+      if (!sc) throw new Error("路径含不允许的字符,请改用「手动方式」");
+      var sameDir = String((dir && dir.name) || "") === String(st.dir.split("\\").pop() || "");
+      return dskWriteFile(dir, r.name, r.bytes).then(function () {
+        return dskWriteFile(dir, st.urlName, dskShortcutBytes(sc.text));
+      }).then(function () {
+        dskSyncUI();
+        if (sameDir) toast("已写入 2 个文件;把 " + st.urlName + " 拖到桌面即可", "success", 4600);
+        else toast("已写入 2 个文件;图标需放在 " + st.dir + " 才生效(请把 " + r.name + " 移过去)", "warn", 7000);
+      });
+    });
+  }).catch(function (e) {
+    if (e && e.name === "AbortError") { toast("已取消写入", "info", 1600); return; }
+    toast((e && e.message) ? ("写入失败:" + e.message) : "写入失败", "error", 4600);
+  });
 }
 
 /* ---- 模型视觉能力:服务端清单自报 → 探测 → 手动覆盖 ---- */
@@ -2005,25 +2377,37 @@ function renderAttachPanel() {
 }
 /* ---- 上下文压缩:自动路径的入口(appD 侧;压缩内核在 appE §28) ----
    · 去重:同一水位不重复压(CX_LEDGER.lastAfter,等价 Kimi lastCompactedTokenCount)
-   · 限流:本 turn 内最多自动压缩 1 次(CX_LEDGER.round,防"压完又满→再压"成环)
-     (计数在 sendMessage 开头复位;溢出恢复 cxOverflowRecover 共用同一个计数器)
+   · 限流:自动发送前路径靠**去重闸**(L.lastAfter:同一水位不重复压)限流;
+     L.round 语义收窄为"本 turn 自动路径已压次数"的读数,不再是闸
+     (计数在 sendMessage 开头复位;溢出恢复另用 CX_LEDGER.ovfCount,上限 CX_OVERFLOW_PER_TURN_MAX)
    · 降噪:ECOMPACT_SMALL / NOSPACE **不 toast、不写状态行**(根本没进压缩流程),
      只按 CX_LEDGER.warned 的 5 个百分点步长提示一次 —— cxPlanFor 落水位档并给出 warnFresh
    · **不吞 ECOMPACT_ABORT**:原样返回给发送链,由它决定放弃本次发送
    返回形状统一 {ok, code, compacted, text} */
+/* 预留项(U-4 借鉴-2;b24 方案 P2-新3 已批准的公式,原为孤儿常量):
+   reserve = min(max(CX_RESERVE_MIN, win*5%), win*50%);win ≤ 0 ⇒ 0。
+   纯函数、可页内断言(U12①:8192 ⇒ 4096 · 65536 ⇒ 16384 · 262144 ⇒ 16384) */
+function cxReserveOf(win) {
+  var w = Number(win) || 0;
+  if (!(w > 0)) return 0;
+  return Math.min(Math.max(CX_RESERVE_MIN, w * 0.05), w * 0.5);
+}
 async function cxAutoBeforeSend(tf) {
   if (!cxEnabled() || !tf || !Array.isArray(tf.messages)) return null;
   var s = ctxSnapshot(tf);
   var pct = s.win > 0 ? (s.used / s.win * 100) : 0;
-  if (pct < cxTriggerPct()) return null;
+  /* 两条触发式:①水位百分比 ②预留项(再涨 reserve 就满窗 ⇒ 提前压,避免"下一步就溢出") */
+  var reserve = cxReserveOf(s.win);
+  var byPct = (pct >= cxTriggerPct());
+  var byReserve = (reserve > 0 && reserve < s.win && (s.used + reserve) >= s.win);
+  if (!byPct && !byReserve) return null;
   var L = cxLedger(tf.id);
   if (L.lastAfter > 0 && s.used <= L.lastAfter) return null;   /* 没长过就不再压 */
-  if ((L.round || 0) >= 1) return null;
   L.round = (L.round || 0) + 1;
-  var r = await cxCompactNow(tf, { source: "auto", mode: "auto" });
+  var r = await cxCompactNow(tf, { source: "auto", mode: "auto", triggerReason: byPct ? "pct" : "reserve" });
   if (r && r.ok) {
     L.lastAfter = ctxSnapshot(tf).used;
-    toast("上下文已自动压缩:丢弃 " + (r.dropped || 0) + " 条较早的消息" +
+    toast("摘要已生成:上下文已自动压缩(" + (byPct ? "阈值" : "预留") + "触发),丢弃 " + (r.dropped || 0) + " 条较早的消息" +
       (r.released ? "(释放 " + r.released + " 个附件)" : "") +
       ",约 " + num(r.before) + " → " + num(r.after) + " tok(重要中间结论建议落到工作区文件)" +
       (Number(r.after) > Number(r.before) ? "（本次摘要比被丢弃内容更长，属正常）" : ""),
@@ -2043,7 +2427,7 @@ async function cxAutoBeforeSend(tf) {
     }
     return { ok: false, code: code, compacted: false, text: "" };
   }
-  toast("自动压缩失败:" + cxCodeText(code, false, r && r.note) + " —— 本轮照常继续", "warn", 6000);
+  toast("自动压缩失败:" + cxCodeText(code, false, r && r.note) + "(原文未改动) —— 本轮照常继续", "warn", 6000);
   return { ok: false, code: code, compacted: false, text: "" };
 }
 /* 轮次之间的检查点:同一判定(去重 / 限流 / 降噪一致) */
@@ -2372,32 +2756,104 @@ function toggleParamsPop() {
   syncParamTools();      /* 「工具」分组的开关态 / 可用数 / prefill 提示 */
   pop.classList.toggle("open", open);
   btn.classList.toggle("on", open);
-  if (open) placePopover(pop, btn, { align: "left", width: 320 });
+  if (open) {
+    placePopover(pop, btn, { align: "left", width: 320 });
+    /* F12 同类（#ctx-pop 已修，此处补齐）：开屏一律回到浮层顶部 —— 浮层自身的内滚偏移是 DOM 状态,
+       关掉不清 ⇒ 重开后顶部的滑块/开关被推出视图（与 `toggleCtxPop` 同形、同一判据） */
+    pop.scrollTop = 0;
+  }
 }
 /* ---- 提示词模板 ---- */
+/* 菜单项按**数组顺序**输出,遇到 group 变化才插组头(U-3 的 18 条 / 6 组):
+   —— 不按 group 聚合再排序,这样用户自建的无 group 条目会留在它被创建的位置附近,不被重排;
+   —— 无 group(缺省 / 旧备份导入 / 新增入口 push({name,text}))⇒ 不插组头,但用分隔线与上一组隔开;
+   —— 组头复用既有的裸类名 `.pop-sub-title` / `.pm-sep`(零新增 CSS)。 */
 function openLibMenu(anchor) {
   closeMenus();
   var menu = $("pop-menu");
-  var items = state.promptLib.map(function (t) {
-    var pv = t.text.replace(/\s+/g, " ").slice(0, 34);
-    return '<button data-libtext="' + escAttr(t.text) + '" title="' + escAttr(t.text) + '">' +
+  var items = "", lastG = null;
+  state.promptLib.forEach(function (t) {
+    var g = (typeof t.group === "string") ? t.group.trim() : "";
+    if (lastG !== null && g !== lastG) items += '<div class="pm-sep"></div>';
+    if (g && g !== lastG) items += '<div class="pop-sub-title">' + escapeHtml(g) + "</div>";
+    lastG = g;
+    items += '<button data-libtext="' + escAttr(t.text) + '" title="' + escAttr(t.text) + '">' +
       icon("book", "sm") + "<span>" + escapeHtml(t.name) + "</span></button>";
-  }).join("");
+  });
   if (!items) items = '<div class="pm-hint" style="padding:8px 11px">模板库为空</div>';
   menu.innerHTML = items +
     '<div class="pm-sep"></div><button data-libact="manage">' + icon("sliders", "sm") + " 管理模板…</button>";
   placeMenu(menu, anchor);
 }
+/* 贴着锚点放:优先放正上方,上面放不下才翻到下方;左右夹紧在视口内。
+   两条硬要求(都来自实测缺陷):
+   ① **量布局尺寸,不量 rect** —— 本元素带 `animation: popIn .14s`(起帧
+      `translateY(6px) scale(.98)`),而 `display:none → block` 每次开合都会**重启动画** ⇒
+      `getBoundingClientRect()` 在 add("open") 之后立即读到的**是动画起帧**(高少 2%、位置多 6px)
+      ⇒ 菜单"首次点击就偏一点,开合多次读数还会抖"。`offsetWidth/offsetHeight` 是**布局盒**尺寸,
+      不受 transform 影响 ⇒ 同一内容每次读数逐位相同(浮窗漂移的根因修)。
+   ② **先重置 max-height / overflow-y** —— `#pop-menu` 是**多主单例**(会话菜单 / 工作区挂载 /
+      模板菜单 / 右键菜单共用)。旧实现只设 left/top,谁设过高上限就会**串到下一个菜单**上
+      (placeMenuAt 会重置、placeMenu 不会 ⇒ 两侧口径不一致)。
+   ③ 超高时给上限 + 自身滚动(旧实现对超高菜单直接出屏):上限只由视口与锚点位置决定,
+      不含任何"测量值反馈"⇒ 不引入读数漂移。
+   ④ **开屏一律回滚到顶部** —— 内滚偏移是元素自身的 DOM 状态,关掉不清 ⇒ 重开后顶部条目
+      被推出视图(F12 债:实测 `#pop-menu` 开 → 滚 200 → 关 → 再开仍 200)。口径与 F12 三面
+      (`#cmd-list` 的 `openPalette` / `#ctx-pop` 的 `toggleCtxPop` / `#params-pop` 的
+      `toggleParamsPop`)同源 ⇒ **「同一菜单重开保留上次位置」的旧行为按该口径统一取消**(placeMenuAt 同)。 */
 function placeMenu(menu, anchor) {
   menu.classList.add("open");
-  var r = menu.getBoundingClientRect();
+  menu.style.maxHeight = "";
+  menu.style.overflowY = "";
   var a = anchor.getBoundingClientRect();
-  var x = a.left, y = a.top - r.height - 8;
-  if (y < 8) y = a.bottom + 8;
-  if (x + r.width > window.innerWidth - 8) x = window.innerWidth - r.width - 8;
+  var vw = window.innerWidth, vh = window.innerHeight, gap = 8;
+  var mw = menu.offsetWidth, mh = menu.offsetHeight;
+  var y = a.top - mh - gap;
+  if (y < gap) y = a.bottom + gap;
+  var room = Math.max(a.top - gap * 2, vh - a.bottom - gap * 2);
+  var cap = Math.max(160, Math.min(Math.round(vh * 0.8), room));
+  if (mh > cap) {
+    menu.style.maxHeight = cap + "px";
+    menu.style.overflowY = "auto";
+    mh = cap;
+    y = a.top - mh - gap;
+    if (y < gap) y = a.bottom + gap;
+  }
+  if (y + mh > vh - gap) y = Math.max(gap, vh - mh - gap);
+  var x = a.left;
+  if (x + mw > vw - gap) x = vw - mw - gap;
+  if (x < gap) x = gap;
+  menu.style.left = Math.round(x) + "px";
+  menu.style.top = Math.round(y) + "px";
+  /* ④ 的落地(F12 口径):**必须放在最后一行** —— 写早了不生效。实测(探针 `tmp/p1fix/probe-scroll.js`):
+     关掉后元素无盒(`display:none`),`classList.add("open")` 一让它有盒,浏览器会**把上次的内滚偏移
+     还回来**,并在 cap/overflow 落地的那一刻再次施加;而"清空 cap(overflow:visible)"期间元素**不是
+     滚动容器**,此时写 `scrollTop` 会被丢弃 ⇒ 复位若写在前面,重开仍是旧值(本轮实测 200)。
+     与 F12 三面同形:`openPalette` 的注释也写着"遮罩未显示时元素无盒,写 scrollTop 不生效"。 */
+  menu.scrollTop = 0;
+}
+/* 定点放置(右键菜单用):以鼠标位置为左上角,四边夹紧在视口内。
+   与 placeMenu 并列、不替换 —— 后者是「贴着锚点上方」语义,右键没有锚点元素。
+   高度超过视口时自身滚动(超高菜单在窄屏抽屉形态下同样不出屏)。
+   内滚偏移同样按 placeMenu ④ 的 F12 口径回零(同一 `#pop-menu` 单例:右键菜单重开不留在上次滚位) */
+function placeMenuAt(menu, x, y) {
+  menu.classList.add("open");
+  menu.style.maxHeight = "";
+  menu.style.overflowY = "";
+  var vh = window.innerHeight, vw = window.innerWidth;
+  var r = menu.getBoundingClientRect();
+  if (r.height > vh - 16) {
+    menu.style.maxHeight = (vh - 16) + "px";
+    menu.style.overflowY = "auto";
+    r = menu.getBoundingClientRect();
+  }
+  if (x + r.width > vw - 8) x = vw - r.width - 8;
+  if (y + r.height > vh - 8) y = y - r.height;      /* 右下放不下就往上翻(菜单底边贴鼠标) */
   if (x < 8) x = 8;
+  if (y < 8) y = 8;
   menu.style.left = x + "px";
   menu.style.top = y + "px";
+  menu.scrollTop = 0;   /* ④ 落地:同 placeMenu —— 必须在 cap 落地之后(写早了会被浏览器还原的旧偏移覆盖) */
 }
 /* 浮层贴着触发按钮:优先放正上方(与「插入提示词模板」菜单同一套做法),
    上面放不下才翻到下方;太高时自身滚动,保证始终贴着按钮且不出屏。
@@ -2481,7 +2937,8 @@ function errText(e) {
    并给出可执行的下一步(服务端要补哪些头 / 改用同源反向代理 / 关掉兼容模式)。
    ⚠ **族分支在产线不可达**(C2 审查 P3-5 登记;依据 = 调用点普查):本函数全库 6 个调用点
    (886 / 3515 / 5234 / 5296 / 5345 / 5953)全部只传 ≤2 参 ⇒ fam 恒为空,产线只会看到缺省文案;
-   族级文案当前只从 CORS_FAMILY_TEXT 的两条消费路径露出(诊断面板结论行 + 开关拒绝 note)。
+   族级文案当前从 CORS_FAMILY_TEXT 的三条消费路径露出(诊断面板结论行 + 开关被拒时的红字 note
+   + 开关开启成功时的绿字 note,后者见 setCorsBypass 的成功分支)。
    该分支为将来「把族接到发送失败路径」保留,不按死代码删。 */
 function friendlyError(e, url, family) {
   var msg = errText(e);
@@ -2572,7 +3029,7 @@ function expandToolMediaForOpenAI(list) {
       j++;
     }
     if (media.length) {
-      var parts = [{ type: "text", text: "以下是 Read 工具读取的 " + media.length + " 个文件" +
+      var parts = [{ type: "text", text: "以下是工具读取的 " + media.length + " 个文件" +
         (paths.length ? "(" + paths.join("、") + ")" : "") + "的图片内容,请据此继续完成任务(这不是用户的新提问)" }];
       for (var q = 0; q < media.length; q++) parts.push(imagePartFor("openai", media[q].mime, media[q].data, null));
       out.push({ role: "user", content: parts });
@@ -2923,6 +3380,7 @@ async function sendMessage(text, opts) {
   CX_RUN.regen = !!opts.history;
   if (!opts.history) {
     cxLedger(tf.id).round = 0;
+    cxLedger(tf.id).ovfCount = 0;      /* U-4 借鉴-1:溢出恢复额度与 round 同一处按 turn 复位 */
     if (cxEnabled()) {
       var pre = await cxAutoBeforeSend(tf);
       if (pre && pre.code === "ECOMPACT_ABORT") {
@@ -2956,6 +3414,13 @@ async function sendMessage(text, opts) {
         return;
       }
     }
+  }
+
+  /* 发送冲突:手动压缩正在跑 ⇒ 中止它并如实登记(不阻塞本次发送) */
+  if (pre && pre.code === "ECOMPACT_BUSY" && CX_RUN.phase !== "idle" && CX_RUN.source === "manual" &&
+      CX_RUN.convId === tf.id) {
+    cxAbortActive("用户发送新消息");
+    cxFailRecord(tf.id, "ECOMPACT_BUSY", "cancelledBySend", "你发送了新消息,正在进行的压缩已中止", "manual", "", 0);
   }
 
   var userContent = opts.skipUserMsg ? null : buildUserContent(text, opts.files);
@@ -3615,7 +4080,9 @@ function redrawMessage(msg) {
   if (!host || !host.parentNode) { renderChat(); return; }
   var group = conv ? groupOfMsg(msg.id) : null;
   /* 压缩产物有独立气泡(不是普通 user/assistant):重建时走同一条构造路径 */
-  var fresh = msg.compact ? makeCompactEl(msg) : (group ? makeGroupEl(group) : makeMsgEl(msg, false, followingToolMsgs(msg)));
+  var fresh = msg.compact
+    ? (msg.compact === "summary" ? makeCxCardEl(msg) : makeCompactEl(msg))
+    : (group ? makeGroupEl(group) : makeMsgEl(msg, false, followingToolMsgs(msg)));
   host.parentNode.replaceChild(fresh, host);
 }
 
@@ -4593,6 +5060,7 @@ function closeMenus() {
   $("pop-menu").classList.remove("open");
   $("params-pop").classList.remove("open");
   $("btn-params").classList.remove("on");
+  WS_CTX = null;      /* 工作区右键菜单的上下文跟着菜单一起失效(唯一写入口见 wsCtxOpenMenu) */
 }
 $$(".modal-mask").forEach(function (mask) {
   focusTrap(mask);
@@ -4617,7 +5085,7 @@ document.addEventListener("click", function (e) {
      点它们的选项时不能连带把宿主浮层也关掉,否则「在参数浮层里选思考强度」会把整个参数浮层收走 */
   var inLayer = !!(t.closest("#nsel-pop") || t.closest("#model-suggest"));
   if (!inLayer && !t.closest("#pop-menu") && !t.closest("[data-menu-opener]")) {
-    $("pop-menu").classList.remove("open");
+    wsCtxCloseMenu();      /* 同一条路径:去 .open + 清 WS_CTX(右键菜单上下文不残留) */
   }
   if (!inLayer && !t.closest("#params-pop") && !t.closest("#btn-params")) {
     $("params-pop").classList.remove("open");
@@ -5572,8 +6040,8 @@ var CORS_FAMILY_TEXT = {
   },
   timeout: {
     label: "服务端未在超时内回话",
-    /* 这份文案有两条消费路径:诊断面板的结论行(corsProbeLines)与开关的拒绝 note(setCorsBypass)——
-       后者当下看不到面板 ⇒ 定位语不许写「诊断面板里」,改成两条路径都成立的「去哪里看矩阵」。
+    /* 这份文案有三条消费路径:诊断面板的结论行(corsProbeLines)与开关的拒绝 note(setCorsBypass)——
+       红 / 绿两条 note 当下看不到面板 ⇒ 定位语不许写「诊断面板里」,改成三条路径都成立的「去哪里看矩阵」。
        断言只引用矩阵标记(「标 ✗(超时) 的探针」),**不得**写成「四条都没等到」(混合态下与矩阵矛盾)。 */
     advice: "标 ✗(超时) 的探针在 " + Math.round(CORS_PROBE_TIMEOUT_MS / 1000) + " 秒内没等到响应(可能只有其中几条):连接建立了但不回话(服务端卡死 / 过载 / 正在装载模型时很常见)。这一态分不出 CORS 卡在哪一层,「预检规避兼容模式」也要等它回话才能验证 —— 等服务端恢复响应后再重跑;四探针矩阵在 设置 → 环境 → 运行自检 的「CORS 分层」段。"
   },
@@ -6313,8 +6781,10 @@ function renderLibList() {
     return;
   }
   box.innerHTML = state.promptLib.map(function (t, i) {
+    /* 描述行只显示前 90 字,补一个 title 让全文可 hover 查看(U-3:18 条正文平均 276 字) */
+    var flat = t.text.replace(/\s+/g, " ");
     return '<div class="tool-row"><div class="tr-main"><div class="tr-name">' + escapeHtml(t.name) +
-      '</div><div class="tr-desc">' + escapeHtml(t.text.replace(/\s+/g, " ").slice(0, 90)) + "</div></div>" +
+      '</div><div class="tr-desc" title="' + escAttr(flat) + '">' + escapeHtml(flat.slice(0, 90)) + "</div></div>" +
       '<button class="btn xs danger" data-libdel="' + i + '">删除</button></div>';
   }).join("");
   box.querySelectorAll("[data-libdel]").forEach(function (b) {
@@ -6838,6 +7308,9 @@ function toggleCtxPop(force) {
   if (open) {
     renderCtxPop();
     placePopover(pop, btn, { align: "right", width: 344 });
+    /* F12:开屏一律回到浮层顶部 —— 浮层自身的内滚偏移是 DOM 状态,关掉不清 ⇒ 重开后
+       顶部的总览(已用/剩余)被推出视图(更早的会话里滚到底 = 20px 会残留到下一次打开) */
+    pop.scrollTop = 0;
   }
 }
 
@@ -6889,6 +7362,11 @@ popMenuEl.addEventListener("click", function (e) {
 
   var wsact = b.getAttribute("data-wsact");
   if (wsact) { runWsMenuAction(wsact, b.getAttribute("data-ws")); return; }
+
+  /* 工作区右键菜单(#wsr-files 上的 contextmenu 开出来);必须插在 data-convact 之前 ——
+     再往后就是 palette 兜底 runPaletteAction(null),落到那里等于点了空 */
+  var wsctx = b.getAttribute("data-wsctx");
+  if (wsctx) { runWsCtxAction(wsctx); return; }
 
   var act = b.getAttribute("data-convact");
   if (!act) { runPaletteAction(b.getAttribute("data-palette")); return; }
@@ -6961,74 +7439,203 @@ elConvList.addEventListener("contextmenu", function (e) {
 
 /* ---- 命令面板 ---- */
 var paletteItems = [], paletteSel = 0;
-function paletteSources() {
+/* 组顺序(渲染顺序的唯一权威) + 搜索态每组配额 + 「只在搜索态出现」的组。
+   配额上限之和 = 3+8+4+4+6+8+10 = 43 < 60 ⇒ 末尾既有的 slice(0,60) 退化为保险,永不饿死任何组。
+   ★ 用户决策门 D5=B(彻底删除 MCP 逐工具条目):列表**没有**「MCP 工具」组,
+     工具名也不进任何 kw —— 搜工具名不再直达设置,配 MCP 走设置面板。 */
+var PALETTE_GROUPS = ["会话", "内容", "数据", "外观与设置", "工具与帮助", "模型", "对话"];
+var PALETTE_QUOTA = { "会话": 3, "内容": 8, "数据": 4, "外观与设置": 4, "工具与帮助": 6, "模型": 8, "对话": 10 };
+var PALETTE_SEARCH_ONLY = { "模型": 1, "对话": 1 };
+/* D3=B(搜消息正文)的两个护栏:最多在最近多少条对话里扫正文 + 正文片段最长多少字 */
+var PALETTE_BODY_SCAN_MAX = 200;
+var PALETTE_SNIP_MAX = 58;
+
+/* 默认态(空关键词)渲染的全部内容 —— 13 条动作 / 5 组,逐条写死。与旧版的差异:
+   ① 两条「清空」合并为一条(门 D6=A) ② 逐工具的 N 条导航条目整组删除(门 D5=B)
+   ③ 快捷键只显示一处:desc 只写用途,键名只出现在右侧 key 徽标 */
+function paletteActions() {
   var out = [];
-  function add(group, name, desc, iconName, key, fn) {
-    out.push({ group: group, name: name, desc: desc, icon: iconName, key: key, fn: fn });
+  function add(group, name, desc, iconName, key, fn, kw) {
+    out.push({ group: group, name: name, desc: desc, icon: iconName, key: key, fn: fn, kw: kw || "" });
   }
-  add("操作", "新建对话", "Ctrl+N", "plus", "Ctrl N", function () { newConversationUI(); });
-  add("操作", generating ? "停止生成" : "发送当前输入", generating ? "Ctrl+X" : "Enter", generating ? "stop" : "send", "Enter",
+  add("会话", "新建对话", "开一条新对话", "plus", "Ctrl N", function () { newConversationUI(); });
+  add("内容", generating ? "停止生成" : "发送当前输入",
+    generating ? "中止本轮生成与工具等待" : "把输入框内容发给模型",
+    generating ? "stop" : "send", generating ? "Ctrl X" : "Enter",
     function () { if (generating) stopGenerating(); else doSend(); });
-  add("操作", "打开设置", "Ctrl+,", "sliders", "Ctrl ,", function () { openSettings(); });
-  add("操作", "MCP 工具设置", "模型能否调用工具", "plug", "", function () { openSettings("mcp"); });
-  add("操作", "使用教程与关于", "", "book", "F1", function () { openHelp(); });
-  add("操作", "切换主题", "Ctrl+Shift+L", "palette", "", function () { cycleTheme(); });
-  add("操作", "运行环境自检", "", "shield", "", function () { openSettings("env"); setTimeout(runDiagnostics, 120); });
-  add("操作", "复制最后一条回答", "Ctrl+Alt+C", "copy", "", function () {
+  add("内容", "复制最后一条回答", "复制到剪贴板", "copy", "Ctrl Alt C", function () {
     var last = lastAssistantMsg();
     if (!last) { toast("还没有 AI 回答", "warn"); return; }
     copyText(contentToText(last.content), "已复制最后一条回答");
   });
-  add("操作", "导出当前对话(Markdown)", "", "download", "", exportCurrentMd);
-  add("操作", "导出全部数据(JSON)", "", "download", "", exportAll);
-  add("操作", "清空当前对话消息", "", "eraser", "", function () { if (conv) clearConvMessages(conv.id); });
-  add("操作", "压缩上下文", "丢弃较早的消息与附件(不可撤销)", "layers", "", function () { slashCompact(""); });
-  add("操作", "清除本会话上下文", "等价于 /clear", "eraser", "", function () { slashClear(); });
-  add("操作", "后台任务", "查看输出与中止", "clock", "", function () { openTasksModal(); });
-
-  (state.fetchedModels || []).slice(0, 40).forEach(function (m) {
-    add("模型", m, "切换到该模型", "cpu", "", function () { pickModel(m); });
-  });
-  state.conversations.slice().sort(function (a, b) { return b.updatedAt - a.updatedAt; })
-    .slice(0, 40).forEach(function (c) {
-      add("对话", c.title, c.messages.length + " 条消息 · " + timeAgo(c.updatedAt), "chat", "",
-        function () { selectConv(c.id); });
-    });
-  /* 可见性旁路:去掉 toolsEnabled 早退,直接列 activeTools(conv) ——
-     没有可用工具时自然一个条目也不加(以后只开外部 MCP 时这里才会出现外部工具);
-     传当前会话 ⇒ 会话级覆盖也体现在这份清单里 */
-  activeTools(conv).forEach(function (t) {
-    add("MCP 工具", t.title + "(" + t.name + ")", "权限:" +
-      (toolPermOf(t.name) === "ask" ? "每次询问" : toolPermOf(t.name) === "allow" ? "自动允许" : "禁止"),
-      "plug", "", function () { openSettings("mcp"); });
-  });
+  add("内容", "压缩上下文", "生成交接总结后丢弃较早消息(不可撤销) · /compact", "layers", "",
+    function () { slashCompact(""); });
+  /* 门 D6=A:与旧的「清空当前对话消息」合并成一条 —— fn 写死 = slashClear()(保留「无对话」
+     提示;clearConvMessages 内含的忙碌门与确认弹窗一字不动);旧名进 kw ⇒ 按旧名搜仍命中 */
+  add("内容", "清空本对话消息", "删除本对话全部消息与附件(保留会话与系统提示词) · /clear", "eraser", "",
+    function () { slashClear(); },
+    "清除本会话上下文 清空当前对话消息 清除上下文 clear");
+  add("数据", "导出当前对话（Markdown）", "只导出当前这条会话", "download", "", exportCurrentMd);
+  add("数据", "导出全部数据（JSON）", "完整备份（含 API Key，妥善保管）", "download", "", exportAll);
+  add("外观与设置", "切换主题", "深色 / 浅色 / 跟随系统 轮换", "palette", "Ctrl ⇧ L",
+    function () { cycleTheme(); });
+  add("外观与设置", "打开设置", "模型服务 / 生成参数 / 外观 / 数据", "sliders", "Ctrl ,",
+    function () { openSettings(); });
+  /* 门 D5=B:只保留这一条(不再有逐工具条目),且**不放工具名 kw** */
+  add("工具与帮助", "MCP 工具与权限…", mcpStatusInfo(conv).text, "plug", "",
+    function () { openSettings("mcp"); });
+  add("工具与帮助", "后台任务", "查看 Python 任务输出并中止 · /tasks", "clock", "",
+    function () { openTasksModal(); });
+  add("工具与帮助", "运行环境自检", "跑一遍能力自检并打开环境面板", "shield", "",
+    function () { openSettings("env"); setTimeout(runDiagnostics, 120); });
+  add("工具与帮助", "使用教程与关于", "教程 / 斜杠命令 / 快捷键 · /help", "book", "F1",
+    function () { openHelp(); });
   return out;
 }
+function paletteTokens(kw) {
+  var t = String(kw || "").toLowerCase().trim();
+  if (!t) return [];
+  return t.split(/\s+/).filter(function (x) { return !!x; });
+}
+/* 多词 AND 命中:每个词都要在 name + desc + group + kw 里小写子串命中。
+   kw = 额外搜索词(旧条目名等),**只在匹配时参与、不渲染** */
+function paletteHit(it, tokens) {
+  var hay = (it.name + " " + (it.desc || "") + " " + it.group + " " + (it.kw || "")).toLowerCase();
+  for (var i = 0; i < tokens.length; i++) { if (hay.indexOf(tokens[i]) === -1) return false; }
+  return true;
+}
+/* 正文片段:命中点前留 14 字,总长收到 PALETTE_SNIP_MAX。
+   ★ 搜索与取位都在**同一份已折叠空白**的文本上做,避免下标与片段错位 */
+function paletteSnip(text, at) {
+  var t = String(text || "");
+  var p = Math.max(0, Math.min(at, t.length));
+  var start = Math.max(0, p - 14);
+  var s = t.slice(start, start + PALETTE_SNIP_MAX);
+  if (start > 0) s = "…" + s;
+  if (start + PALETTE_SNIP_MAX < t.length) s = s + "…";
+  return s;
+}
+/* 门 D3=B:对话命中判定 —— 标题优先,其次消息正文。
+   正文匹配口径与侧栏搜索(renderConvList)保持一致:contentToText(content) + reasoning。
+   返回 "" = 未命中;"title" = 标题命中;其余 = 正文命中片段 */
+function paletteConvHit(c, tokens) {
+  var title = (c.title || "").toLowerCase();
+  if (tokens.every(function (t) { return title.indexOf(t) > -1; })) return "title";
+  var msgs = c.messages || [];
+  /* 从最新一条往回扫:近的消息更接近用户当下要找的东西 */
+  for (var i = msgs.length - 1; i >= 0; i--) {
+    var hay = (contentToText(msgs[i].content) + " " + (msgs[i].reasoning || ""))
+      .replace(/\s+/g, " ").trim();
+    var low = hay.toLowerCase(), at = -1, ok = true;
+    for (var j = 0; j < tokens.length; j++) {
+      var p = low.indexOf(tokens[j]);
+      if (p === -1) { ok = false; break; }
+      if (at === -1 || p < at) at = p;
+    }
+    if (ok) return paletteSnip(hay, at);
+  }
+  return "";
+}
+function paletteConvItem(c, hit, id) {
+  return {
+    group: "对话", name: c.title, icon: "chat", key: "", kw: "", matched: 1,
+    desc: hit === "title" ? (c.messages.length + " 条消息 · " + timeAgo(c.updatedAt)) : hit,
+    fn: function () { selectConv(id); }
+  };
+}
+/* 模型 / 对话两组 —— **只在搜索态构造**(默认态不构造 ⇒ 打开面板不再做一次全量会话排序):
+   · 模型:desc 有意留空,去掉旧版 40 行「切换到该模型」同文案噪声
+   · 对话:排序策略写死 = 标题命中在前、正文命中其后,各自按 updatedAt 降序;
+     护栏 = 最多扫最近 PALETTE_BODY_SCAN_MAX 条;标题命中已够填满配额时整轮正文扫描跳过 */
+function paletteDataResults(tokens) {
+  var out = [];
+  (state.fetchedModels || []).slice(0, 40).forEach(function (m) {
+    out.push({ group: "模型", name: m, desc: "", icon: "cpu", key: "", kw: "",
+      fn: function () { pickModel(m); } });
+  });
+  var convs = state.conversations.slice().sort(function (a, b) { return b.updatedAt - a.updatedAt; });
+  if (!tokens.length) {
+    /* 不过滤形态(仅供 paletteSources 的兼容入口):沿用旧口径的前 40 条 */
+    convs.slice(0, 40).forEach(function (c) {
+      out.push({ group: "对话", name: c.title, icon: "chat", key: "", kw: "",
+        desc: c.messages.length + " 条消息 · " + timeAgo(c.updatedAt),
+        fn: function () { selectConv(c.id); } });
+    });
+    return out;
+  }
+  var cap = Math.min(convs.length, PALETTE_BODY_SCAN_MAX);
+  var quota = PALETTE_QUOTA["对话"];
+  var titles = [], bodies = [], i, c;
+  /* 第一遍只比标题(便宜,不碰消息)⇒ 命中数要**数全**,组头的「命中 N」才是真读数 */
+  for (i = 0; i < cap; i++) {
+    c = convs[i];
+    if (paletteConvHit(c, tokens) === "title") titles.push(paletteConvItem(c, "title", c.id));
+  }
+  /* 第二遍才是贵的正文扫描,且**只在标题命中不够填满配额时**才做(性能护栏)——
+     跳过时计数只含标题命中,这一口径已在代码注释与 CHANGELOG 里写明,不含糊 */
+  if (titles.length < quota) {
+    for (i = 0; i < cap; i++) {
+      c = convs[i];
+      var h = paletteConvHit(c, tokens);
+      if (h && h !== "title") bodies.push(paletteConvItem(c, h, c.id));
+    }
+  }
+  return out.concat(titles, bodies);
+}
+/* 兼容入口(§10-R1:runPaletteAction 无生产者但仍按 name 读它) */
+function paletteSources() { return paletteActions().concat(paletteDataResults([])); }
 function openPalette() {
   closeMenus();
   $("cmd-input").value = "";
   renderPalette("");
   openMask("palette-mask");
+  /* F12:重开一律回到列表顶部 —— 偏移是 #cmd-list 自身的 DOM 状态,关面板不清 ⇒ 上次滚到
+     300+ 时重开仍停在中部,而选中项已回第 0 行(paletteSel=0)⇒ 用户看不到"当前选中项"。
+     放在 openMask 之后:遮罩未显示时元素无盒,写 scrollTop 不生效。 */
+  $("cmd-list").scrollTop = 0;
   setTimeout(function () { try { $("cmd-input").focus(); } catch (e) {} }, 50);
 }
 function renderPalette(kw) {
-  var all = paletteSources();
-  var k = (kw || "").toLowerCase().trim();
-  var filtered = k ? all.filter(function (i) {
-    return (i.name + " " + i.desc + " " + i.group).toLowerCase().indexOf(k) > -1;
-  }) : all;
-  paletteItems = filtered.slice(0, 60);
+  var tokens = paletteTokens(kw);
+  var searching = tokens.length > 0;
+  /* 默认态 = 只构造动作清单(不碰模型/会话 ⇒ 省掉一次全量会话排序,也避开正文扫描) */
+  var all = paletteActions();
+  if (searching) all = all.concat(paletteDataResults(tokens));
+  /* 数据组条目带 matched:1 ⇒ 它们已由各自的数据源判定过命中,不再交由通用 paletteHit 复判
+     (正文命中时片段可能不含**全部**关键词 —— 多词且相距很远时会被通用 AND 误杀) */
+  var hit = searching ? all.filter(function (i) { return i.matched || paletteHit(i, tokens); }) : all;
+
+  /* 按 PALETTE_GROUPS 顺序分组 + 组内配额(配额之和 43 < 60 ⇒ 不可能饿死任何组) */
+  var byGroup = {};
+  hit.forEach(function (it) {
+    if (!byGroup[it.group]) byGroup[it.group] = [];
+    byGroup[it.group].push(it);
+  });
+  var picked = [];
+  PALETTE_GROUPS.forEach(function (g) {
+    var arr = byGroup[g];
+    if (!arr || (PALETTE_SEARCH_ONLY[g] && !searching)) return;
+    var q = PALETTE_QUOTA[g] || arr.length;
+    picked = picked.concat(arr.slice(0, q));
+  });
+  paletteItems = picked.slice(0, 60);
   paletteSel = 0;
   var box = $("cmd-list");
   if (!paletteItems.length) {
     box.innerHTML = '<div class="cmd-group">没有匹配项</div>';
     return;
   }
-  var html = "", lastGroup = null;
+  /* 组头:数据组带命中计数与截断说明(不静默),动作组沿用组名(13 条事实上不截断) */
+  var seen = {}, html = "";
   paletteItems.forEach(function (it, i) {
-    if (it.group !== lastGroup) {
-      lastGroup = it.group;
-      html += '<div class="cmd-group">' + escapeHtml(it.group) + "</div>";
+    if (!seen[it.group]) {
+      seen[it.group] = 1;
+      var g = it.group;
+      if (PALETTE_SEARCH_ONLY[g]) {
+        var n = byGroup[g].length, shown = PALETTE_QUOTA[g] || n;
+        g = g + " · " + n + (shown < n ? "（显示前 " + shown + "）" : "");
+      }
+      html += '<div class="cmd-group">' + escapeHtml(g) + "</div>";
     }
     html += '<button class="cmd-item' + (i === 0 ? " sel" : "") + '" data-pi="' + i + '">' +
       '<span class="ci-ico">' + icon(it.icon, "sm") + "</span>" +
@@ -7041,6 +7648,13 @@ function renderPalette(kw) {
     b.addEventListener("click", function () { runPaletteIndex(Number(b.getAttribute("data-pi"))); });
     b.addEventListener("mousemove", function () { selectPalette(Number(b.getAttribute("data-pi"))); });
   });
+}
+/* 循环移动选中项(n = 0 直接返回):首↔尾环绕,越界的 delta 也能落回区间 */
+function paletteStep(d) {
+  var n = paletteItems.length;
+  if (!n) return;
+  paletteSel = ((paletteSel + d) % n + n) % n;
+  selectPalette(paletteSel);
 }
 function selectPalette(i) {
   if (i < 0 || i >= paletteItems.length) return;
@@ -7397,21 +8011,31 @@ function syncSidebarBackdrop() {
 function closeSidebarMobile() { $("sidebar-backdrop").classList.remove("show"); }
 function openSidebarMobile() {
   $("sidebar").classList.remove("collapsed");
+  SIDE_MANUAL = false;   /* 用户自己打开的 ⇒ 先前的「手动收起」意图作废 */
   $("sidebar-backdrop").classList.add("show");
   wsRailClose();   /* 窄屏下两块抽屉互斥,免得叠在一起打架 */
 }
-/* 收起侧栏:窄屏下同时收掉遮罩,桌面端只是让它滑出屏幕 */
-function collapseSidebar() {
+/* 收起侧栏:窄屏下同时收掉遮罩,桌面端只是让它滑出屏幕。
+   auto = 让位型收起(缩窄 / 进入窄屏 / 与右栏互斥):窗口再够宽时允许自动展开(既有行为);
+   省略 / false = 用户手动收起 ⇒ 记 SIDE_MANUAL,此后自动逻辑不再替他展开 */
+function collapseSidebar(auto) {
   $("sidebar").classList.add("collapsed");
+  if (!auto) SIDE_MANUAL = true;
   closeSidebarMobile();
   /* 左栏收起会吃掉 railColMin() 里的左栏宽度 ⇒ 右栏要让位判定重来一次 */
   if (typeof wsRailRefit === "function") wsRailRefit();
 }
 function isMobile() { return window.innerWidth <= 880; }
+/* 左栏「手动收起」意图(纯内存、不持久化 —— 与右栏 RAIL_AUTO 同口径):
+   true 时 autoFitSidebar() 跳过自动展开,只有用户自己再打开才恢复。
+   不变量:SIDE_MANUAL=true ⇒ #sidebar 带 .collapsed(各展开路径都会先清它)。 */
+var SIDE_MANUAL = false;
 
 /* ---- 侧栏自动回缩:聊天区被挤到下限时让位,窗口变宽后自动展开 ----
-   判定只看「当前状态 + 可用宽度」,不再记「是不是自动收的」:
-   手动收起后只要窗口宽度真的变了(≥24px),就会按阈值重新开合,不会一直卡在收起状态。 */
+   判定看「当前状态 + 可用宽度 + 手动意图」:自动让位造成的收起步沿用原口径 ——
+   窗口宽度真的变了(≥24px)就按阈值重新开合;用户手动收起的(SIDE_MANUAL=true)不在此列:
+   自动展开被跳过,只有用户自己再打开(Ctrl+B / 顶栏按钮 / 窄屏抽屉入口 / 侧栏 ✕)才恢复 ——
+   「以人为主」,手动意图不被宽度重判拉回。 */
 var MIN_CHAT_W = 760;                 /* 「非紧凑」下的对话区下限;紧凑模式见 minChatW() */
 var RAIL_W = 340, RAIL_W_CMP = 300;   /* 右栏兜底宽(正常路径仍取 offsetWidth) */
 var lastFitW = -1;
@@ -7504,11 +8128,13 @@ function autoFitSidebar(force) {
     wsRailExpandAuto();
     return;
   }
-  /* 7) 左栏判定(原样:右栏让位优先,同趟不再继续重判左栏) */
+  /* 7) 左栏判定(原样:右栏让位优先,同趟不再继续重判左栏)。
+        自动张开只对「自动让位收起来的」生效:用户手动收起的(SIDE_MANUAL=true)跳过,
+        免得宽度重判把用户的收起意图拉回(见本节首注释) */
   var avail = w - sidebarWidth() - railWidth();
   var collapsed = sb.classList.contains("collapsed");
   if (avail < minChatW() && !collapsed) sb.classList.add("collapsed");
-  else if (avail >= minChatW() + 80 && collapsed) sb.classList.remove("collapsed");
+  else if (avail >= minChatW() + 80 && collapsed && !SIDE_MANUAL) sb.classList.remove("collapsed");
 }
 
 /* 使用教程与关于(hero + 教程卡 + 斜杠命令 + 快捷键 + 降级策略 + 关于)。
@@ -7548,7 +8174,7 @@ function openHelp() {
       ] },
       { icon: "plug", title: "工具与工作区", items: [
         "「设置 → MCP 工具」是总开关;每个工具有三态权限:每次询问 / 自动允许 / 禁止。",
-        "挂载工作区后,模型能用 Read / Write / Edit / Glob / Grep / FileOps 读写沙箱虚拟盘(存在 IndexedDB 里,不上传)。",
+        "挂载工作区后,模型能用 Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office 读写沙箱虚拟盘(存在 IndexedDB 里,不上传)。",
         "ExecutePython 在页面内跑 CPython(可后台运行、随时看输出、随时中止);ExecuteJavaScript 跑在独立 Worker 沙箱里,默认断网。"
       ] },
       { icon: "layers", title: "上下文与压缩", items: [
@@ -7644,7 +8270,10 @@ function bindUI() {
       if ($("sidebar").classList.contains("collapsed")) openSidebarMobile();
       else collapseSidebar();
     } else {
-      $("sidebar").classList.toggle("collapsed");
+      /* 桌面分支 = 用户显式开合 ⇒ 手动意图跟着结果走:收起后自动逻辑不再替他展开 */
+      var sbEl = $("sidebar");
+      sbEl.classList.toggle("collapsed");
+      SIDE_MANUAL = sbEl.classList.contains("collapsed");
       syncSidebarBackdrop();
       /* 桌面分支不经 collapseSidebar();Ctrl+B 也走这里 ⇒ 左栏开合后右栏必须重判一次 */
       if (typeof wsRailRefit === "function") wsRailRefit();
@@ -7665,12 +8294,30 @@ function bindUI() {
   /* 命令面板 */
   $("cmd-close").addEventListener("click", function () { closeMask("palette-mask"); focusInput(); });
   $("cmd-input").addEventListener("input", function () { renderPalette(this.value); });
+  /* 导航监听从 #cmd-input **上提到容器 #palette**(keydown 冒泡已覆盖输入框)⇒ 焦点落在条目
+     按钮上时 ↑↓ / Tab 也有效(修「焦点一离开输入框导航就失效」) */
+  $("palette").addEventListener("keydown", function (e) {
+    if (e.key === "Tab") {
+      /* 门 D4=A:Tab / Shift+Tab 接管为选中项移动。
+         ★ stopPropagation() 是硬条件:#palette-mask 上装了 focusTrap(appA),它**只看
+         document.activeElement、不看 defaultPrevented**;#palette 内 f[0] === #cmd-input、
+         f[last] === 最后一个 .cmd-item ⇒ 只写 preventDefault() 时 Shift+Tab 会被判成
+         「从首元素反向 Tab」并把焦点抛到末项 ⇒ 必须在冒泡到 mask 之前拦下 */
+      e.preventDefault();
+      e.stopPropagation();
+      paletteStep(e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (e.key === "ArrowDown") { e.preventDefault(); paletteStep(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); paletteStep(-1); return; }
+    if (e.key === "PageDown") { e.preventDefault(); paletteStep(5); return; }
+    if (e.key === "PageUp") { e.preventDefault(); paletteStep(-5); return; }
+    if (e.key === "Home") { e.preventDefault(); selectPalette(0); return; }
+    if (e.key === "End") { e.preventDefault(); selectPalette(paletteItems.length - 1); return; }
+  });
+  /* Enter 仍只认输入框(既有语义):焦点在条目上时 Enter = 浏览器原生 click = 执行被聚焦那条 */
   $("cmd-input").addEventListener("keydown", function (e) {
-    if (e.key === "ArrowDown") { e.preventDefault(); selectPalette(Math.min(paletteSel + 1, paletteItems.length - 1)); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); selectPalette(Math.max(paletteSel - 1, 0)); }
-    else if (e.key === "Enter") { e.preventDefault(); runPaletteIndex(paletteSel); }
-    else if (e.key === "Home") { e.preventDefault(); selectPalette(0); }
-    else if (e.key === "End") { e.preventDefault(); selectPalette(paletteItems.length - 1); }
+    if (e.key === "Enter") { e.preventDefault(); runPaletteIndex(paletteSel); }
   });
 
   /* 查找栏 */
@@ -7997,6 +8644,10 @@ function bindUI() {
     applyAppearance(); saveSoon(); syncFaviconUI();
     toast("已重置为默认图标", "success");
   });
+  /* 设置:桌面快捷方式(需求 8)—— 按钮可用性与「写入文件夹…」的 hidden 由 dskSyncUI() 统一控制 */
+  $("btn-dsk-ico").addEventListener("click", dskDownloadIco);
+  $("btn-dsk-url").addEventListener("click", dskDownloadUrl);
+  $("btn-dsk-write").addEventListener("click", dskWriteToFolder);
   /* 设置:数据 */
   $("btn-export").addEventListener("click", exportAll);
   $("btn-export-md").addEventListener("click", exportCurrentMd);
@@ -8066,7 +8717,7 @@ function bindUI() {
     var nowMobile = isMobile();
     if (nowMobile !== wasMobile) {
       wasMobile = nowMobile;
-      if (nowMobile) collapseSidebar();   // 进入窄屏先收起,免得挡住整页
+      if (nowMobile) collapseSidebar(true);   // 进入窄屏先收起(自动,不写手动意图),免得挡住整页
       else closeSidebarMobile();
       autoFitSidebar(true);               // 跨越窄屏阈值时立刻重判一次,不受 24px 阈值限制
     } else {
@@ -8124,6 +8775,7 @@ function onKeyDown(e) {
     if (anyOpen) {
       /* 关之前给弹窗一次钩子式收尾:任务面板要停掉 1s 刷新定时器(closeMask 是裸 classList.remove) */
       if ($("tasks-modal").classList.contains("open")) closeTasksModal();
+      var wasPalette = $("palette-mask").classList.contains("open");
       closeAllMasks();
       /* 工作区预览的 objectURL 也要在这里回收(closeMask 没有钩子) */
       if (typeof wsPreviewCleanup === "function") wsPreviewCleanup();
@@ -8133,6 +8785,9 @@ function onKeyDown(e) {
       lightboxEl.classList.remove("open");
       lightboxImg.removeAttribute("src");
       toggleCtxPop(false);
+      /* 门 D8=A:命令面板被普通 Esc 关掉后把焦点交回输入框(与 #cmd-close 按钮路径一致);
+         其余弹层的关闭不动焦点(不扩大既有行为面) */
+      if (wasPalette) focusInput();
       return;
     }
     /* 浮窗 / 抽屉形态的右栏:Esc 与点遮罩一致地关掉它(列形态下不关,避免与既有习惯冲突) */
@@ -8143,6 +8798,12 @@ function onKeyDown(e) {
        别丢用户看不见的东西;缓冲为空则不再有其它动作 */
     if (sqHasFor(conv && conv.id)) { sqDiscardAll(); toast("已丢弃待发送内容", "info", 2400); return; }
     return;
+  }
+  /* 命令面板开着时再按 Ctrl+K = 收起:谓词收紧到「面板是唯一打开的弹层」,与设置/确认弹窗
+     并存时仍走下面的「弹窗独占快捷键」早退(不变量保持)。位置:Esc 分支之后、早退之前 */
+  if (key === "k" && mod && $("palette-mask").classList.contains("open") &&
+      $$(".modal-mask.open").length === 1) {
+    e.preventDefault(); closeMask("palette-mask"); focusInput(); return;
   }
   /* 中断 = 主键 Ctrl+X(macOS 为 Cmd+X):与 Ctrl/Cmd+Esc 同一套行为 —— 生成中先停止生成;
      空闲时若仍有手动压缩在跑则中止它。Ctrl+X 在浏览器里本是「剪切」,有非空文本选区时
@@ -8169,12 +8830,21 @@ function onKeyDown(e) {
   if (key === "o") {
     /* Ctrl+O:展开 / 折叠最后一张「上下文已压缩」卡片(与 Kimi 的 Ctrl-O 对齐) */
     e.preventDefault();
-    var cards = elChatInner.querySelectorAll(".msg.compact-card");
+    var cards = elChatInner.querySelectorAll(".msg.compact-card, .msg.cx-sum");
     if (cards.length) {
       var last = cards[cards.length - 1];
-      last.classList.toggle("expanded");
-      var tg = last.querySelector(".cc-more");
-      if (tg) tg.textContent = last.classList.contains("expanded") ? "收起" : "展开";
+      /* 完成卡(工具气泡)与头部点击走**同一条**重绘路径:改真实摘要消息的 toolOpen + 分流重绘 */
+      var tg0 = last.querySelector("[data-tool-toggle]");
+      var mmsg = tg0 ? findMsg(tg0.getAttribute("data-tool-toggle")) : null;
+      if (mmsg) {
+        mmsg.toolOpen = !toolCardOpen(mmsg);
+        redrawToolCard(mmsg);
+        saveSoon();
+      } else {
+        last.classList.toggle("expanded");
+        var tg = last.querySelector(".cc-more");
+        if (tg) tg.textContent = last.classList.contains("expanded") ? "收起" : "展开";
+      }
     }
     return;
   }
@@ -8352,6 +9022,18 @@ var WSR_TREE_DIR_MAX = 40;            /* 缓存目录数上限 */
 var WSR_TREE_KID_LIMIT = 200;         /* 每层条目上限(与 WSR_LIMIT 同量级) */
 var WSR_TREE_ROW_MAX = 600;           /* 整树渲染行数上限(40 目录 × 200 项的最坏组合必须封顶) */
 var WSR_TREE_DEPTH_MAX = 6;           /* 展开层级上限(再深请点进去看) */
+/* ---- 工作区右键菜单状态(全部纯内存:不进 settings / 不进 IDB / 不跨标签页) ---- */
+var WS_CTX = null;        /* 当前打开的右键菜单上下文 {wsId,type:"file"|"dir"|"blank",path,name,dir};
+                             唯一写入口 = wsCtxOpenMenu / wsCtxCloseMenu / closeMenus */
+var WS_CTX_CLIP = null;   /* 内存剪贴板 {mode:"cut"|"copy",wsId,paths:[…],names:[…],at:ts}
+                             —— 门 8=B 起 paths 真的会 >1(多选批量剪切/复制) */
+var WS_CTX_EXTRA = [];    /* 扩展点注册表(需求 6「用 JupyterLab 打开」用;本批不注册任何项) */
+/* ---- 行选中集(门 8=B:选中模型;与 WS_CTX_CLIP 一样纯内存,不进 settings / IDB) ----
+   语义:路径数组 + Shift 区间锚点;只在「同一工作区 + 同一目录」内有效(换目录 / 换工作区即清)。
+   渲染标记 = .wsr-sel(与 .wsr-cut 同一条 wsrRowExtraClass 出口,故重绘后自动重算) */
+var WS_SEL = [];
+var WS_SEL_ANCHOR = "";
+var WS_SEL_KEY = "";      /* WS_SEL 所属的 "wsId|WS_CWD";键一变即清(选中跨目录/跨工作区无意义) */
 var WS_PREVIEW_URL = null;            /* 当前预览的 objectURL(单点回收,见 wsPreviewCleanup) */
 function wsrTreeReset() { WSR_TREE = { open: {}, kids: {}, more: {}, busy: {} }; WSR_TREE_ORDER = []; }
 var WS_PRIME = {};                                        /* 元数据缓存补热标记 */
@@ -8373,7 +9055,7 @@ function wsRailSetOpen(open) {
   if (!r) return;
   if (!open) { wsRailClose(); return; }
   if (!wsReady()) { toast("工作区存储不可用(设置 → 数据 里查看原因)", "warn", 3600); return; }
-  if (isMobile()) collapseSidebar();            /* 窄屏两块抽屉互斥,免得叠在一起 */
+  if (isMobile()) collapseSidebar(true);        /* 窄屏两块抽屉互斥(自动,不写手动意图),免得叠在一起 */
   RAIL_AUTO = false;
   lockRailForm(railForm());                     /* ★ 锁型先于遮罩/按钮判据 */
   r.classList.remove("collapsed");
@@ -8506,7 +9188,7 @@ function updateWsMountBtn() {
     var nm = (cur && WS_META_CACHE[cur]) ? WS_META_CACHE[cur].name : "";
     btn.title = cur
       ? ("工作区:已挂载「" + nm + "」,点击可切换或取消挂载")
-      : "工作区(沙箱虚拟盘):挂载后模型可用 Read / Write / Edit / Glob / Grep / FileOps";
+      : "工作区(沙箱虚拟盘):挂载后模型可用 Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office";
   }
   var rb = $("btn-wsr-mount");
   if (rb) {
@@ -8548,6 +9230,8 @@ function wsOnWsSwitch(v) {
   WS_RAIL_SEL = v;
   WS_CWD = "/";
   WSR_LIMIT = 200;
+  /* 剪贴板不跨工作区:换到别的工作区就清(换出才清 —— 同 id 的重复选择不动它) */
+  if (WS_CTX_CLIP && WS_CTX_CLIP.wsId !== v) wsCtxClipClear();
   wsrTreeReset();             /* 换了工作区:目录树缓存属于上一个工作区 */
   wsSetReport(null);          /* 上一批上传的失败报告属于上一个工作区,留着会被读成当前工作区的结果 */
   renderWsRail();
@@ -8577,7 +9261,7 @@ function renderWsRail() {
       if (sub) sub.textContent = "还没有工作区";
       if (files) {
         files.innerHTML = '<div class="wsr-empty">还没有工作区。<br>' +
-          "工作区是这个页面里的虚拟盘:挂载后模型可以用 <b>Read / Write / Edit / Glob / Grep / FileOps</b> " +
+          "工作区是这个页面里的虚拟盘:挂载后模型可以用 <b>Read / ReadOffice / Write / Edit / Glob / Grep / FileOps / Office</b> " +
           "读写它,<b>碰不到你的真实磁盘</b>。" +
           '<div><button class="btn sm" data-wsr="create">' + icon("plus", "sm") + " 新建工作区</button></div></div>";
       }
@@ -8625,7 +9309,10 @@ function renderWsCrumb() {
   var c = $("wsr-crumb");
   if (!c) return;
   var parts = WS_CWD === "/" ? [] : WS_CWD.slice(1).split("/");
-  var html = '<button data-wsr="go" data-wsp="/">/</button>';
+  /* 根目录项 = 「文件夹图标 + /」同一个按钮:命中区放大到 24px(clientHeight/clientWidth 判据见验收 A1),
+     data-wsr/data-wsp 原样 ⇒ 点击语义零变化 */
+  var html = '<button class="wsr-home" data-wsr="go" data-wsp="/" title="回到根目录 /" ' +
+    'aria-label="根目录">' + icon("folder", "sm") + "<span>/</span></button>";
   var acc = "";
   parts.forEach(function (p) {
     acc += "/" + p;
@@ -8635,10 +9322,82 @@ function renderWsCrumb() {
   c.innerHTML = html;
   c.hidden = false;
 }
-/* ---- 列表行渲染:一级列表 + 内联目录树(A2/A3) ---- */
-function wsrUpRowHtml() {
+/* ---- 行渲染:一级列表 + 内联目录树(A2/A3) ---- */
+/* 条目行的右键类型判据只认 data-wst(dir/file)——唯一权威;没有它的行(树内「显示更多」/
+   「显示更多(共 N 项)」/「…未展开」/空态)一律走空白菜单,见 wsCtxContextFromEvent */
+function wsrRowExtraClass(wsId, path) {
+  var cls = "";
+  if (WS_CTX_CLIP && WS_CTX_CLIP.wsId === wsId && WS_CTX_CLIP.mode === "cut" &&
+      WS_CTX_CLIP.paths.indexOf(path) > -1) cls += " wsr-cut";
+  if (wsSelHas(path)) cls += " wsr-sel";
+  return cls;
+}
+/* ---- 行选中集(门 8=B) —— 单击/多选的唯一出口 ----
+   ★ 点击语义改写(依据 `decisions/plans-user-decisions-2026-09-16.md` §二 门8 + §三 偏离汇总第 3 条,
+     用户拍板时已知"会改到既有单击行为"):**单击 = 只改选中**,不再进目录/开预览;
+     **双击**(第二击 e.detail>=2)= 打开(进目录 / 开预览)。行内按钮(.wsr-ops / .wsr-caret)、
+     面包屑、特殊行(「显示更多」等无 data-wst 的行)一律照旧,不受本改写影响。 */
+function wsSelHas(p) { return WS_SEL.indexOf(p) > -1; }
+/* 就地刷 .wsr-sel(不整列表重绘:重绘会丢滚动位置与树展开态) */
+function wsSelPaint() {
+  $$("#wsr-files .wsr-row[data-wst]").forEach(function (r) {
+    var p = r.getAttribute("data-wsp") || "";
+    if (p && wsSelHas(p)) r.classList.add("wsr-sel"); else r.classList.remove("wsr-sel");
+  });
+}
+/* 清选中(换目录 / 换工作区 / 点空白处) */
+function wsSelClear() {
+  if (!WS_SEL.length && !WS_SEL_ANCHOR) return;
+  WS_SEL = []; WS_SEL_ANCHOR = "";
+  wsSelPaint();
+}
+/* 条目行的 DOM 顺序(DOM 序 = 视觉序,含「上级目录」行;特殊行没有 data-wst ⇒ 不算) */
+function wsSelRowPaths() {
+  var out = [];
+  $$("#wsr-files .wsr-row[data-wst]").forEach(function (r) {
+    var p = r.getAttribute("data-wsp") || "";
+    if (p) out.push(p);
+  });
+  return out;
+}
+/* 行点击 → 选中集:Shift = 锚点区间(可 Ctrl+Shift 并入), Ctrl/Cmd = 切换, 其余 = 单选替换 */
+function wsSelOnRowClick(p, e) {
+  var all = wsSelRowPaths(), i = all.indexOf(p);
+  if (e.shiftKey && WS_SEL_ANCHOR) {
+    var a = all.indexOf(WS_SEL_ANCHOR);
+    if (a < 0 || i < 0) { WS_SEL = [p]; WS_SEL_ANCHOR = p; }
+    else {
+      var lo = Math.min(a, i), hi = Math.max(a, i), range = all.slice(lo, hi + 1);
+      if (e.ctrlKey || e.metaKey) {
+        range.forEach(function (x) { if (!wsSelHas(x)) WS_SEL.push(x); });
+      } else {
+        WS_SEL = range.slice();
+      }
+      WS_SEL_ANCHOR = p;
+    }
+  } else if (e.ctrlKey || e.metaKey) {
+    if (wsSelHas(p)) WS_SEL = WS_SEL.filter(function (x) { return x !== p; });
+    else WS_SEL.push(p);
+    WS_SEL_ANCHOR = WS_SEL.length ? WS_SEL[WS_SEL.length - 1] : "";
+  } else {
+    WS_SEL = [p]; WS_SEL_ANCHOR = p;
+  }
+  wsSelPaint();
+}
+/* 行激活门(挂在 onWsRailClick 的 enter/go/preview 分支上):
+   返回 false = 这次点击只算「改选中」,不执行「进目录 / 开预览」 */
+function wsrRowActivate(e, b) {
+  if (!b || !b.getAttribute || !b.getAttribute("data-wst")) return true;   /* 面包屑 / 特殊行:照旧 */
+  if (!(b.classList && b.classList.contains("wsr-row"))) return true;      /* 行内按钮等:照旧 */
+  var p = b.getAttribute("data-wsp") || "";
+  if (!p) return true;
+  wsSelOnRowClick(p, e);
+  return e.detail >= 2;               /* 双击的第二击才真的打开 */
+}
+function wsrUpRowHtml(wsId) {
   var up = wsPathParent(WS_CWD);
-  return '<div class="wsr-row up" data-wsr="go" data-wsp="' + escAttr(up) + '" title="返回上级:' + escAttr(up) + '">' +
+  return '<div class="wsr-row up' + wsrRowExtraClass(wsId, up) + '" data-wst="dir" data-wsr="go" data-wsp="' +
+    escAttr(up) + '" title="返回上级:' + escAttr(up) + '">' +
     icon("left", "sm") + '<span class="wsr-name">上级目录</span>' +
     '<span class="wsr-size">' + escapeHtml(up) + "</span></div>";
 }
@@ -8661,7 +9420,9 @@ function wsrRowHtml(e, depth, acc) {
     '<button data-wsr="del" data-wsp="' + escAttr(path) + '" title="删除" class="danger">' + icon("trash", "sm") + "</button>";
   var pad = depth > 0 ? ' style="padding-left:' + (8 + 14 * depth) + 'px"' : "";
   return '<div class="wsr-row' + (isDir ? " dir" : "") + (depth > 0 ? " tree" : "") +
-    '" data-depth="' + depth + '" data-wsr="' + (isDir ? "enter" : "preview") + '" data-wsp="' + escAttr(path) +
+    wsrRowExtraClass(acc.wsId, path) +
+    '" data-depth="' + depth + '" data-wst="' + (isDir ? "dir" : "file") +
+    '" data-wsr="' + (isDir ? "enter" : "preview") + '" data-wsp="' + escAttr(path) +
     '" title="' + escAttr(path) + '"' + pad + ">" +
     icon(isDir ? "folder" : "file", "sm") +
     '<span class="wsr-name">' + escapeHtml(e.name) + "</span>" + caret +
@@ -8736,14 +9497,17 @@ function wsrTreeMore(wsId, path) {
 function renderWsFiles(wsId) {
   var box = $("wsr-files");
   if (!box) return;
+  /* 选中集只在「同一工作区 + 同一目录」内有效:键一变即清(换目录 / 换工作区 / 删掉当前目录后被兜回父目录) */
+  var selKey = String(wsId) + "|" + WS_CWD;
+  if (selKey !== WS_SEL_KEY) { WS_SEL = []; WS_SEL_ANCHOR = ""; WS_SEL_KEY = selKey; }
   renderWsCrumb();
   wsListDir(wsId, WS_CWD, { limit: WSR_LIMIT }).then(function (r) {
     if (wsIsErr(r)) {
       box.innerHTML = '<div class="wsr-empty">' + escapeHtml(r.error || r.code) + "</div>";
       return;
     }
-    var acc = { n: 0, cut: false };
-    var html = (WS_CWD !== "/") ? wsrUpRowHtml() : "";
+    var acc = { n: 0, cut: false, wsId: wsId };      /* wsId 供 wsrRowExtraClass 判"剪贴板是不是这个工作区的" */
+    var html = (WS_CWD !== "/") ? wsrUpRowHtml(wsId) : "";
     if (!r.entries.length) {
       html += '<div class="wsr-empty">这个目录是空的。<br>把文件或文件夹拖进这一栏,或点工具条的上传按钮。</div>';
     } else {
@@ -8869,6 +9633,16 @@ function bindWsRail() {
     }
     e.target.value = "";      /* 允许再次选同一批文件 */
   });
+  /* 工作区右键菜单:只接管 #wsr-files 容器内的右键(面包屑与工具条是容器外的兄弟节点,不归它管)。
+     Shift+右键 放行给浏览器原生菜单;wsCtxContextFromEvent 返 null(没工作区/存储不可用)也不接管 */
+  var fl = $("wsr-files");
+  if (fl) fl.addEventListener("contextmenu", function (e) {
+    if (e.shiftKey) return;
+    var ctx = wsCtxContextFromEvent(e);
+    if (!ctx) return;
+    e.preventDefault();
+    wsCtxOpenMenu(ctx, e.clientX, e.clientY);
+  });
 }
 function onWsRailClick(e) {
   var b = (e.target && e.target.closest) ? e.target.closest("[data-wsr]") : null;
@@ -8878,14 +9652,21 @@ function onWsRailClick(e) {
   var p = b.getAttribute("data-wsp") || "";
   var id = b.getAttribute("data-wsid") || WS_RAIL_SEL;
   e.preventDefault();
-  if (act === "go" || act === "enter") { WS_CWD = p || "/"; WSR_LIMIT = 200; renderWsRail(); return; }
+  /* 门 8=B 点击语义改写:条目行单击 = 只改选中(wsrRowActivate 返 false),双击第二击才进目录/开预览 */
+  if (act === "go" || act === "enter") {
+    if (!wsrRowActivate(e, b)) return;
+    WS_CWD = p || "/"; WSR_LIMIT = 200; renderWsRail(); return;
+  }
   if (act === "more") { WSR_LIMIT = Math.min(WSR_LIMIT_MAX, WSR_LIMIT + WSR_STEP); renderWsRail(); return; }
   if (act === "tree") { wsrTreeToggle(id, p); return; }
   if (act === "treemore") { wsrTreeMore(id, p); return; }
-  if (act === "preview") { wsPreviewOpen(id, p); return; }
+  if (act === "preview") { if (!wsrRowActivate(e, b)) return; wsPreviewOpen(id, p); return; }
   if (act === "create") { wsCreateWorkspaceUI(); return; }
   if (act === "pick") {
     WS_RAIL_SEL = id; WS_CWD = "/"; WSR_LIMIT = 200;
+    WS_SEL = []; WS_SEL_ANCHOR = "";        /* 换工作区:选中集作废(路径属于另一个箱子) */
+    /* 侧栏点选是最常用的工作区切换路径(wsl 下拉那条走 wsOnWsSwitch):同样要清跨工作区的剪贴板 */
+    if (WS_CTX_CLIP && WS_CTX_CLIP.wsId !== id) wsCtxClipClear();
     if (wsRailCollapsed()) wsRailExpand(); else renderWsRail();
     return;
   }
@@ -8949,6 +9730,432 @@ function wsMountToggleUI(id) {
   else wsMountTo(conv.id, id);
 }
 
+/* ---- 工作区右键菜单(需求 3) ----
+   三态:文件行 / 目录行 / 列表空白(树内「显示更多」一类特殊行一律按空白态,判据见 wsCtxContextFromEvent)。
+   复用 #pop-menu 单例(不新建浮层):开前 closeMenus()、项集只由 wsCtxItems 一处产出。
+   ★ 本批不做键盘可达(决策门 4 = C)⇒ 菜单只由鼠标/触屏右键唤起,连 hint 也不写快捷键(不做假快捷键)。
+   位置用 placeMenuAt(定点夹紧 + 超高自滚),不用 placeMenu(那是「贴着锚点上方」语义)。 */
+var WS_CTX_CLIP_NOTE = "工作区内部剪贴板(不进系统剪贴板、刷新后失效)";
+var WS_CTX_ROOT_WHY = "工作区根目录不能改名 / 删除 / 剪切 / 复制";
+/* 菜单项权威表:项集与顺序的唯一来源(三态列 f/d/b;sep 的分组按参考图同序) */
+var WS_CTX_ROWS = [
+  { id: "rename", label: "重命名", icon: "edit", f: 1, d: 1, b: 0, lock: 1 },
+  { id: "delete", label: "删除", icon: "trash", f: 1, d: 1, b: 0, lock: 1 },
+  { id: "cut", label: "剪切", icon: "scissors", f: 1, d: 1, b: 0, lock: 1 },
+  { id: "copy", label: "复制", icon: "copy", f: 1, d: 1, b: 0, lock: 1 },
+  { id: "paste", label: "粘贴", icon: "clip", f: 1, d: 1, b: 1 },
+  { id: "duplicate", label: "复制副本", icon: "duplicate", f: 1, d: 0, b: 0 },
+  { id: "download", label: "下载", altLabel: "下载（打包 zip）", icon: "download", f: 1, d: 1, b: 0 },
+  { sep: 1, f: 1, d: 1, b: 0 },
+  { id: "copypath", label: "复制路径", icon: "file", f: 1, d: 1, b: 0 },
+  { sep: 1, f: 1, d: 1, b: 1 },
+  { id: "newfile", label: "新建文件", icon: "file-plus", f: 1, d: 1, b: 1 },
+  { id: "newfolder", label: "新建文件夹", icon: "folder-plus", f: 1, d: 1, b: 1 },
+  { sep: 1, f: 1, d: 1, b: 1 },
+  { foot: "Shift+右键 = 浏览器菜单", f: 1, d: 1, b: 1 }
+];
+/* 扩展点:需求 6 的「用 JupyterLab 打开」等项在此注册(本批不注册任何项 ⇒ 零视觉残留)。
+   ★ 页面不对外暴露任何接口(无 window API):注册只走同一 IIFE 内的模块加载期调用 */
+function wsCtxRegisterExtra(item) {
+  if (!item || !item.id) return;
+  WS_CTX_EXTRA.push(item);
+}
+/* 命中的扩展项(when 为假或抛异常一律当"不显示",不让第三方项弄坏菜单) */
+function wsCtxExtras(ctx) {
+  var out = [];
+  WS_CTX_EXTRA.forEach(function (it) {
+    var ok = true;
+    if (it.when) { try { ok = !!it.when(ctx); } catch (e) { ok = false; } }
+    if (!ok) return;
+    out.push({ id: "x:" + it.id, label: it.label || it.id, icon: it.icon || "spark", title: it.hint || "" });
+  });
+  return out;
+}
+/* 右键 → 上下文 | null(null = 不接管,交给浏览器原生菜单)。
+   ★ 类型判据先看 data-wst:只有条目行(wsrRowHtml / wsrUpRowHtml)才有它;
+   树内「显示更多」/「显示更多(共 N 项)」/「…未展开」/空态都没有 ⇒ 一律空白菜单
+   ★ 门 8=B:右键落在"已在选中集里"的行上 ⇒ 动作作用于整个选中集(paths);否则选中集收敛为这一行。
+   空白/特殊行右键 ⇒ 清选中(菜单作用于该目录本身,与选中集无关) */
+function wsCtxContextFromEvent(e) {
+  if (!wsReady() || !WS_RAIL_SEL) return null;
+  var row = (e.target && e.target.closest) ? e.target.closest(".wsr-row") : null;
+  var t = row ? row.getAttribute("data-wst") : null;
+  if (t === "dir" || t === "file") {
+    var p = row.getAttribute("data-wsp") || "";
+    /* dir = 粘贴 / 新建的目标目录:目录行取它自己、文件行取父目录(即列表当前目录) */
+    if (!wsSelHas(p)) { WS_SEL = [p]; WS_SEL_ANCHOR = p; }
+    wsSelPaint();
+    return { wsId: WS_RAIL_SEL, type: t, path: p, name: wsPathName(p), dir: (t === "dir" ? p : wsPathParent(p)),
+             paths: WS_SEL.slice() };
+  }
+  if (WS_SEL.length) wsSelClear();
+  var d = row ? (row.getAttribute("data-wsp") || WS_CWD) : WS_CWD;
+  return { wsId: WS_RAIL_SEL, type: "blank", path: null, name: null, dir: d, paths: [] };
+}
+/* 粘贴的四道门(返回空串才启用):空 / 跨工作区 / 目标是源的自身或子树 / 剪切且源与目标同目录。
+   ★ 门 8=B:剪贴板可含多项 ⇒ 任一源命中禁用条件即整批禁用(不做"部分粘进去"的静默惊喜) */
+function wsCtxPasteReason(targetDir) {
+  if (!wsCtxClipAlive()) {
+    if (!WS_CTX_CLIP || !WS_CTX_CLIP.paths.length) return "剪贴板为空:先「复制」或「剪切」一个条目";
+    return "剪贴板来自另一个工作区(跨工作区粘贴暂不支持)";
+  }
+  var ps = WS_CTX_CLIP.paths, i, src;
+  for (i = 0; i < ps.length; i++) {
+    src = ps[i];
+    if (targetDir === src || targetDir.indexOf(src + "/") === 0) return "不能把目录粘贴到它自己的子目录里";
+  }
+  if (WS_CTX_CLIP.mode === "cut") {
+    for (i = 0; i < ps.length; i++) {
+      if (targetDir === wsPathParent(ps[i])) return "源与目标在同一目录";
+    }
+  }
+  return "";
+}
+function wsCtxPasteTitle(why) { return why ? why + " — " + WS_CTX_CLIP_NOTE : WS_CTX_CLIP_NOTE; }
+/* ★ 菜单项单一来源(三态项集与顺序的唯一权威;禁用用原生 disabled,理由进 title) */
+function wsCtxItems(ctx) {
+  var st = ctx.type === "blank" ? "b" : (ctx.type === "dir" ? "d" : "f");
+  var rooted = ctx.type === "dir" && ctx.path === "/";
+  var pasteWhy = wsCtxPasteReason(ctx.dir);
+  var n = (ctx.paths || []).length;         /* 门 8=B:选中项数(右键那一行也算在内) */
+  var items = [];
+  WS_CTX_ROWS.forEach(function (r) {
+    if (!r[st]) return;
+    if (r.sep) { items.push({ sep: true }); return; }
+    if (r.foot) { items.push({ foot: r.foot }); return; }
+    var it = { id: r.id, label: r.label, icon: r.icon, disabled: false, title: "" };
+    if (r.altLabel && ctx.type === "dir") it.label = r.altLabel;    /* 目录态:下载（打包 zip） */
+    if (r.lock && rooted) { it.disabled = true; it.title = WS_CTX_ROOT_WHY; }
+    if (r.id === "paste") { it.disabled = !!pasteWhy; it.title = wsCtxPasteTitle(pasteWhy); }
+    if (n > 1 && !it.disabled) {
+      if (r.id === "rename" || r.id === "duplicate") {
+        /* 只作用于单项的项在多选时禁用 + 写明理由:不做"只改了其中一项"的静默惊喜 */
+        it.disabled = true;
+        it.title = "选中了 " + n + " 项:重命名 / 复制副本一次只作用于一个条目";
+      } else if (r.id === "delete" || r.id === "cut" || r.id === "copy" ||
+                 r.id === "download" || r.id === "copypath") {
+        it.title = "作用于选中的 " + n + " 项";    /* 批量动作:标题写明作用范围(如实告知破坏面) */
+      }
+    }
+    items.push(it);
+  });
+  /* 扩展项:内置项之后、foot 之前自成一组(空注册表不渲染这一组) */
+  var ex = wsCtxExtras(ctx);
+  if (ex.length) {
+    var foot = items.pop();
+    items.push({ sep: true });
+    items.push.apply(items, ex);
+    items.push(foot);
+  }
+  return items;
+}
+function wsCtxItemsHtml(ctx) {
+  var html = "";
+  wsCtxItems(ctx).forEach(function (it) {
+    if (it.sep) { html += '<div class="pm-sep"></div>'; return; }
+    if (it.foot) { html += '<div class="pm-foot">' + escapeHtml(it.foot) + "</div>"; return; }
+    html += '<button data-wsctx="' + escAttr(it.id) + '" role="menuitem"' +
+      (it.disabled ? " disabled" : "") +
+      (it.title ? ' title="' + escAttr(it.title) + '"' : "") + ">" +
+      icon(it.icon, "sm") + " " + escapeHtml(it.label) + "</button>";
+  });
+  return html;
+}
+function wsCtxOpenMenu(ctx, x, y) {
+  closeMenus();              /* #pop-menu 是单例:先收掉上一位使用者(会话/模板/挂载/命令面板) */
+  WS_CTX = ctx;
+  popMenuEl.innerHTML = wsCtxItemsHtml(ctx);
+  placeMenuAt(popMenuEl, x, y);
+}
+function wsCtxCloseMenu() {
+  popMenuEl.classList.remove("open");
+  WS_CTX = null;
+}
+/* 菜单点击分派(挂在既有 popMenuEl click 分支上)。先取出 WS_CTX 再清 ——
+   动作是异步的(确认框 / 写事务),清早了读数就漂。
+   ★ 门 8=B:ctx.paths = 本次动作的作用对象集(右键那行在选中集里 ⇒ 整批;否则只有那一行) */
+function runWsCtxAction(act) {
+  var ctx = WS_CTX;
+  WS_CTX = null;
+  if (!ctx) return;
+  var id = ctx.wsId, path = ctx.path;
+  var paths = (ctx.paths && ctx.paths.length) ? ctx.paths.slice() : (path ? [path] : []);
+  if (act.indexOf("x:") === 0) {
+    var key = act.slice(2);
+    for (var i = 0; i < WS_CTX_EXTRA.length; i++) {
+      if (WS_CTX_EXTRA[i].id === key) {
+        try { WS_CTX_EXTRA[i].run(ctx); } catch (e) { toast("扩展项执行失败:" + wsMsg(e), "error", 4200); }
+        return;
+      }
+    }
+    return;              /* 找不到即静默返回(注册项被撤掉的情况) */
+  }
+  if (act === "rename") { wsCtxRenameUI(id, path); return; }
+  if (act === "delete") {
+    if (paths.length > 1) { wsCtxBatchDeleteUI(id, paths); return; }
+    wsDeleteUI(id, path); return;
+  }
+  if (act === "cut") { wsCtxClipSet("cut", id, paths); return; }
+  if (act === "copy") { wsCtxClipSet("copy", id, paths); return; }
+  if (act === "paste") { wsCtxPaste(id, ctx.dir); return; }
+  if (act === "duplicate") { wsCtxDuplicate(id, path); return; }
+  /* 文件 ⇒ 原样下载、目录 ⇒ 自动打包 zip:同一条内核(需求 9 冻结的 wsDownloadPathUI)。
+     不自判文件/目录、不自建 zip、不自行点 a[download];与工具默认权限 ask 无关(那是模型侧口径) */
+  if (act === "download") {
+    if (paths.length > 1) { wsCtxBatchDownload(id, paths); return; }
+    wsDownloadPathUI(id, path); return;
+  }
+  if (act === "copypath") {
+    if (paths.length > 1) { copyText(paths.join("\n"), "已复制 " + paths.length + " 条路径"); return; }
+    copyText(path, "已复制路径 " + path); return;
+  }
+  if (act === "newfile") { wsNewFileUI(id, ctx.dir); return; }
+  if (act === "newfolder") { wsMkdirUI(id, ctx.dir); return; }
+}
+
+/* ---- 工作区内部剪贴板(唯一写入口:wsCtxClipSet / wsCtxClipClear) ---- */
+function wsCtxClipSet(mode, wsId, paths) {
+  WS_CTX_CLIP = {
+    mode: mode, wsId: wsId, paths: paths.slice(),
+    names: paths.map(function (p) { return wsPathName(p); }), at: Date.now()
+  };
+  if (WS_RAIL_SEL) renderWsFiles(WS_RAIL_SEL);      /* 立刻刷 .wsr-cut 标记 */
+  toast((mode === "cut" ? "已剪切 " : "已复制 ") + paths.length + " 项(" + WS_CTX_CLIP_NOTE + ")", "info", 2800);
+}
+function wsCtxClipClear() {
+  if (!WS_CTX_CLIP) return;
+  WS_CTX_CLIP = null;
+  if (WS_RAIL_SEL) renderWsFiles(WS_RAIL_SEL);
+}
+function wsCtxClipAlive() {
+  return !!(WS_CTX_CLIP && WS_CTX_CLIP.wsId === WS_RAIL_SEL && WS_CTX_CLIP.paths.length);
+}
+/* 造「永不覆盖」的目标名:先取这一层的同名集合,再按 name (2).ext 递增(最多 100 次,再不成用时间戳)。
+   扩展名切分口径 = wsSuffixOf(最后一个点之后),但**按原样大小写回填** —— wsSuffixOf 会小写,
+   直接拿它拼名会把 Photo.JPG 变成 Photo (2).jpg;首字符就是点的隐藏文件不算扩展名 */
+function wsCtxUniqueName(name, taken) {
+  var s = String(name);
+  if (!taken[s]) return s;
+  var dot = s.lastIndexOf(".");
+  var suf = (dot > 0 && dot < s.length - 1) ? wsSuffixOf(s) : "";
+  var base = suf ? s.slice(0, s.length - suf.length - 1) : s;
+  var tail = suf ? s.slice(s.length - suf.length - 1) : "";
+  for (var i = 2; i <= 100; i++) {
+    var cand = base + " (" + i + ")" + tail;
+    if (!taken[cand]) return cand;
+  }
+  return base + " (" + Date.now() + ")" + tail;
+}
+function wsCtxUniquePath(wsId, dir, name) {
+  return wsListDir(wsId, dir, { limit: WS_LIST_MAX }).then(function (r) {
+    /* 读不到这一层(极端):照原名试一次,交给内核的 overwrite:false / mode:"create" 兜底,绝不静默覆盖 */
+    if (wsIsErr(r)) return wsJoinPath(dir, name);
+    var taken = Object.create(null);        /* 无原型:文件名可能是 constructor 一类 */
+    r.entries.forEach(function (e) { taken[e.name] = 1; });
+    return wsJoinPath(dir, wsCtxUniqueName(name, taken));
+  });
+}
+function wsCtxCopyTo(wsId, src, dir, unique) {
+  var name = wsPathName(src);
+  return (unique ? wsCtxUniquePath(wsId, dir, name) : Promise.resolve(wsJoinPath(dir, name)))
+    .then(function (to) {
+      return wsCopyPath(wsId, src, to, { recursive: true, overwrite: false });
+    });
+}
+function wsCtxDuplicate(wsId, path) {
+  return wsCtxCopyTo(wsId, path, wsPathParent(path), true).then(function (r) {
+    if (wsIsErr(r)) { toast("复制副本失败:" + (r.error || r.code), "error", 4200); return; }
+    toast("已创建副本 " + r.path, "success", 2400);
+    wsCtxAfterChange(wsId, null);
+  });
+}
+/* ---- 门 8=B 批量动作:串行执行 + 进度 + **如实聚合**(部分失败绝不静默) ----
+   进度走既有 #wsr-prog 状态行;结果:全成 ⇒ success toast;有失败 ⇒ error toast(头行计数 + 前 3 条明细)
+   并把完整明细灌进右栏报告区(wsSetReport ⇒ #wsr-report 可「展开全部 N 条失败」)。
+   st = { total, i, ok, fails:[{path,name,code,msg}], done:[…], aborted } */
+function wsCtxBatchRun(label, items, fn) {
+  var st = { total: items.length, i: 0, ok: 0, done: [], fails: [], aborted: false };
+  function next() {
+    if (st.i >= st.total || st.aborted) return Promise.resolve(st);
+    var it = items[st.i++];
+    wsSetProg(label + " " + st.i + " / " + st.total + "…");
+    return Promise.resolve().then(function () { return fn(it); }).then(function (r) {
+      if (r && r.aborted) {
+        st.aborted = true;
+        st.fails.push({ path: it, name: wsPathName(it), code: "EABORTED", msg: r.error || "已中止" });
+      } else if (wsIsErr(r)) {
+        st.fails.push({ path: it, name: wsPathName(it), code: r.code || "", msg: r.error || r.code || "失败" });
+      } else { st.ok++; st.done.push(it); }
+    }, function (e) {
+      st.fails.push({ path: it, name: wsPathName(it), code: "EXC", msg: String((e && e.message) || e) });
+    }).then(next);
+  }
+  return next();
+}
+function wsCtxBatchReport(label, st) {
+  wsSetProg("");
+  if (!st.fails.length) {
+    toast(label + "完成:" + st.ok + " 项", "success", 3000);
+    return;
+  }
+  var det = st.fails.slice(0, 3).map(function (f) { return f.name + "(" + f.msg + ")"; }).join("; ");
+  if (st.fails.length > 3) det += ";…还有 " + (st.fails.length - 3) + " 项(右栏报告可展开全部)";
+  toast(label + ":" + st.ok + " 项成功 · " + st.fails.length + " 项失败 — " + det, "error", 7000);
+  wsSetReport({ ok: st.ok, skip: 0, fail: st.fails.length, fails: st.fails, aborted: st.aborted });
+}
+/* 批量删除:一次二次确认(破坏范围如实聚合:条目数 + 文件数 + 字节数),再逐条 wsDelete。
+   确认后逐条按 id 现取(弹窗是异步的) —— 与既有 wsDeleteUI 同一条纪律 */
+function wsCtxBatchDeleteUI(wsId, paths) {
+  Promise.all(paths.map(function (p) { return wsStat(wsId, p); })).then(function (rs) {
+    var files = 0, bytes = 0, gone = 0;
+    rs.forEach(function (st) {
+      if (wsIsErr(st)) { gone++; return; }
+      files += (st.type === "dir") ? (st.files || 0) : 1;
+      bytes += st.size || 0;
+    });
+    askConfirm({
+      title: "删除文件", icon: "trash", okText: "删除",
+      message: "删除选中的 " + paths.length + " 项?\n合计 " + files + " 个文件、" + fmtBytes(bytes) +
+        (gone ? "(其中 " + gone + " 项已不在)" : "") + "\n" +
+        paths.slice(0, 6).join("\n") + (paths.length > 6 ? "\n…等共 " + paths.length + " 项" : "") +
+        "\n不可撤销。"
+    }, function () {
+      wsCtxBatchRun("删除", paths, function (p) {
+        return wsStat(wsId, p).then(function (st) {
+          var isDir = !wsIsErr(st) && st.type === "dir";
+          return wsDelete(wsId, p, { recursive: isDir });
+        });
+      }).then(function (st) {
+        wsCtxBatchReport("删除", st);
+        /* 删掉的正是当前目录(或它的祖先)⇒ 兜回父目录(与单条 wsCtxAfterChange 同口径) */
+        st.done.forEach(function (p) {
+          if (p && p !== "/" && (WS_CWD === p || WS_CWD.indexOf(p + "/") === 0)) {
+            WS_CWD = wsPathParent(p);
+            WSR_LIMIT = 200;
+          }
+        });
+        wsCtxAfterChange(wsId, null);
+      });
+    });
+  });
+}
+/* 批量下载:复用需求 9 冻结的同一条入口(文件 ⇒ 原样下载 / 目录 ⇒ 打包 zip)。
+   silent 只让聚合器统一出报(内核、类型判定、zip 打包全在内核里,菜单侧不自判不自建) */
+function wsCtxBatchDownload(wsId, paths) {
+  wsCtxBatchRun("下载", paths, function (p) {
+    return wsDownloadPathUI(wsId, p, { silent: true });
+  }).then(function (st) { wsCtxBatchReport("下载", st); });
+}
+/* 粘贴单条(门 5 = A:永不覆盖)。cut 与 copy 两条分支都先算唯一名;
+   先算名与执行之间被并发抢先(或目录条目超一页导致算重名失败)⇒ 重算一次再试,仍失败如实回传。
+   quiet=true(批量路径):不弹单条 toast/不清剪贴板,一切交回聚合器如实记账 */
+function wsCtxPasteOne(wsId, targetDir, cut, src, quiet) {
+  var name = wsPathName(src);
+  function once(retry) {
+    var p = cut
+      ? wsCtxUniquePath(wsId, targetDir, name).then(function (to) { return wsMove(wsId, src, to); })
+      : wsCtxCopyTo(wsId, src, targetDir, true);
+    return p.then(function (r) {
+      if (wsIsErr(r)) {
+        if (r.code === "EEXIST" && !retry) return once(true);
+        if (r.code === "ENOENT") {
+          if (!quiet) { wsCtxClipClear(); toast("源已不在,已清空工作区内部剪贴板", "warn", 3600); }
+          return r;
+        }
+        if (!quiet) toast((cut ? "移动失败:" : "粘贴失败:") + (r.error || r.code), "error", 4200);
+        return r;
+      }
+      if (!quiet) {
+        if (cut) WS_CTX_CLIP = null;     /* 剪切粘贴成功即清剪贴板(标记随重渲染消失) */
+        toast((cut ? "已移动到 " : "已粘贴到 ") + r.path, "success", 2600);
+        wsCtxAfterChange(wsId, cut ? src : null);
+      }
+      return r;
+    });
+  }
+  return once(false);
+}
+/* 粘贴:单条走原路径;多条(门 8=B 多选)走批量 —— 逐条串行 + 进度 + 聚合。
+   cut 批量里没搬成功的那些**留在剪贴板**(不静默丢、也不静默清),成功的照常出列 */
+function wsCtxPaste(wsId, targetDir) {
+  var why = wsCtxPasteReason(targetDir);
+  if (why) { toast(why, "warn", 3400); return; }
+  var clip = WS_CTX_CLIP, cut = clip.mode === "cut", srcs = clip.paths.slice();
+  if (srcs.length === 1) return wsCtxPasteOne(wsId, targetDir, cut, srcs[0], false);
+  wsCtxBatchRun("粘贴", srcs, function (src) {
+    return wsCtxPasteOne(wsId, targetDir, cut, src, true);
+  }).then(function (st) {
+    if (cut) {
+      var left = st.fails.filter(function (f) { return f.code !== "ENOENT"; })
+        .map(function (f) { return f.path; });
+      WS_CTX_CLIP = left.length
+        ? { mode: "cut", wsId: wsId, paths: left, names: left.map(function (p) { return wsPathName(p); }), at: clip.at }
+        : null;
+    }
+    wsCtxBatchReport("粘贴", st);
+    wsCtxAfterChange(wsId, null);
+  });
+}
+/* 动作后的收尾:删/移掉的正是当前目录(或它的祖先)时把面板兜回父目录(免得停在 ENOENT),
+   再走既有 afterWsChange(树缓存作废 + 全量重渲染 + 计量刷新)。
+   改动后选中集清空:路径可能已被改名/移走 ⇒ 留着只会是过期路径(右键时按行收敛,不留静默作用面) */
+function wsCtxAfterChange(wsId, removedPath) {
+  WS_SEL = []; WS_SEL_ANCHOR = "";
+  if (removedPath && removedPath !== "/" &&
+      (WS_CWD === removedPath || WS_CWD.indexOf(removedPath + "/") === 0)) {
+    WS_CWD = wsPathParent(removedPath);
+    WSR_LIMIT = 200;
+  }
+  afterWsChange();
+}
+function wsCtxRenameUI(wsId, path) {
+  openAskDialog({
+    title: "重命名", icon: "edit", okText: "保存",
+    fields: [{ key: "name", label: "名称", value: wsPathName(path), maxLen: 120,
+      empty: "名称不能为空", hint: "当前:" + path }],
+    onSubmit: function (v) {
+      var nm = String(v.name).replace(/\\/g, "/");
+      if (nm.indexOf("/") !== -1) return { error: "名称里不能有 /(重命名只改名字,不换目录)" };
+      var np = wsNormPath(wsJoinPath(wsPathParent(path), nm));
+      if (wsIsErr(np)) return { error: "名称不合法:" + (np.error || np.code) };
+      if (np.path === path) return {};
+      return wsMove(wsId, path, np.path).then(function (r) {
+        if (wsIsErr(r)) return { error: "重命名失败:" + (r.error || r.code) };
+        toast("已重命名为「" + nm + "」", "success", 2400);
+        wsCtxAfterChange(wsId, null);
+        return {};
+      });
+    }
+  });
+}
+/* 新建文件 = **只建空文件 + 建后立即进入重命名态**(门 7 = C,JupyterLab 风格;依据
+   `decisions/plans-user-decisions-2026-09-16.md` §二 门7 与 §三 偏离汇总第 2 条:
+   "建空文件 + 自动进重命名;不填初始内容;不实现 openAskDialog 的 textarea 分支")。
+   本产品没有文本编辑器,要写内容走模型/工作区工具;重名由内核 mode:"create" 返 EEXIST ⇒
+   弹窗内就地回显、不静默覆盖。重命名**复用既有 wsCtxRenameUI**(与右键「重命名」同一条机制,不另造一套) */
+function wsNewFileUI(wsId, dir) {
+  openAskDialog({
+    title: "新建文件", icon: "file", okText: "创建",
+    fields: [
+      { key: "name", label: "文件名", value: "", maxLen: 120, empty: "名称不能为空",
+        placeholder: "可以带 / 一次建多层", hint: "在 " + dir + " 下创建;建好后立即进入重命名态" }
+    ],
+    onSubmit: function (v) {
+      var np = wsNormPath(wsJoinPath(dir, String(v.name).replace(/\\/g, "/")));
+      if (wsIsErr(np)) return { error: "名称不合法:" + (np.error || np.code) };
+      /* 父目录缺失由内核自动补建(wsPrepWrite → wsTreeMkdirs),与新建文件夹同口径 */
+      return wsWriteText(wsId, np.path, "", { mode: "create" })
+        .then(function (r) {
+          if (wsIsErr(r)) return { error: "新建失败:" + (r.error || r.code) };
+          toast("已新建空文件 " + np.path, "success", 2400);
+          wsCtxAfterChange(wsId, null);
+          wsCtxRenameUI(wsId, np.path);      /* 建后立刻进重命名态(回车即保留默认名) */
+          return {};
+        });
+    }
+  });
+}
+
 /* ---- 工作区增删改(确认文案 + 顺序纪律) ----
    命名 / 配额走主题化输入弹窗(原生 prompt 不跟主题、也没有内联校验);
    弹窗只做形态校验,内核的 clamp / 截断 / 重名判定照旧执行,错误就地回显 */
@@ -8973,6 +10180,8 @@ function wsCreateWorkspaceUI() {
           WS_RAIL_SEL = r.ws.id;
           WS_CWD = "/";
           WSR_LIMIT = 200;
+          /* 新建工作区后自动选中同样算"换工作区":清跨工作区的剪贴板 */
+          if (WS_CTX_CLIP && WS_CTX_CLIP.wsId !== r.ws.id) wsCtxClipClear();
           wsSetReport(null);      /* 换了工作区:上一批上传的失败报告不再属于当前上下文 */
           toast("已创建工作区「" + r.ws.name + "」", "success", 3200);
           afterWsChange();
@@ -9066,6 +10275,8 @@ function wsDropNow(id, m, mounted) {
   wsDropWorkspace(id, { force: mounted.length > 0 }).then(function (r) {
     if (wsIsErr(r)) { toast("删除失败:" + (r.error || r.code), "error", 4200); return; }
     if (WS_RAIL_SEL === id) { WS_RAIL_SEL = null; WS_CWD = "/"; WSR_LIMIT = 200; }
+    /* 删的正是剪贴板来源工作区才清(删别的行不动它) */
+    if (WS_CTX_CLIP && WS_CTX_CLIP.wsId === id) wsCtxClipClear();
     wsSetReport(null);        /* 报告属于被删掉的那个工作区,一并清掉(否则会残留成"当前结果") */
     toast("已删除工作区「" + m.name + "」", "success", 3600);
     afterWsChange();
@@ -9081,17 +10292,19 @@ function wsRecountUI(id) {
     afterWsChange();
   });
 }
-function wsMkdirUI(id) {
+/* dir 可选(缺省 = 面板当前目录):右键菜单里"新建文件夹"的落点是菜单上下文的目标目录,
+   那里可能不是面板当前目录(例:树内「显示更多」行 ⇒ 更深的一层) */
+function wsMkdirUI(id, dir) {
   id = id || WS_RAIL_SEL;
   if (!id) { toast("请先创建或选择一个工作区", "warn"); return; }
-  var cwd = WS_CWD;
+  var cwd = dir || WS_CWD;
   openAskDialog({
     title: "新建文件夹",
     icon: "folder",
     okText: "创建",
     fields: [{
       key: "name", label: "文件夹名称", value: "", maxLen: 120, empty: "名称不能为空",
-      placeholder: "可以带 / 一次建多层", hint: "在当前目录(" + cwd + ")下创建"
+      placeholder: "可以带 / 一次建多层", hint: "在 " + cwd + " 下创建"
     }],
     onSubmit: function (v) {
       var np = wsNormPath(wsJoinPath(cwd, String(v.name).replace(/\\/g, "/")));
@@ -9129,16 +10342,45 @@ function wsDeleteUI(id, p) {
   });
 }
 
-/* ---- 单文件下载(内核是 appE 的 wsFileDownload) ---- */
-function wsFileDownloadUI(id, p) {
+/* ---- 下载(单文件 / 目录打包)UI 包装;内核 = 本段的 wsDownloadPath ----
+   wsFileDownloadUI 是保留名(右栏文件行「下载」按钮在用,需求 3 的右键菜单也调它),
+   本批起委托 wsDownloadPathUI —— 文件与目录同一入口,菜单侧不得再自判类型/自建 zip。
+   opts.silent(门 8=B 批量路径用):不自己弹单条 toast(交回给批量聚合器如实记账),其余零变化;
+   返回值 = 内核结果的 Promise(批量聚合需要逐条结果;旧调用方不用返回值,行为不变) */
+function wsFileDownloadUI(id, p) { return wsDownloadPathUI(id, p); }
+function wsDownloadPathUI(id, p, opts) {
+  opts = opts || {};
+  var silent = !!opts.silent;
   id = id || WS_RAIL_SEL;
-  if (!id || !p) return;
-  toast("正在读取文件…", "info", 1600);
-  wsFileDownload(id, p).then(function (r) {
-    if (wsIsErr(r)) { toast("下载失败:" + (r.error || r.code), "error", 4600); return; }
-    toast(r.mode === "open" ? ("已在新标签页打开 " + r.name + "(浏览器不支持直接下载)") : ("已下载 " + r.name),
+  if (!id || !p) return Promise.resolve({ ok: false, code: "EINVAL", error: "缺少下载目标" });
+  var isDir = false, prog = false;
+  /* 先只看一眼类型(只读、走权威树):只为措辞与进度位的选择,判定仍在内核里 */
+  return wsStat(id, p).then(function (st) {
+    isDir = !wsIsErr(st) && st.type === "dir";
+    if (isDir) { prog = true; if (!silent) wsSetProg("正在准备打包…"); }
+    else if (!silent) toast("正在读取文件…", "info", 1600);
+    return wsDownloadPath(id, p, {
+      onProg: function (n, all) { wsSetProg("正在打包 " + n + " / " + all); }
+    });
+  }).then(function (r) {
+    if (prog) wsSetProg("");
+    if (silent) return r;
+    if (r && r.aborted) { toast(r.error || "已中止", "warn", 3600); return r; }
+    if (wsIsErr(r)) { toast(dlErrText(r, isDir), "error", 4600); return r; }
+    toast(r.kind === "file"
+      ? (r.mode === "open" ? ("已在新标签页打开 " + r.name + "(浏览器不支持直接下载)") : ("已下载 " + r.name))
+      : ("已打包 " + r.files + " 个文件(" + fmtBytes(r.zipBytes) + ")"),
       "success", 3200);
+    return r;
   });
+}
+/* 错误码 → toast 文案:内核给的自足整句直接用(EBUSY/E2BIG/EINVAL/ENOTSUP/ETIMEDOUT/EWSREADY),
+   其余按目标类型加前缀 —— 单文件分支与批前「下载失败:…」逐字一致 */
+function dlErrText(r, isDir) {
+  var code = (r && r.code) || "";
+  if (code === "EBUSY" || code === "E2BIG" || code === "EINVAL" || code === "ENOTSUP" ||
+      code === "ETIMEDOUT" || code === "EWSREADY") return String(r.error || code);
+  return (isDir ? "打包失败:" : "下载失败:") + (r.error || code);
 }
 function wsBlobDownload(blob, filename) {
   /* a[download] 不可用时 a.click() 会退化成导航到 blob URL / 落个随机名 —— 文件名丢掉却看着像成功,
@@ -9158,7 +10400,7 @@ function wsBlobDownload(blob, filename) {
   }
 }
 
-/* ---- 整箱下载:自写 store-only ZIP ---- */
+/* ---- 整箱下载:自写 ZIP 写入器(deflate-raw 可用则 method 8,否则 method 0) ---- */
 function wsUtf8Bytes(s) { return new TextEncoder().encode(s); }
 function wsCrc32(u8) {
   if (!WS_CRC_TABLE) {
@@ -9196,42 +10438,74 @@ function wsDeflate(u8) {
       function () { return null; });
   } catch (e) { return Promise.resolve(null); }
 }
-function wsZipBuild(files, onProg) {
-  var chunks = [], central = [], offset = 0, i = 0, compressed = 0;
+/* ---- 下载内核:单文件 + 目录打包 + 整箱同一条路(需求 9 DownloadForUser) ----
+   同时只允许一个打包/下载任务(跨 UI 与工具;防两倍内存峰值) */
+var WS_DL = { running: false };
+var WS_ZIP_YIELD_N = 25;      /* 每 N 个条目让出一次主线程 */
+var WS_ZIP_YIELD_MS = 50;     /* 或距上次让出超过这个毫秒数时让出(与 WS_GREP_YIELD/_MS 同法) */
+
+/* zip 写入器:本地头 / 中央目录 / EOCD / 偏移累加的唯一一份实现
+   (wsZipBuild 与 wsZipBuildLazy 都只经它写字节;字段写法与批前的 wsZipBuild 逐字相同) */
+function wsZipWriteOpen() {
+  var chunks = [], central = [], offset = 0, w;
   var now = new Date();
   var dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2)) & 0xFFFF;
   var dosDate = ((((now.getFullYear() - 1980) & 0x7f) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xFFFF;
-  function addEntry(nameBytes, raw, stored, crc, method) {
-    var lh = new Uint8Array(30 + nameBytes.length), dv = new DataView(lh.buffer);
-    dv.setUint32(0, 0x04034b50, true);
-    dv.setUint16(4, 20, true);              /* version needed */
-    dv.setUint16(6, 0x0800, true);          /* 通用位 bit 11:文件名是 UTF-8 */
-    dv.setUint16(8, method, true);
-    dv.setUint16(10, dosTime, true);
-    dv.setUint16(12, dosDate, true);
-    dv.setUint32(14, crc, true);
-    dv.setUint32(18, stored.length, true);  /* 压缩后大小 */
-    dv.setUint32(22, raw.length, true);     /* 原始大小(不压缩时两者相等) */
-    dv.setUint16(26, nameBytes.length, true);
-    lh.set(nameBytes, 30);
-    chunks.push(lh, stored);
-    var cd = new Uint8Array(46 + nameBytes.length), cv = new DataView(cd.buffer);
-    cv.setUint32(0, 0x02014b50, true);
-    cv.setUint16(4, 20, true);
-    cv.setUint16(6, 20, true);
-    cv.setUint16(8, 0x0800, true);
-    cv.setUint16(10, method, true);
-    cv.setUint16(12, dosTime, true);
-    cv.setUint16(14, dosDate, true);
-    cv.setUint32(16, crc, true);
-    cv.setUint32(20, stored.length, true);
-    cv.setUint32(24, raw.length, true);
-    cv.setUint16(28, nameBytes.length, true);
-    cv.setUint32(42, offset, true);
-    cd.set(nameBytes, 46);
-    central.push(cd);
-    offset += lh.length + stored.length;
-  }
+  w = {
+    entries: 0,        /* 已写入的条目数(供结果回填) */
+    compressed: 0,     /* 其中用到 deflate(method 8)的条目数 */
+    add: function (nameBytes, raw, stored, crc, method) {
+      var lh = new Uint8Array(30 + nameBytes.length), dv = new DataView(lh.buffer);
+      dv.setUint32(0, 0x04034b50, true);
+      dv.setUint16(4, 20, true);              /* version needed */
+      dv.setUint16(6, 0x0800, true);          /* 通用位 bit 11:文件名是 UTF-8 */
+      dv.setUint16(8, method, true);
+      dv.setUint16(10, dosTime, true);
+      dv.setUint16(12, dosDate, true);
+      dv.setUint32(14, crc, true);
+      dv.setUint32(18, stored.length, true);  /* 压缩后大小 */
+      dv.setUint32(22, raw.length, true);     /* 原始大小(不压缩时两者相等) */
+      dv.setUint16(26, nameBytes.length, true);
+      lh.set(nameBytes, 30);
+      chunks.push(lh, stored);
+      var cd = new Uint8Array(46 + nameBytes.length), cv = new DataView(cd.buffer);
+      cv.setUint32(0, 0x02014b50, true);
+      cv.setUint16(4, 20, true);
+      cv.setUint16(6, 20, true);
+      cv.setUint16(8, 0x0800, true);
+      cv.setUint16(10, method, true);
+      cv.setUint16(12, dosTime, true);
+      cv.setUint16(14, dosDate, true);
+      cv.setUint32(16, crc, true);
+      cv.setUint32(20, stored.length, true);
+      cv.setUint32(24, raw.length, true);
+      cv.setUint16(28, nameBytes.length, true);
+      cv.setUint32(42, offset, true);
+      cd.set(nameBytes, 46);
+      central.push(cd);
+      offset += lh.length + stored.length;
+      w.entries++;
+      if (method === 8) w.compressed++;
+    },
+    finish: function () {
+      var cdSize = 0, j;
+      for (j = 0; j < central.length; j++) cdSize += central[j].length;
+      var eocd = new Uint8Array(22), ev = new DataView(eocd.buffer);
+      ev.setUint32(0, 0x06054b50, true);
+      ev.setUint16(8, central.length, true);
+      ev.setUint16(10, central.length, true);
+      ev.setUint32(12, cdSize, true);
+      ev.setUint32(16, offset, true);
+      for (j = 0; j < central.length; j++) chunks.push(central[j]);
+      chunks.push(eocd);
+      return new Blob(chunks, { type: "application/zip" });
+    }
+  };
+  return w;
+}
+/* 旧签名/旧语义逐字保留(全量 entries 已在内存;供既有调用与逐字节对拍) */
+function wsZipBuild(files, onProg) {
+  var w = wsZipWriteOpen(), i = 0;
   function step() {
     if (i >= files.length) return Promise.resolve();
     var f = files[i++];
@@ -9239,67 +10513,185 @@ function wsZipBuild(files, onProg) {
     var raw = f.bytes;
     return wsDeflate(raw).then(function (dz) {
       var method = 0, data = raw;
-      if (dz && dz.length < raw.length) { method = 8; data = dz; compressed++; }
-      addEntry(nameBytes, raw, data, wsCrc32(raw), method);   /* CRC 按原始字节算 */
+      if (dz && dz.length < raw.length) { method = 8; data = dz; }
+      w.add(nameBytes, raw, data, wsCrc32(raw), method);   /* CRC 按原始字节算 */
       if (onProg) onProg(i, files.length);
       return wsYield().then(step);
     });
   }
-  return step().then(function () {
-    var cdSize = 0, j;
-    for (j = 0; j < central.length; j++) cdSize += central[j].length;
-    var eocd = new Uint8Array(22), ev = new DataView(eocd.buffer);
-    ev.setUint32(0, 0x06054b50, true);
-    ev.setUint16(8, central.length, true);
-    ev.setUint16(10, central.length, true);
-    ev.setUint32(12, cdSize, true);
-    ev.setUint32(16, offset, true);
-    for (j = 0; j < central.length; j++) chunks.push(central[j]);
-    chunks.push(eocd);
-    return new Blob(chunks, { type: "application/zip" });
+  return step().then(function () { return w.finish(); });
+}
+/* 懒加载打包:一次只持有一个原始文件 + 已产出块
+   items     = [{ name }](name 已含期望的 zip 内路径)
+   loadBytes = function (item) → Promise<Uint8Array>(拒绝时把 wsErr 原样带回)
+   onProg    = function (done, total)(节流由调用方负责)
+   signal    = AbortSignal(每条目查一次);deadline = 绝对时间戳(ms;超时 ⇒ ETIMEDOUT)
+   → { ok:true, blob, entries, compressed } | { ok:false, aborted:true, error } | wsErr 原样 */
+function wsZipBuildLazy(items, loadBytes, onProg, signal, deadline) {
+  var w = wsZipWriteOpen(), i = 0, lastYield = Date.now();
+  function abortedRes() { return { ok: false, aborted: true, error: "用户中止了打包,未产出下载" }; }
+  function aborted() { return !!(signal && signal.aborted); }
+  if (onProg) onProg(0, items.length);
+  function step() {
+    if (i >= items.length) return Promise.resolve(null);
+    if (aborted()) return Promise.resolve(abortedRes());
+    if (deadline && Date.now() > deadline) {
+      return Promise.resolve(wsErr("ETIMEDOUT", "打包超时,已中止,未产出下载;可拆小子目录后重试"));
+    }
+    var it = items[i];
+    return Promise.resolve().then(function () { return loadBytes(it); }).then(function (raw) {
+      if (wsIsErr(raw)) return raw;                          /* 装载失败:错误码原样带回 */
+      if (aborted()) return abortedRes();
+      return wsDeflate(raw).then(function (dz) {
+        var method = 0, data = raw;
+        if (dz && dz.length < raw.length) { method = 8; data = dz; }
+        w.add(wsUtf8Bytes(it.name), raw, data, wsCrc32(raw), method);
+        i++;
+        if (onProg) onProg(i, items.length);
+        if (aborted()) return abortedRes();
+        /* 让出节流:每 N 个条目、或距上次让出超过 WS_ZIP_YIELD_MS 时让一次
+           (65535 个条目 × 每次 setTimeout(0) 会累积成分钟级空转) */
+        if ((i % WS_ZIP_YIELD_N) === 0 || (Date.now() - lastYield) > WS_ZIP_YIELD_MS) {
+          lastYield = Date.now();
+          return wsYield().then(step);
+        }
+        return step();
+      });
+    });
+  }
+  return step().then(function (r) {
+    if (r) return r;      /* 中止 / 装载失败:不构造 Blob(不产出半成品) */
+    return { ok: true, blob: w.finish(), entries: w.entries, compressed: w.compressed };
+  });
+}
+/* 目录打包计划(只读元数据;精确前缀过滤,不走 glob —— 目录名含 *?{} 也不会被当模式)
+   清单来源写死 = wsReadTx 的 env.meta.tree(与 wsStat / wsOpenSession 同口径),不读 WS_META_CACHE */
+function wsDirPackPlan(wsId, dir) {
+  var np = wsNormPath(dir);
+  if (wsIsErr(np)) return Promise.resolve(np);
+  dir = np.path;
+  return wsReadTx(wsId, function (env) {
+    var node = wsTreeGet(env.meta.tree, dir);
+    if (!node) return wsErr("ENOENT", "目录不存在:" + dir, dir);
+    if (node.t !== "d") return wsErr("ENOTDIR", "「" + dir + "」不是目录", dir);
+    var all = wsTreeAllFiles(env.meta.tree, dir, []);
+    var name = dir === "/" ? String(env.meta.name || "workspace") : wsPathName(dir);
+    var prefix = dir === "/" ? "" : name + "/";
+    var entries = [], total = 0;
+    for (var i = 0; i < all.length; i++) {
+      var sz = all[i].node.size || 0;
+      total += sz;
+      entries.push({ name: prefix + all[i].rel, path: all[i].path, size: sz });
+    }
+    if (!entries.length) {
+      return wsErr("EINVAL", dir === "/" ? "这个工作区里还没有文件" : "「" + dir + "」里还没有文件", dir);
+    }
+    return { ok: true, dir: dir, name: name, prefix: prefix, entries: entries, totalBytes: total, count: entries.length };
+  });
+}
+/* 编排内核(UI 与工具的唯一入口):闸 → 文件/目录分派 → 能力预检 → 清单 → 上限二查 → 打包/下载
+   opts = { signal, deadline, onProg } → 结果契约见方案 §2.3 */
+function wsDownloadPath(wsId, path, opts) {
+  opts = opts || {};
+  var t0 = Date.now();
+  if (!wsId) return Promise.resolve(wsErr("EINVAL", "当前会话没有挂载工作区"));
+  if (!wsReady()) return Promise.resolve(wsErr("EWSREADY", WS_NOTE_READY));
+  /* 双向互斥:打包/上传进行中再发起下载 ⇒ EBUSY(上传入口侧的同款检查在 wsUploadStart) */
+  if (WS_DL.running || WS_UPLOAD.running) {
+    return Promise.resolve(wsErr("EBUSY", "另一个下载/上传正在进行,请稍后再试"));
+  }
+  var np = wsNormPath(path);
+  if (wsIsErr(np)) return Promise.resolve(np);
+  path = np.path;
+  WS_DL.running = true;
+  function done() { WS_DL.running = false; }
+  return wsStat(wsId, path).then(function (st) {
+    if (wsIsErr(st)) return st;
+    if (st.type !== "dir") {
+      /* 单文件:复用既有内核(同一 rc 映射;mode 可能是 "open" 降级) */
+      return wsFileDownload(wsId, path).then(function (r) {
+        if (wsIsErr(r)) return r;
+        return { ok: true, kind: "file", path: path, name: r.name, mode: r.mode, bytes: r.size || 0, files: 1 };
+      });
+    }
+    /* 目录:能力预检必须在清单/打包之前(否则会白打一个最大 128 MB 的包再丢弃) */
+    if (!CAP.objectUrl || typeof window.TextEncoder !== "function") {
+      return wsErr("ENOTSUP", "当前浏览器不支持打包下载(缺少 URL.createObjectURL 或 TextEncoder 能力),未开始打包");
+    }
+    if (opts.signal && opts.signal.aborted) {
+      return { ok: false, aborted: true, error: "用户中止了打包,未产出下载" };
+    }
+    return wsDirPackPlan(wsId, path).then(function (plan) {
+      if (wsIsErr(plan)) return plan;
+      if (plan.count > WS_ZIP_MAX_ENTRIES) {
+        return wsErr("E2BIG", "文件太多(" + plan.count + " 个,上限 " + WS_ZIP_MAX_ENTRIES + " 个),请按目录分批下载");
+      }
+      if (plan.totalBytes > WS_ZIP_MAX) {
+        return wsErr("E2BIG", plan.dir === "/"
+          ? ("整箱 " + fmtBytes(plan.totalBytes) + " 超过打包上限 " + fmtBytes(WS_ZIP_MAX) + ",请按文件单独下载")
+          : ("「" + plan.dir + "」内容合计 " + fmtBytes(plan.totalBytes) + " 超过打包上限 " + fmtBytes(WS_ZIP_MAX) + ",请按子目录分批下载"));
+      }
+      var items = [], k;
+      for (k = 0; k < plan.entries.length; k++) {
+        items.push({ name: plan.entries[k].name, path: plan.entries[k].path });
+      }
+      /* 逐文件读取(每文件一个只读事务,读完即压缩入块并释放原始字节) */
+      return wsZipBuildLazy(items, function (it) {
+        return wsReadBlob(wsId, it.path).then(function (r) {
+          if (wsIsErr(r)) return r;
+          return wsBlobBuffer(r.blob).then(function (ab) { return new Uint8Array(ab); });
+        });
+      }, opts.onProg, opts.signal, opts.deadline).then(function (z) {
+        if (!z || z.ok !== true) {
+          /* 超时句要带真实上限秒数:deadline 由调用方给(内核不知道口径) */
+          if (z && z.code === "ETIMEDOUT" && opts.deadline) {
+            z.error = "打包超时(超过 " + Math.round((opts.deadline - t0) / 1000) + " 秒),已中止,未产出下载;可拆小子目录后重试";
+          }
+          return z;
+        }
+        var fn = wsSafeFileName(plan.name) + "-" + new Date().toISOString().slice(0, 10) + ".zip";
+        if (!wsBlobDownload(z.blob, fn)) {
+          return wsErr("ENOTSUP", plan.dir === "/"
+            ? "当前浏览器不支持直接下载(下载或 blob 能力被禁用),整箱导出未开始"
+            : "当前浏览器不支持直接下载(下载或 blob 能力被禁用),打包结果未能交付");
+        }
+        return {
+          ok: true, kind: "dir", path: path, name: fn, mode: "download",
+          bytes: plan.totalBytes, files: plan.count, zipBytes: z.blob.size, compressed: z.compressed > 0
+        };
+      });
+    });
+  }).then(function (r) {
+    done();
+    return r;
+  }, function (e) {
+    done();
+    return wsErr("EIO", "下载异常:" + wsMsg(e));
   });
 }
 function wsZipWorkspace(id) {
   id = id || WS_RAIL_SEL;
   if (!id) { toast("请先创建或选择一个工作区", "warn"); return; }
   if (!wsReady()) { toast("工作区存储不可用(设置 → 数据 里查看原因)", "warn", 3600); return; }
-  if (!CAP.objectUrl) { toast("当前浏览器不能直接下载,请按文件单独下载", "warn", 4200); return; }
-  if (typeof window.TextEncoder !== "function") { toast("当前浏览器不支持打包 zip(缺少 TextEncoder)", "warn", 4200); return; }
-  if (WS_UPLOAD.running) { toast("上传正在进行中,稍后再打包", "warn", 3200); return; }
   wsSetProg("正在读取工作区文件…");
-  wsMeta(id).then(function (m) {
-    var wsName = (m && m.name) || "workspace";
-    return wsOpenSession(id, { maxBytes: WS_ZIP_MAX }).then(function (r) {
-      if (wsIsErr(r)) { wsSetProg(""); toast("打包失败:" + (r.error || r.code), "error", 4600); return; }
-      var total = 0, remote = 0;
-      (r.manifest || []).forEach(function (x) { total += x.size || 0; if (x.remote) remote++; });
-      if (remote) {
-        wsSetProg("");
-        toast("整箱 " + fmtBytes(total) + " 超过打包上限 " + fmtBytes(WS_ZIP_MAX) + ",请按文件单独下载", "warn", 5600);
-        return;
-      }
-      if (!r.files || !r.files.length) { wsSetProg(""); toast("这个工作区里还没有文件", "info"); return; }
-      var entries = r.files.map(function (f) {
-        return { name: String(f.path || "").replace(/^\/+/, ""), bytes: new Uint8Array(f.bytes) };
-      });
-      /* EOCD 的「本盘条目数 / 总条目数」是 uint16:条目数 > 65535 会静默回绕成坏包 —— 直接拒绝 */
-      if (entries.length > WS_ZIP_MAX_ENTRIES) {
-        wsSetProg("");
-        toast("文件太多(" + entries.length + " 个,上限 " + WS_ZIP_MAX_ENTRIES + " 个),请按目录分批下载", "warn", 5600);
-        return;
-      }
-      wsSetProg("正在打包 0 / " + entries.length);
-      return wsZipBuild(entries, function (n, all) { wsSetProg("正在打包 " + n + " / " + all); }).then(function (blob) {
-        wsSetProg("");
-        var fn = wsSafeFileName(wsName) + "-" + new Date().toISOString().slice(0, 10) + ".zip";
-        if (!wsBlobDownload(blob, fn)) {
-          /* CAP.download / CAP.objectUrl 为假时单文件下载同样走不通,不能再建议"改用单文件下载" */
-          toast("当前浏览器不支持直接下载(下载或 blob 能力被禁用),整箱导出未开始", "error", 5200);
-          return;
-        }
-        toast("已打包 " + entries.length + " 个文件(" + fmtBytes(blob.size) + ")", "success", 4600);
-      });
-    });
+  /* 整箱 = 同一条内核的 dir="/" 分支(门 2:消灭第二份 zip 实现)。
+     **能力门与并发闸不再在这里各写一遍**:内核按"就绪 → 能力 → 闸"同序预检,文案取 §2.2-8
+     映射表的唯一口径(批前那两句"请按文件单独下载"与"上传正在进行中"正是 S8 同类的误导——
+     单文件下载同样依赖 CAP.objectUrl)。正常路径的成功/失败文案与批前逐字一致。 */
+  wsDownloadPath(id, "/", {
+    onProg: function (n, all) { wsSetProg("正在打包 " + n + " / " + all); }
+  }).then(function (r) {
+    wsSetProg("");
+    if (r && r.aborted) { toast(r.error || "已中止", "warn", 3600); return; }
+    if (wsIsErr(r)) {
+      if (r.code === "E2BIG") { toast(r.error, "warn", 5600); return; }
+      if (r.code === "EBUSY") { toast(r.error, "warn", 3200); return; }
+      if (r.code === "EINVAL") { toast(r.error, "info"); return; }
+      if (r.code === "ENOTSUP") { toast(r.error, "error", 5200); return; }
+      toast("打包失败:" + (r.error || r.code), "error", 4600);
+      return;
+    }
+    toast("已打包 " + r.files + " 个文件(" + fmtBytes(r.zipBytes) + ")", "success", 4600);
   });
 }
 
@@ -9597,6 +10989,8 @@ function wsUploadStart(entries, dir, flatFiles) {
   if (!wsReady()) { toast("工作区存储不可用(设置 → 数据 里查看原因)", "warn", 3600); return; }
   if (!WS_RAIL_SEL) { toast("请先创建并选择一个工作区", "warn"); return; }
   if (WS_UPLOAD.running) { toast("还有一批上传正在进行(可先点「取消」)", "warn", 3600); return; }
+  /* 反向互斥:打包进行中不许开始上传(与 wsDownloadPath 的 WS_UPLOAD 检查构成双向闸) */
+  if (WS_DL.running) { toast("有打包正在进行,请稍后再上传", "warn", 3600); return; }
   var wsId = WS_RAIL_SEL;
   var snap = (flatFiles && flatFiles.length) ? flatFiles : [];
   wsSetReport(null);
@@ -9893,7 +11287,8 @@ function openAskDialog(spec) {
        少了它这个输入框吃不到任何样式,落到 UA 的 `input{background-color:field}` ——
        本机 Chrome(深色系统偏好)把 field 解析成 #3B3B3B,浅色主题下就是「深底 + 深字」,对比度 ≈1.6:1 */
     body += '<div class="field"><label for="ask-f-' + escAttr(f.key) + '"></label>' +
-      '<input id="ask-f-' + escAttr(f.key) + '" type="text" autocomplete="off" spellcheck="false" /></div>';
+      '<input id="ask-f-' + escAttr(f.key) + '" type="text" autocomplete="off" spellcheck="false" />' +
+      "</div>";
   });
   mask.innerHTML = '<div class="modal narrow">' +
     '<div class="modal-head"><h2>' + icon(spec.icon || "edit") + ' <span class="ask-title"></span></h2>' +
@@ -9925,7 +11320,9 @@ function openAskDialog(spec) {
       wrap.appendChild(h);
     }
     inp.addEventListener("keydown", function (e) {
-      if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submit(); }
+      if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      submit();
     });
     if (!i) setTimeout(function () { try { inp.focus(); inp.select(); } catch (e) {} }, 40);
   });

@@ -107,20 +107,21 @@
 | 首次执行（装配 CPython + **全量装载本档全部预置包**） | 极简版 ≈ **3.2–3.6 s** 墙钟（其中装载段 **1.1–1.4 s** / 33 个包；本机两次独立复跑 3554 / 3181 ms）；完整版见下「包装载与释放」实测表。装载时间**不计入脚本超时**，同一解释器生命期内只装一次 |
 | 主线程 JS 堆峰值 | **≈416 MB**(415.7 MB) |
 | 空闲回收 | **10 分钟**无活动回收解释器（连同已装载的包一起释放）;**有未完成任务时保活** |
-| 分发产物 `AzusaAI-WebUI-full.html` 总体积(完整版) | **209,165,053 B**(≈199.4 MiB;pyodide 载荷 195,811,297 B 是大头;md5 `c3c06a7f56c22cf2d46cff3ad5fe1e35`)。口径 = `node scripts/build.js` 打印值;**载荷段 `src/pyodide.part` 生成后未变过** |
+| 分发产物 `AzusaAI-WebUI-full.html` 总体积(完整版) | **227,449,375 B**(≈216.9 MiB；2026-09-18 取件时刻，构建批在飞 ⇒ 仅供量级参照，终编以 `node scripts/build.js --profile=all` 打印值为准；pyodide 载荷 195,811,297 B 仍是大头)。口径 = `node scripts/build.js` 打印值;**载荷段 `src/pyodide.part` 生成后未变过** |
 
 **分档实测**(同机、Node v24.16.0;`node scripts/make-pyodide-part.js --profile=…` 的打印值):
 
 | 档位 | wheel 段 | 段数(文本段) | 轮组内嵌 | 剪裁锁 | 载荷 part | 分发产物 |
 |---|---:|---:|---:|---:|---:|---:|
-| `full`(默认,载荷入库) | 151 | 156(3) | 186,333,848 B | 45,212 B | `src/pyodide.part` 195,811,297 B(md5 `19b48756a17808cd2474ee78bf6f922b`) | `AzusaAI-WebUI-full.html` 209,165,053 B(md5 `c3c06a7f56c22cf2d46cff3ad5fe1e35`) |
-| `normal` | 99 | 105(4) | 114,302,412 B | 29,764 B | `src/pyodide-normal.part` 123,762,373 B(md5 `5639fb31bfa39c2538aff656ce90dbcb`) | `AzusaAI-WebUI-normal.html` 137,116,299 B(md5 `b31c2770f9eacf6e3bdb3383074742b2`) |
-| `minimal` | 33 | 39(4) | 32,827,748 B | 10,134 B | `src/pyodide-minimal.part` 42,265,436 B(md5 `41abf8f3ceb9eb65c02927196ea38c4c`) | `AzusaAI-WebUI-minimal.html` 55,619,364 B(md5 `eaa6f62d4ff7675d84543b950f1527f3`) |
+| `full`(默认,载荷入库) | 151 | 156(3) | 186,333,848 B | 45,212 B | `src/pyodide.part` 195,811,297 B(md5 `19b48756a17808cd2474ee78bf6f922b`) | `AzusaAI-WebUI-full.html` **227,449,375 B**（2026-09-18 取件时刻；终编以构建打印值为准） |
+| `normal` | 99 | 105(4) | 114,302,412 B | 29,764 B | `src/pyodide-normal.part` 123,762,373 B(md5 `5639fb31bfa39c2538aff656ce90dbcb`) | `AzusaAI-WebUI-normal.html` **155,400,621 B**（同上口径） |
+| `minimal` | 33 | 39(4) | 32,827,748 B | 10,134 B | `src/pyodide-minimal.part` 42,265,436 B(md5 `41abf8f3ceb9eb65c02927196ea38c4c`) | `AzusaAI-WebUI-minimal.html` **73,903,686 B**（同上口径） |
 
+- **「分发产物」列的口径（2026-09-18 修订）**：产物体积由 pyodide 之外的载荷（pdf.js / Tesseract / 办公 / JupyterLite / 各手写分段）共同决定——「载荷 part」列长期不变（pyodide 三档逐字节未变），而「分发产物」随每个批次增长；上表三格 = **2026-09-18 取件时刻**的构建值（当时构建批在飞，**仅供量级参照**），终编后以 `node scripts/build.js --profile=all` 打印的字节与 md5 为准。
 - 轻档比完整版多 1 个文本段（`pyodide-profile.json`，见 §1）；**完整版的重建与入库产物逐字节相同**（md5 同上，两次独立复跑）；三档的 `expect` 已写回 `scripts/pyodide-profiles.json`，此后每次生成按 **±0 强断言**核对（换 Node / zlib 版本会触发，属有意的摩擦）。
 - `--all` 一次生成三档载荷：实测 **13 s**（同机，热缓存），三档 md5 与逐档生成一致。
-- **当前三档实测**（2026-09-14；「Python/JS 执行体验修复」批后重建，`node scripts/build.js --profile=all` 两次独立复跑逐字节一致）：`AzusaAI-WebUI-full.html` 209,165,053 B / md5 `c3c06a7f56c22cf2d46cff3ad5fe1e35`；`normal` 137,116,299 B / `b31c2770f9eacf6e3bdb3383074742b2`；`minimal` 55,619,364 B / `eaa6f62d4ff7675d84543b950f1527f3`。（该批之前的 0.1.0 稳版读数 209,130,781 / `fe717287118cb5cac3eb59847fa9333e`、137,082,027 / `78935b1848754982d4a19b3f862c886e`、55,585,092 / `8fa9ce593d47f20fed37c0c9766db90e` 已作废——差异只来自源码改动，载荷段逐字节未变。）
-- 「分发产物」三格落位 = 代码目录根（三档 `AzusaAI-WebUI-{full,normal,minimal}.html`、被 `.gitignore` 排除；`build.js --profile=all` 一次出三档）：字节与 md5 见上表与上方「当前三档实测」。
+- **2026-09-14 三档实测（历史读数，已被后续批次取代）**（「Python/JS 执行体验修复」批后重建，`node scripts/build.js --profile=all` 两次独立复跑逐字节一致）：`AzusaAI-WebUI-full.html` 209,165,053 B / md5 `c3c06a7f56c22cf2d46cff3ad5fe1e35`；`normal` 137,116,299 B / `b31c2770f9eacf6e3bdb3383074742b2`；`minimal` 55,619,364 B / `eaa6f62d4ff7675d84543b950f1527f3`。（该批之前的 0.1.0 稳版读数 209,130,781 / `fe717287118cb5cac3eb59847fa9333e`、137,082,027 / `78935b1848754982d4a19b3f862c886e`、55,585,092 / `8fa9ce593d47f20fed37c0c9766db90e` 已作废——这些差异只来自源码改动，载荷段逐字节未变。）
+- 「分发产物」三格落位 = 代码目录根（三档 `AzusaAI-WebUI-{full,normal,minimal}.html`、被 `.gitignore` 排除；`build.js --profile=all` 一次出三档）：字节见上表，「取件时刻」口径见上一条。
 
 > 首屏 / 内存阈值属**待确认**项；上面的数字都是实测量，不是承诺。
 

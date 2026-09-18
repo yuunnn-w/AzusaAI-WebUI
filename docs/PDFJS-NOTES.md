@@ -1,7 +1,7 @@
 # pdf.js / PDFKit 内嵌产物笔记
 
 > 状态：现行 —— 内嵌 pdf.js 的取件、ESM→classic 改写与 `file://` 加载约束的唯一记录；升级库版本或改动 `src/pdfjs.part` 前必读
-> 更新：2026-09-14 · 载荷段 `src/pdfjs.part`（1,853,151 B，三档产物共用）· 生成脚本 `scripts/make-pdfjs-part.js`（幂等 + 自检）
+> 更新：2026-09-18 · 载荷段 `src/pdfjs.part`（**1,882,880 B**，三档产物共用；口径 = `stat -c %s src/pdfjs.part`，2026-09-18 现取——该段由 netdocs-B 重生成后未再变）· 生成脚本 `scripts/make-pdfjs-part.js`（幂等 + 自检）
 > 上游版本：pdfjs-dist 6.3.289（`legacy` 构建，已修复 CVE-2024-4367）
 
 ## 1. 结论速览
@@ -10,7 +10,7 @@
 |---|---|
 | pdf.js 版本 | **pdfjs-dist 6.3.289**(`legacy` 构建) —— **已修复 CVE-2024-4367**(该漏洞影响 ≤4.1.392) |
 | 原始包 | `vendor/pdfjs-src/pdfjs-dist-6.3.289.tgz`(registry.npmjs.org);源文件 `vendor/pdfjs-src/legacy/build/pdf.min.mjs` 518,555 B、`pdf.worker.min.mjs` 1,317,034 B |
-| 产物 | **`src/pdfjs.part` = 1,853,151 bytes**(磁盘实测;md5 `b06fc57dbbc44ef6c9042a3723cc1047`) |
+| 产物 | **`src/pdfjs.part` = 1,882,880 bytes**（2026-09-18 磁盘实测；md5 `befc7cafea8e5b469df4e3542c7285d9`；该段由 netdocs-B 重生成后未再变） |
 | 结构 | 3 个 `<script>` 块:display 库 → `<script type="text/plain" id="pdfjs-worker-src">` worker 源码 → PDFKit 包装层 |
 | 体积影响 | 相对增量 **+1.85 MB**(上版 3.11.174 是 +1.53 MB) |
 | 测试 | 一次性测试件 → **150 项断言全 PASS**（脚本未随仓库保留，见 §5） |
@@ -32,11 +32,11 @@
 |---|---|---|---|---|
 | 4.10.38(最低可接受 4.2.67 之上的 4.x 末版) | 1.82 MB | 1,832,578 B | Chrome ≥ 98 级 | 不用:比 5.x 大、比 6.x 旧 |
 | 5.7.284(5.x 最新) | 1.78 MB | **1,800,792 B**(最小) | Chrome ≥ 118 / Safari ≥ 16.4 | 备选:兼容面更宽 |
-| **6.3.289(最新,本次采用)** | 1.84 MB | **1,853,151 B** | Chrome ≥ 125 / Safari ≥ 18 | 最新;仅比 5.x 大 52 KB(+2.9%) |
+| **6.3.289(最新,本次采用)** | 1.84 MB | **1,882,880 B**(2026-09-18 现取;表中另两行为 2026-09-14 读数) | Chrome ≥ 125 / Safari ≥ 18 | 最新;不比 5.x 明显更大(量级结论不变) |
 
 结论:**6.x 并没有比 5.x 明显更大**(远低于“>3MB”的担忧),所以按“最新版优先”选了 6.3.289。
 如果要把兼容面从 Safari 18 降到 16.4,只需把 `vendor/pdfjs-src/legacy/build/` 换成 5.7.284 的两个文件再跑一次
-`node scripts/make-pdfjs-part.js`(生成器已实测三版都能跑通),产物 1,800,792 B,其余一切不变。
+`node scripts/make-pdfjs-part.js`(生成器已实测三版都能跑通),产物 ≈1.80 MB(2026-09-14 读数;再生成请以当次打印值为准),其余一切不变。
 
 ## 2. v4+ 没有 UMD:ESM → classic 的机械化改写
 
@@ -181,7 +181,7 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 | `src/pdfjs.part` | **最终内嵌片段（1,863,174 B；含 §9 的流异步迭代垫片 + 手动 reader 泵）** |
 | `scripts/make-pdfjs-part.js` | ESM→classic 机械化改写 + 自检 + 转义，幂等 |
 
-- **`Read` 工具也复用本引擎**：`Read` 对 PDF 先 `extractText`（**文本优先，不吃 `pdfMode()` 设置** —— Read 的契约是"读内容"），只在确实没有文字层（分页标记 `----- 第 N 页 -----` 不算文字）时才 `renderPages`（页数 = `min(pdfMaxPages(), READ_PDF_IMG_MAX_PAGES=4)`，参数与附件图片模式同参）→ 支持视觉就附页图、否则逐页 OCR；渲染与文本抽取都直接调 `PDFKit`，不走 `resolvePdf` 包装。
+- **`ReadOffice` 工具复用本引擎**：`ReadOffice` 对 PDF 先 `extractText`（**文本优先，不吃 `pdfMode()` 设置** —— 读文档的契约是"读内容"），只在确实没有文字层（分页标记 `----- 第 N 页 -----` 不算文字）时才 `renderPages`（页数 = `min(pdfMaxPages(), READ_PDF_IMG_MAX_PAGES=4)`，参数与附件图片模式同参）→ 支持视觉就附页图、否则逐页 OCR；渲染与文本抽取都直接调 `PDFKit`，不走 `resolvePdf` 包装。**`Read` 自己不再读 PDF**：遇 `.pdf` 返回 `EINVAL` 重定向到 `ReadOffice`（按后缀给词 + 可照抄的 `path` JSON），不产生任何解析副作用。
 
 能力探针（实测 module/classic worker、blob、动态 import、`new Function` 在 http/file 下的差异，§3 的设计依据）与一次性测试件（`mk-test-pdf.js` / `mk-libtest-page.js` / `libtest-pdfjs.js` / `pdfjs-cdp.js` / `libtest-pdfjs.html` / `pdfjs-test-log.txt`）及旧 `.build/` 目录均已删除；§5 的数字是当时的原始结论（仓库不保留回归脚本，理由见 `CONTRIBUTING.md`「验证」）。
 
@@ -190,7 +190,7 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 **症状**：宿主缺 `ReadableStream.prototype[Symbol.asyncIterator]`（Chrome 124 才有）时，`PDFKit.extractText()` 必抛
 `TypeError: e is not async iterable` —— pdf.js 6 的 display `getTextContent()` 内部是
 `for await (const t of this.streamTextContent())`。用户真机 Thorium Legacy `M122.0.6261.171`（Chromium 122 / Windows 7）
-2026-09-15 报出该错，PDF 附件与 `Read` 的文本抽取全部不可用。
+2026-09-15 报出该错，PDF 附件与 `Read` 的文本抽取全部不可用（当时 PDF 由 `Read` 读；该路径现已属 `ReadOffice`）。
 
 **修法（两处，都在 `make-pdfjs-part.js` 的模板里；`src/pdfjs.part` 只经脚本重生成）**
 1. **手动 reader 泵**（热路径，`PDFKIT_JS`）：`extractText` 不再调 `getTextContent()`，改走 `pageTextViaReader()`
@@ -236,8 +236,11 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
   （原始读数 `shared/progress/thorium-122-verify-done.md`）。口径同 `README.md`：**「实测可用（含垫片 + 手动 reader 泵）」，不等于把
   Chromium 122 升格为官方支持基线**（官方目标仍是 Chrome ≥125 / Safari ≥18）。
 - **仍未实测**：**Windows 7 本体**（本机 = Win11 + Chromium 122 内核）；Safari / Firefox / 移动端；worker realm 内的实测（仍是静态推导）；
-  `normal` / `full` 档的浏览器行为（122 真机上只抽验过 `minimal` 档；`full` 档那次读数取自更早一路留下的快照，且该读数在
-  并发事故中作废、事后未复跑 —— 见 `shared/progress/thorium-122-verify-done.md` §15）。
+  `normal` / `full` 档的浏览器行为 —— **本条已改准(2026-09-16)**：122 真机上**三档都跑过整轮**（`shared/progress/netdocs-final-122-verify.md`：
+  6 轮 × 逐项 = 264 项、FAIL = 0；`full` 42/42、`normal` 同，只有「真实模型端到端」一项只在 `minimal` 跑）。此前记的"122 真机上只抽验过
+  `minimal` 档 / `full` 档那次读数取自更早快照且在并发事故中作废、事后未复跑"（`shared/progress/thorium-122-verify-done.md` §15）
+  是**那一路上当时**的实况，已被上述独立复测取代。**仍未覆盖**的只剩：那套读数对应 02:05–02:06 那次构建，
+  **02:37 之后重编的现盘产物只做了静态标记核**（同报告 §一/§六）。
 
 `PDFKit.diag()` 的读数同时出现在 设置 → 环境 的「诊断」面板（`· PDF 引擎:pdf.js 6.3.289 · worker · 取文本:reader ·
 流迭代:原生/已垫片 · 取图:可用/不可用 · 图文融合:<`fuseStateText()` 的返回值>`）；「图文融合」的取值逐字来自 `src/appD.part` 的
@@ -253,7 +256,7 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 
 **链路**：`PDFKit.pageImages()` 扫页图位置（Route C 几何：CTM 下的单位方，见 §2.1c 契约与 `shared/progress/netdocs-B1-done.md`）
 → `PDFKit.renderCrops()` 按区取图（失败单调降级到整页 `renderPages`，**必须注记**，不静默）→ 应用层用内嵌 OCRKit 逐张识别
-→ 按页插进 PDF 文本。Read 侧（`Read("/x.pdf")`）与附件侧（选文件 → `resolvePdf`）**同一套助手、同一套块格式**：
+→ 按页插进 PDF 文本。ReadOffice 侧（`ReadOffice("/x.pdf")`）与附件侧（选文件 → `resolvePdf`）**同一套助手、同一套块格式**：
 `ocrSeqCands`（逐张 `wsImgFitForModel` → `wsOcrTextOf` + 预算/中止 + 计数，**不做任何文案**）、
 `ocrBlockText`（块头唯一来源，空 / 纯空白 ⇒ `""`，不写空块）、`docFusePages`（按页插块；无块 ⇒ 原样返回）——
 三个都在 `src/appD.part`，`appE.part` 的 `wsOcrCands`（旧的「整页无文字层 ⇒ OCR」路径）内部改调 `ocrSeqCands`，
@@ -277,9 +280,9 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 
 | 常量 | 值 | 语义 |
 |---|---|---|
-| `READ_DOC_OCR_MAX_IMAGES` | 12 | Read 侧单次最多 OCR 张数 |
-| `READ_DOC_OCR_MAX_PAGES` | 8 | Read 侧只扫描前 8 页的图片（文本仍按 `extractText` 的 `maxPages` 取） |
-| `READ_OCR_TIMEOUT_MS` | 120 s | **整次 Read** 共享的 OCR 总预算 |
+| `READ_DOC_OCR_MAX_IMAGES` | 12 | ReadOffice 侧单次最多 OCR 张数 |
+| `READ_DOC_OCR_MAX_PAGES` | 8 | ReadOffice 侧只扫描前 8 页的图片（文本仍按 `extractText` 的 `maxPages` 取） |
+| `READ_OCR_TIMEOUT_MS` | 120 s | **整次读取**共享的 OCR 总预算（`Read` 读图片与 `ReadOffice` 读文档图片共用同一常量） |
 | `ATT_OCR_MAX_IMAGES` | 6 | **附件侧**单次最多 OCR 张数 |
 | `ATT_OCR_TIMEOUT_MS` | 60 s | **附件侧 OCR 阶段**总预算——**整次附件解析共享**，不是每图；**不是整条解析链的墙钟上限**（取图调用 `pageImages` / `renderCrops` / `renderPages` 各另带一次 60 s 超时） |
 
@@ -288,9 +291,14 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 `OCRKit.recognize` 单次调用不可中断（只能 `terminate`）⇒ 超时 / 中止的生效点只在**两张之间**。
 
 **落点**
-- **Read 侧**：融合文本进工具结果（`wsFuseOcrText`），状态行加字段「图片 N 张已本机 OCR 并按页插入(当前模型不支持图像输入,OCR 可能有误差)」。
+- **ReadOffice 侧**：融合文本进工具结果（`wsFuseOcrText`），状态行加字段「图片 N 张已本机 OCR 并按页插入(当前模型不支持图像输入,OCR 可能有误差)」。
+  **同一条路径也服务 pptx**（P2 的 S15 起）：pptx 的正文由 office 胶水写上 `----- 第 N 页 -----`（S11，**与 PDF 同一字面量**），
+  `wsDocumentPack` 的融合分支按 `kind` 选布局 —— `pdfPage`（PDF / pptx）⇒ `pages`（块插到对应页 / 幻灯段之后）、
+  docx / xlsx ⇒ `flat`（正文之后按序接）。因此 pptx 的幻灯内图片 OCR 后**落在该幻灯段之后**（块头 `【第 N 页 · 图 k · 本机 OCR】`，
+  `k` = 该幻灯内序号），而不是文末。判据与读数见 `shared/progress/read-split-p2b-done.md`。
 - **附件侧**：进附件对象——`att.text`（融合后正文，`textChars` 同步）、`att.ocrImgs`（**写入过非空块的张数**；未识别的另计；
   旧数据无此键 = 0，不做迁移）、`att.degraded`（上面那些注记）。气泡卡片与附件 chip 显示「N 图已 OCR」。
+  **附件侧不受 S15 影响**：office 三格式仍一律 `flat`，只有 PDF 走 `pages`。
 
 **不变量（有负例断言守着）**：视觉模型路径一字不变（不探页图、不做 OCR，请求体既不含「本机 OCR」也不含夹具暗号）；
 无图 / 纯文本文档输出逐字节不变；附件 PDF 的融合条件 = 「非视觉**且有图**」（**不是**「文本为空」）。

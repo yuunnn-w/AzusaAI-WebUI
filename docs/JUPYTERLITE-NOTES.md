@@ -1,0 +1,25 @@
+# JupyterLite 内嵌产物（`appJ` 宿主 + 内核 ↔ 工作区同步）笔记
+
+面 = JupyterLab 宿主与内核同步（与 `PYODIDE-NOTES.md` 的分工：那份讲载荷与运行时装载，这份讲宿主 / 同步 / 内核交互面）。
+
+## 已知限制
+
+- **内核一直 `busy` ⇒ 排队中的「跟随格」永不结清（"忙型挂死"不覆盖）**：链首（用户单元格或同步自身的隐藏执行）长时间 `busy` 且**永不回头**时，后续同步请求停在队列里**一直不结清**（单元格不产出、不报错）。看门狗窗口 `JL_SYNC_CHAIN_WAIT_MS = 120000` **只累计"内核空闲"时段**（每 `JL_SYNC_WATCHDOG_TICK_MS = 500` 采样一次，只有 `conn.status !== "busy"` 的那一格才计入窗口）—— 这是为消除"合法长跑链首 + 排队跟随格被误杀"而**有意**引入的语义 ⇒ 纯忙长格**不会被误杀**，代价是"忙型挂死"这一方向不被覆盖。可见性：状态行按 `JL_SYNC_BUSY_NOTE_MS = 5000` 节流给出 **`warn` 级**可见等待（文案含"内核已 busy N s ⇒ 看门狗只累计内核空闲时段：不结清、不误杀链首；忙型挂死不覆盖 ⇒ NOTES 已知限制"），**不置 `degraded`**（没有发生任何降级 / 重置；置 `degraded` 会污染"世代校验 / 截断"这两个真正需要看 `degraded` 的信号）。**收尾方式**：用户点笔记本的 **Stop / Restart**（走既有 `interrupt` / `restart` 强制结清四条路径），或等链首自然结束。
+- **链首自身"夹带空闲期"仍累计 ⇒ 内核空闲累计 ≥120 s 仍会结清跟随格**：链首是"忙一段、空闲一段"的长格（`await asyncio.sleep` / 长 IO / 等 stdin）时，空闲段照常计入窗口 ⇒ 累计 ≥ `JL_SYNC_CHAIN_WAIT_MS`（120000 ms）后**跟随格被结清**（`status=aborted` + 状态行 `degraded`；**链首自身不受影响**，仍在跑）。判据面：`window.__JL_SYNC_DIAG.releases[]` 里一条带 `via:"watchdog"` 且 `idleMs >= 120000`，且 `window.__JL_SYNC_STAT.degraded === true`。失败形状**可见**（状态行 + 留痕），不是静默丢数据；彻底消除需引入"链首活动心跳"语义（新一轮机制设计，**收益 / 风险比不成立**）。
+- **上面两条合起来才是本语义的完整边界**：`空闲 + 挂死 ⇒ 120 s 结清`（有真机读数）· `忙型 ⇒ 不结清，但也不误杀链首`。
+- **单次同步的字节上限是"名义值"**：`JL_SYNC_MAX_BYTES_IN` / `MAX_BYTES_OUT` 名义 = 16 MiB，但判定量的是 **base64 宽度**（base64 膨胀 4/3）⇒ **有效原始字节上限 ≈ 12 MiB（名义值的 3/4）**。超限的文件**不会进内核**（`open()` 抛带说明的 `FileNotFoundError`，状态行 + 跳过清单有该路径），也不会被判成"内核侧删除"；大文件请走工作区工具或 `DownloadForUser`。
+- **子文档 realm 结构性无法注册 ServiceWorker ⇒ 内核侧文件同步只能走"读者级"路径（P-C11 的范围限制）**：Jupyter 宿主给子文档写的**伪源**是 `<base href="https://azusa-jupyter.invalid/">`（`JL_VIRT_ROOT`，注释自称"伪源（站点根；永不解析）"）⇒ 子文档内一切相对 URL 按伪源解析，`navigator.serviceWorker.register("./service-worker.js")` 必抛 `SecurityError`（跨源）；该 realm 的 `getRegistrations()` 亦报 `InvalidStateError`；把**正确 origin 的绝对 href** 喂给产品自身的 `ServiceWorkerManager._initialize(href)`，promise 返回 `ok:true` 但 **`enabled` 恒 `false`、`_registration` 恒 `null`**。⇒ **判定式第一析取项（`IServiceWorkerManager.enabled`）在本架构下结构性取不到真值** ⇒ 只能用"未挂 Drive"的既有路径（产品自身 console 亦给出 "Pyodide contents will NOT be synced with Jupyter Contents…" 的自述）。**归因 = 产品架构（伪源 `<base>` + 子 realm 读数面）**，装置侧与环境侧已**机械排除**：把静态服务的 SW 开关打开后，**主 realm** 同 origin 的 `register()` 成功（`mainReg.ok:true`、`scope` = 该 origin）—— 限定：`active:false` ∧ `controller:null` ⇒ 只证到"**注册对象能建立**"，不是"SW 已激活接管"。**这一条是"判据范围限制"的登记，不是产品缺陷主张**（`_initialize()` 何时置 `enabled` 未追，只主张"在 P-C11 的读数窗里取不到真值"）。
+- **启动期会有 1 条子 realm `Uncaught (in promise)`（噪声，不影响功能）**：每次子文档启动，子 realm 抛出一条空载荷的未处理拒绝 —— 归因 = 上游 JupyterLite 的 `ServiceWorkerManager._ready.reject(void 0)`（**SW 注册失败路径**，与上一条同源：伪源 `<base>` ⇒ `register()` 必失败、`_ready` 被 reject 而无人消费）；`exception:{type:"undefined"}` 与 rejection 值 `void 0` 吻合。**实测（审查方 4 轮独立自跑）**：`file://` 与 `http://` 两形态**同签名同源**出现，**每轮每次子文档启动恰 1 条**、全部落在启动期，注入相 0 条；产品自身不消费 `_ready` ⇒ **功能无影响**（镜像 `ready=true`、`ticks` 推进、`err=""`、非回环外部请求 0）。去噪只能在上游侧 / 子 realm 加 `unhandledrejection` 兜底（**属机制设计，不在本轮**）。
+- **独立标签页地址栏是 `about:blank`，刷新该页 ⇒ 白屏（J-TAB-1，已登记为已知问题，0.2.1 备选）**：标签页由 `window.open()` + 子文档 `document.write` 建立，子文档用伪源 `<base href="https://azusa-jupyter.invalid/">` ⇒ 地址栏停在 `about:blank`，刷新等于重新加载它 ⇒ 白屏。**无数据丢失**：工作区文件与镜像不受影响，重新从工作区右键「通过 JupyterLab 打开」即可恢复。解法已写清 = A1（子页内核资产自举）+ A2（跨页传输迁 `localStorage` + `storage` 事件），属 0.2.1 范围。
+
+## 打开中的文档与镜像（冲突面 · 2026-09-18 登记）
+
+**三方副本语义**：同一路径最多可能有三份副本 —— ① 工作区 `wsfiles`（IDB）；② Jupyter Contents（localforage 库 `AzusaAI-JupyterLab`）；③ **打开中的文档模型**（内存）。镜像**不经过**副本③ 的**保存路径**（`Context._maybeSave`）—— 但副本③ 的**模型内容**会被"跟随"替换（见下节：clean 文档由 `Context.revert()` 重载；dirty 文档**不动**）。外部改动在本栈（非 RTC）**没有主动提示通道**（`Context._onFileChanged` 对 `type==="save"` 只在协同/RTC 模式下合并模型，否则直接返回）⇒ 原生的 **`File Changed`（Revert / Overwrite / Cancel）只可能在"文档自身发起保存"时出现**（手动保存，或 dirty 文档的 autosave）。
+
+**保护面 —— dirty 文档一律不动作**：镜像推方向写成功（`cs.save`）后，若该路径在 Jupyter 侧有打开中的文档，**只有 clean 文档**会被跟随重载（`Context.revert()`）；**dirty 文档不做任何动作** —— 用户未保存的编辑保持原样，其保存时才走原生的 `File Changed` 对话框（选 `Overwrite` 会覆盖对侧最新内容，选 `Revert` 丢弃本侧改动）。
+
+**触发与延迟**：跟随由"**镜像推成功后**"驱动，延迟 **≤1 tick（≈1 s）** —— **不是实时**（tick 周期 `JL_MIRROR_TICK_MS = 1000`，且 `revert()` 自身还有一次 Contents 往返）。子窗口处于聚焦态时**该次跳过**（把裁决交给用户保存时的原生对话框）；跳过只影响那一次 —— 转回主页面后的下一次外部改动照常跟随。跟随成功后清空该文档的 undo 历史（上游 `Context.initialize` 同款）：否则用户 Ctrl+Z 可"撤销跟随"⇒ 模型回到旧内容且 `dirty=true` ⇒ 其保存时冲突裕度不命中（模型与磁盘刚被对齐）⇒ **静默写回旧内容**（该数据链已按上游范式切断）。
+
+**残余竞态与读数面**：从"读到 `dirty=false`"到"模型内容被替换"之间存在一个异步窗口（`await this.ready` + `contents.get` 往返，非微秒级）—— 已采纳"**子窗口聚焦即跳过**"护栏；窗口大小由读数面 `data-jl-mirror-stat.nudgeMs`（最近一次成功跟随的墙钟毫秒，0 = 尚无读数）与计数 `nudged / nudgeSkipped / nudgeFailed` 暴露（均只读、不新增对外接口）。
+
+**已知边界（登记，不改上游）**：① 同一路径被多个 widget/context 打开时**只跟随首个**（最小耦合，不做重复 `revert`）；② 该文档**正挂着 `File Changed` 对话框**时，跟随可能在其打开期间换掉模型（`Context` 无公开模态标志 ⇒ 本设计**不读私有字段、不改上游**）；③ 文档在 Contents 侧被删除后仍继续打开（**既有行为**，未在本设计内处理）；④ **冲突轮：子侧更新不跟随** —— 冲突轮里拉方向把工作区写新后，推方向下一轮走"内容相同"分支（`same++` + 对齐基线）而**不再 `cs.save`** ⇒ 不进入"推写成功"驱动 ⇒ 打开中的 clean 文档**当轮不跟随**（实测：冲突轮后 `model` 仍为旧内容）。行为与上游一致（外部改 Contents 不会自动重载打开中的文档）⇒ 打开中的文档要拿新内容，等**下一次推写**或**用户保存时**的原生 `File Changed` 对话框。

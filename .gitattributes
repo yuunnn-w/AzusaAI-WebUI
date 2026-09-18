@@ -2,3 +2,4 @@
 # 无论克隆到哪个平台，工作区文件与库内存储都保持提交时的原始字节（LF）。
 * -text
 src/pyodide.part filter=lfs diff=lfs merge=lfs -text
+src/jupyterlite.part filter=lfs diff=lfs merge=lfs -text
