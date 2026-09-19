@@ -20,6 +20,10 @@ src/pyodide-*.part
 # 旧产物名（防误写误入库）：防旧脚本 / `--out=index.html` 重新写出后被 git add 误入库
 /index.html
 
+# root 下的分发型 exe（手工从 rust-proxy/dist/ 拷来与三档 HTML 放一起，方便拷贝分发）：
+#   ⚠ 必须忽略 —— 其中 `…-internal.exe` 内含内网地址，一旦入库即泄漏（见 rust-proxy/README.md「安全与保密」）
+/*.exe
+
 # 旧分档输出目录（旧 dist/ 布局已弃用；条目保留，防旧脚本写出的产物被误提交）
 dist/
 
