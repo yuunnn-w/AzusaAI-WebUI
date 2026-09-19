@@ -1,0 +1,8 @@
+# Win7 构建必须钉在已验证的日期化 nightly 上（tier-3 目标无上游 CI：指南 §1.4；方案 §12 DG16）。
+# 前置（经代理安装 —— 方案 §5.5.1 第 0 步）：
+#   rustup toolchain install nightly-2026-06-03 --component rust-src
+#   （期望：rustc 1.98.0-nightly (d595fce01 2026-06-02) —— 频道名里的日期 = 发布日，
+#     版本串里的日期 = 提交日，差一天；`b354133fb 2026-06-03` 是**滚动** nightly 的串）
+[toolchain]
+channel = "nightly-2026-06-03"
+components = ["rust-src"]

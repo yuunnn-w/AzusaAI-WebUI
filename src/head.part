@@ -398,6 +398,20 @@ html.legacy #compat-screen { display: flex; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .conv-item .ci-msgs { flex: none; font-size: 10px; font-family: var(--font-mono); color: var(--text-faint); }
+/* 生成中徽标(b30):该会话处于生成态时出现;四态文案由 appD 的 genPhaseText 派生
+   (生成中 / 工具执行中 / 等你操作 / 停止中)。颜色只用主题变量(--accent / --warning),
+   深浅两组自动跟随;紧凑模式字号收一档 */
+.conv-item .ci-gen {
+  flex: none; display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; line-height: 1; color: var(--accent); white-space: nowrap;
+}
+.conv-item .ci-gen i {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none;
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.conv-item .ci-gen.warn { color: var(--warning); }
+.conv-item .ci-gen.warn i { background: var(--warning); }
+html[data-density="compact"] .conv-item .ci-gen { font-size: 9px; }
 .conv-item .ci-pin { flex: none; color: var(--accent); display: none; }
 .conv-item.pinned .ci-pin { display: block; }
 .conv-item .ci-menu {
@@ -3115,18 +3129,17 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
           <div class="range-row"><input type="range" id="set-tool-out" min="1000" max="131072" step="1000" /><span class="val" id="set-tool-out-v"></span></div>
           <div class="hint">1K ~ 128K 字符(默认 16K)。工具输出超过上限时会保留末尾并注明截断量(不再标注原始长度);档位提示、工作区回写、并发冲突等短注记不受影响,不会因结果过长而丢失。</div>
         </div>
+        <div class="field">
+          <label>同时生成会话数上限</label>
+          <div class="range-row"><input type="range" id="set-gen-max" min="1" max="6" step="1" /><span class="val" id="set-gen-max-v"></span></div>
+          <div class="hint">1 ~ 6 条(默认 3)。多条会话可以同时生成;超过上限的发送会转入该会话的「待发送」浮窗,任一会话收尾后自动补发。提示:Python 解释器池上限为 2,设得更高会更容易撞到「池已满」。</div>
+        </div>
 
         <div class="sec-title">Python 任务</div>
         <div class="field">
           <label>后台任务超时</label>
           <div class="range-row"><input type="range" id="set-py-task-timeout" min="60000" max="3600000" step="60000" /><span class="val" id="set-py-task-timeout-v"></span></div>
           <div class="hint">1 ~ 60 分钟(默认 30 分钟)。只作用于 <code>run_in_background=true</code> 的任务:到点直接销毁解释器并把状态标成「已超时」(python 在浏览器里没有协作式中断,销毁是唯一手段)。前台执行另有「单次执行超时」控制。</div>
-        </div>
-        <div class="field">
-          <div class="switch-row">
-            <div class="sw-txt"><label for="set-py-stop-kill">停止生成时也终止后台任务</label><small>默认关闭:按 Ctrl+X / 停止生成只中止当前这次回答,后台 Python 任务继续跑。打开后「停止」会连后台任务一起终止(未回写的产物会丢失)。</small></div>
-            <label class="switch"><input type="checkbox" id="set-py-stop-kill" /><span class="slider"></span></label>
-          </div>
         </div>
         <div class="note" id="py-task-summary"></div>
         <div class="hint">同时最多 2 个未完成任务(前台 + 后台合计),第 3 个会被拒绝并提示先停止其中一个。<b>任务不跨刷新</b>:刷新或关闭页面后任务与记录全部消失(已回写到工作区的产物不受影响),长任务请让脚本把中间结果写进工作区文件。</div>
@@ -3190,10 +3203,10 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
           <div class="hint">单条消息里所有附件的总量上限(默认 100 MB)。数据存在浏览器的大仓库里,所以可以放宽;真放不下时会弹「清理空间」让你确认后再处理。</div>
         </div>
 
-        <div class="sec-title">PDF 处理方式</div>
+        <div class="sec-title">附件图片策略</div>
         <div class="field">
-          <div class="nsel" id="set-pdfmode"></div>
-          <div class="hint">「纯文本」用 pdf.js 抽取文字(快、省 token,扫描件抽不出字);「图片模式」把每页渲染成图片发给模型(需要模型支持图像输入)。</div>
+          <div class="nsel" id="set-attachmode"></div>
+          <div class="hint">PDF 与办公文档共用这一档。<b>默认「混合」</b>:文字 + 文档里的图片一起发送(非视觉模型下图片自动改走本机 OCR,识别结果随文字发送、原图不发)。「纯文本」只发抽出的文字、最省 token(扫描件这类没有文字层的文件会自动升档并把原因写在气泡下方);「图片」把 <b>PDF 与 docx</b> 逐页渲染成页图(docx 基于浏览器排版,分页与 Word 可能不一致;页数为渲染结果),表格(xlsx/xls)在本机绘制成表格图发给模型 —— <b>图片档要不要发图取决于模型是否支持图像输入</b>。单张图片附件(png/jpg…)始终按图片发送,不受这一档影响。</div>
         </div>
         <div class="field">
           <div class="range-row">
@@ -3201,7 +3214,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
             <input type="range" id="set-pdfdpi" min="72" max="300" step="1" />
             <span class="val" id="set-pdfdpi-v"></span>
           </div>
-          <div class="hint">72 ~ 300 DPI(默认 150)。分辨率越高越清晰,但每页图片的体积与 token 也越大;A4 在 150 DPI 下约 1240×1754 像素。</div>
+          <div class="hint">72 ~ 300 DPI(默认 150)。只影响图片档与混合档里的<b>渲染页图</b>(xlsx/xls 的本机表格图另按行/列上限绘制);纯文本档不受它约束。分辨率越高越清晰,页图体积与 token 也越大;A4 在 150 DPI 下约 1240×1754 像素。</div>
         </div>
         <div class="field">
           <div class="range-row">
@@ -3209,7 +3222,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
             <input type="range" id="set-pdfpages" min="1" max="50" step="1" />
             <span class="val" id="set-pdfpages-v"></span>
           </div>
-          <div class="hint">只影响「图片模式」;纯文本模式只受 40 万字符的上限约束。</div>
+          <div class="hint">只影响图片档与混合档的<b>渲染页图</b>(最多处理这么多页);纯文本档只受 40 万字符的上限约束。办公格式的图片档能力见上面的档位说明;docx 的页图与 PDF 同口径(同一 DPI / 页数上限)。</div>
         </div>
 
         <div class="sec-title">图像输入能力</div>
@@ -3219,7 +3232,7 @@ html.no-flexgap .chips > * + * { margin-left: 6px; }
         </dl>
         <div class="field">
           <div class="nsel" id="set-visionforce"></div>
-          <div class="hint">模型不支持图像输入时,图片会改用内嵌的 Tesseract.js 做 OCR,只把识别出的文字发给模型(气泡下方会注明)。</div>
+          <div class="hint">模型不支持图像输入时,图片会改用内嵌的 Tesseract.js 做 OCR,只把识别出的文字发给模型(气泡下方会注明;附件的图片会按此自动在原图与本机 OCR 之间切换,无需另设开关)。</div>
         </div>
         <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:10px">
           <button class="btn sm" id="btn-vision-probe"><svg class="icon sm"><use href="#i-eye" xlink:href="#i-eye"/></svg> 重新探测当前模型</button>

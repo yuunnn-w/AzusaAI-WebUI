@@ -1,0 +1,48 @@
+D12-1 源码面「零文件 I/O」判据归档（P6-S10 / B4b · 现取）
+生成时间 = 2026-09-19 21:57:19
+cwd(git 仓库根) = /c/Azusa/Code/AzusaAI-WebUI/AzusaAI-WebUI
+纪律：本档**不含**任何私有网段地址与内网服务标识字面量（needle 分段拼接 + 命中掩码；D13-6）
+
+== 一、命令与计数 ==
+命令：grep -rn -E "std::fs|File::open|File::create|OpenOptions|GetPrivateProfile|SHGetFolderPath|CreateFileW" rust-proxy/src
+命中总数 = 6（逐条归类见第二节）
+按文件计数：
+src/output.rs:2
+src/ui/tray.rs:4
+
+== 二、逐条归类 ==
+src/output.rs:435:            let h = fs::CreateFileW(PCWSTR(wide("CONOUT$").as_ptr()), acc, shr, None, crt, flg, None);
+src/output.rs:439:            let h = fs::CreateFileW(PCWSTR(wide("CONERR$").as_ptr()), acc, shr, None, crt, flg, None);
+src/ui/tray.rs:391:        std::fs::create_dir_all(dir).map_err(|err| format!("建目录失败：{err}"))?;
+src/ui/tray.rs:494:    std::fs::write(path, out)
+src/ui/tray.rs:787:        let read = |name: &str| std::fs::read(dir.join(name)).expect("图标文件必须存在");
+src/ui/tray.rs:804:        let _ = std::fs::remove_dir_all(&dir);
+
+归类（现取）
+  1. src/output.rs:435  CreateFileW("CONOUT$")   ⇒ **K9 白名单**（运行期；第四节给判定式）
+  2. src/output.rs:439  CreateFileW("CONERR$")   ⇒ **K9 白名单**（同上）
+  3. src/ui/tray.rs:391 std::fs::create_dir_all   ⇒ `#[cfg(test)]`（**仅 cargo test 下编译**；函数 dump_icon_states，声明于 :365）
+  4. src/ui/tray.rs:494 std::fs::write           ⇒ `#[cfg(test)]`（同上，dump_icon_states 的写盘臂）
+  5. src/ui/tray.rs:787 std::fs::read            ⇒ `#[cfg(test)]`（四态图标回归测试体内）
+  6. src/ui/tray.rs:804 std::fs::remove_dir_all  ⇒ `#[cfg(test)]`（同上，测试收尾清理）
+⇒ **非测试面**：std::fs / File::open|create / OpenOptions / GetPrivateProfile* / SHGetFolderPath = **0**
+⇒ **非测试面 CreateFileW = 仅 K9 白名单两处**（控制台**设备**句柄，非文件）
+⇒ `#[cfg(test)]` 内允许项 = 4 条（上表 3–6），全部**仅 cargo test 下编译**
+
+== 三、CreateFileW 判定式四步（方案 §12.1-D12-1）==
+① grep -rl "CreateFileW" rust-proxy/src 的文件集合 = {src/output.rs }
+② grep -rc "CreateFileW" rust-proxy/src 总计 = 2
+③ 两处命中行须含 CONOUT$ / CONERR$：
+  src/output.rs:9://!    **[`Channel::Console`]** —— 用 [`open_console_device()`] 重开 `CONOUT$` / `CONERR$` 设备句柄
+  src/output.rs:17://! **只能是** `CONOUT$` / `CONERR$`。打开的是**设备**（`GetFileType` 返回 `FILE_TYPE_CHAR`）
+  src/output.rs:34:    /// 附着到父控制台（或启动时已有控制台）：写 `CONOUT$` / `CONERR$` 设备句柄。
+  src/output.rs:416:/// **K9 白名单**：本批唯一允许打开控制台设备句柄的函数体，字面量只能是 `CONOUT$` / `CONERR$`。
+  src/output.rs:435:            let h = fs::CreateFileW(PCWSTR(wide("CONOUT$").as_ptr()), acc, shr, None, crt, flg, None);
+  src/output.rs:439:            let h = fs::CreateFileW(PCWSTR(wide("CONERR$").as_ptr()), acc, shr, None, crt, flg, None);
+④ 两处行号须落在 open_console_device() 函数体内（现取 :424–443）
+⇒ 四步全过：白名单外**多一处**会让 ② 变、函数体外插入会让 ④ 红、字面量换成真实路径会让 ③ 红
+
+== 四、覆盖与未覆盖 ==
+覆盖：rust-proxy/src/** 的上述 7 个模式（含 `#[cfg(test)]` 面，逐条归类）
+未覆盖：build.rs 与 scripts/**（**构建期**脚本，按 D12 边界不属于"运行期零文件 I/O"的对象）；
+        运行期行为面由 scripts/verify-no-residue.ps1 / verify-no-write.ps1 承载（读数见各自报告）

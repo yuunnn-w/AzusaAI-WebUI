@@ -505,7 +505,8 @@ async function jlChildMain() {
        载荷侧不得有副本(断言 16);内核的锁用载荷段 jupyterlite-lock.json(产品剪裁锁不含 micropip,
        内核的 initPackageManager 必装它 ⇒ 用产品锁必挂)
      · worker 源码在**运行期**打补丁(不改生成器、不改载荷字节;虚拟源始终由本页 blob 承载)
-     · 输出面 = 子文档底部的 #jl-out(§2.6.1 C 的最小轮口径:阶段诊断行 + 判据读数)
+     · 诊断留痕 = **仅内存**(§2.6.1 C 的阶段诊断行 + 判据读数 → KR.lines / KR.stages;
+       b33 起子文档底部**只留** #jl-sync-note 半透明状态栏,不再渲染任何日志 DOM)
   --------------------------------------------------------------------------- */
   var KR = {
     t0: Date.now(), stage: "idle", lines: [], stages: {}, checks: {}, errors: [], msgs: [],
@@ -536,29 +537,11 @@ async function jlChildMain() {
     jlOut("[失败] " + k + ":" + m);
     return m;
   }
-  /* 子文档可见的输出面(§2.6.1 C:本轮渲染进我们自己的 <pre id="jl-out"> + 阶段诊断行)
-     E11①：高度收敛为两行（12px/1.55 ⇒ 行高 18.6px，2 行 37.2px + 上下 padding 16px ≈ 54px 含盒），
-     超出滚动（overflow:auto 原样）；追加后跟尾滚动 ⇒ 两行窗口里看到的是**最新**一行，不是 [+0ms] 开头 */
-  function jlOutEl() {
-    var pre = document.getElementById("jl-out");
-    if (!pre) {
-      pre = document.createElement("pre");
-      pre.id = "jl-out";
-      pre.setAttribute("style", "position:fixed;left:0;right:0;bottom:0;margin:0;max-height:54px;overflow:auto;"
-        + "box-sizing:border-box;padding:8px 10px;font:12px/1.55 ui-monospace,Consolas,monospace;white-space:pre-wrap;"
-        + "background:rgba(252,252,252,.97);color:#222;border-top:1px solid #ddd;z-index:2147483645");
-      (document.body || document.documentElement).appendChild(pre);
-    }
-    return pre;
-  }
+  /* 阶段诊断的**仅内存**留痕(b33:按用户要求彻底删除子文档底部的日志面 #jl-out,只保留
+     #jl-sync-note 半透明状态栏 ⇒ 这里不创建、不写入、不滚动任何 DOM)
+     现取方式:子文档 realm 的 `window.__JL_KERN_ACT.diag().kr.lines`(见本段末尾的读数面) */
   function jlOut(line) {
-    var s = "[+" + (Date.now() - KR.t0) + "ms] " + line;
-    KR.lines.push(s);
-    try {
-      var pre = jlOutEl();
-      pre.textContent += s + "\n";
-      pre.scrollTop = pre.scrollHeight;
-    } catch (e) {}
+    KR.lines.push("[+" + (Date.now() - KR.t0) + "ms] " + line);
   }
   function jlRace(p, ms, tag) {
     return new Promise(function (res, rej) {
@@ -1130,7 +1113,7 @@ async function jlChildMain() {
     } catch (e) {
       krFail("S2.kernel_info", e);
       window.__JL_KERN_ERR = String((e && e.message) || e);
-      banner("Python 内核未能就绪(worker 侧诊断见下方输出面):" + window.__JL_KERN_ERR);
+      banner("Python 内核未能就绪(worker 侧诊断见控制台):" + window.__JL_KERN_ERR);
       return null;
     }
     krRec("S2.status", KR.status.join(","));
@@ -4223,7 +4206,8 @@ async function jlChildMain() {
     /* 内核就绪是**另一件事**(§2.6.1 A):__JL_READY / __JL_APP_READY 都不是内核就绪信号。
        异步启动 ⇒ 不阻塞上面两个就绪标记(Phase 2 的判据面因此逐字不变) */
     Promise.resolve(PYCORE.promise).then(function () { return jlKernelBoot(appReady); }).then(null, function (e) {
-      krFail("kernel.boot", e);
+      /* b33:#jl-out 已删 ⇒ 本兜底路径原先唯一的可见面没了,改走既有横幅(不新增 UI 元素) */
+      banner("Python 内核启动链异常:" + krFail("kernel.boot", e));
     });
   } catch (e) {
     window.__JL_APP_ERR = String((e && e.message) || e);

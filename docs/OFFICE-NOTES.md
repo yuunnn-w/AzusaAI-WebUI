@@ -1,7 +1,7 @@
 # 办公文件解析内嵌产物（OfficeKit）笔记
 
 > 状态：现行 —— 办公六格式解析的取件、worker 加载与限额的唯一记录；升级四库版本或改动 `src/office.part` 前必读
-> 更新：2026-09-14 · 载荷段 `src/office.part` 文件 = 2,928,414 字节（2.79 MB；其中 6 段载荷合计 2,927,822 B，差额 592 B = 5 个 `<script>` 包装 + 头注释）
+> 更新：2026-09-19 · 载荷段 `src/office.part` 文件 = 3,429,087 字节（3.43 MB；7 块载荷合计 3,428,845 B + 头注释 235 B + 7 处块间换行 7 B；md5 `94ee8e08205bb39c40e148952c68aed6`）
 > 上游版本：mammoth 1.12.3 / SheetJS CE 0.20.3 / @jose.espana/docstream 0.1.3 / fflate 0.8.3 · 生成脚本 `scripts/make-office-part.js`（幂等 + sha256 断言）
 > 取件：按生成脚本 `LIBS` 表里的 URL 下载四个浏览器单包到 `vendor/office-src/`（文件名见 §1 表）；哈希不符即 `exit 1`
 > 测试：一次性 CDP 无头脚本（只跑 `file://`）已删除，结论与原始读数见 §5；要复现请按 `CONTRIBUTING.md`「验证」现写
@@ -10,15 +10,19 @@
 
 ## 1. 版本与体积
 
-| 部分 | 来源(上游发行版,落 `vendor/office-src/`) | 原始 | 产物 |
+| 部分 | 来源(上游发行版,落 `vendor/office-src/`；胶水 / 包装 / 写入层为本项目源文件) | 原始 | 产物(`<script>` 整块) |
 |---|---|---|---|
-| mammoth | `mammoth@1.12.3 mammoth.browser.min.js` | 636,898 B | 637,016 B |
-| SheetJS CE | `xlsx-0.20.3 xlsx.full.min.js`(官方 CDN 版) | 951,904 B | 952,033 B |
-| docstream | `@jose.espana/docstream@0.1.3 dist/officeparser.browser.js` | 1,271,443 B | 1,271,483 B(剥 shebang 1 处 + sourceMappingURL 1 处) |
-| fflate | `fflate@0.8.3 umd/index.min.js` | 33,311 B | 33,146 B(剥 jsdelivr 横幅 267 B) |
-| 解析核心胶水 | `src/office-worker.src.js` | 16,865 B | 17,005 B |
-| OfficeKit 包装层 | `src/officekit.src.js` | 17,139 B | 17,139 B |
-| **合计** | | | **2,927,822 B** |
+| mammoth | `mammoth@1.12.3 mammoth.browser.min.js` | 636,898 B | 637,080 B |
+| SheetJS CE | `xlsx-0.20.3 xlsx.full.min.js`(官方 CDN 版) | 951,904 B | 952,096 B |
+| docstream | `@jose.espana/docstream@0.1.3 dist/officeparser.browser.js` | 1,271,443 B | 1,271,548 B(剥 shebang 1 处 + sourceMappingURL 1 处) |
+| fflate | `fflate@0.8.3 umd/index.min.js` | 33,311 B | 33,206 B(剥 jsdelivr 横幅 267 B) |
+| 解析核心胶水 | `src/office-worker.src.js` | 34,813 B | 35,014 B |
+| OfficeKit 包装层 | `src/officekit.src.js` | 20,029 B | 20,091 B |
+| OfficeWrite 写入层 | `src/officewrite.src.js` | 479,745 B | 479,810 B |
+| **合计** | | | **3,428,845 B** |
+
+`src/office.part` = 上表 7 块 3,428,845 B + 头注释 235 B + 7 处块间换行 7 B = **3,429,087 B**（上表各列均为 2026-09-19 现取；文件 md5 `94ee8e08205bb39c40e148952c68aed6`）。
+块结构 = 5 个 `text/plain` 载荷（四个上游库 + 解析核心胶水）+ 2 个可执行块（`OfficeKit` / `OfficeWrite`）。
 
 四库来源 URL 与 SHA-256 断言写在 `scripts/make-office-part.js` 的 `LIBS` 表里（哈希不符即 `exit 1` 且不写盘）。
 `vendor/office-src/` 不进版本库（`.gitignore` 已排除）；丢了就按 `LIBS` 表重新下载四份发行版文件（文件名见 §1 表的上游来源列）并核对哈希。
@@ -150,7 +154,7 @@ worker 路径(真实 `OfficeKit`)与主线程参照(注入库体 + 胶水直接�
 - **视觉模型路径一字不变**：图片照旧作为 image part 发出（`att.mode === "both"`、`imgCount` = 发出张数、无 `ocrImgs`）；
 - `skippedImgs` 只数解析层跳过的（图表 / EMF / WMF / TIFF / 超限），**不**把融合的图算进去；融合的图也不进 `att.images`。
 
-**预算（唯一来源 = `appD.part` 的常量）**：单次附件解析最多 `ATT_OCR_MAX_IMAGES`(6) 张、**OCR 阶段**总预算 `ATT_OCR_TIMEOUT_MS`(60 s，
+**预算（唯一来源 = `appD.part` 的常量）**：单次附件解析最多 `ATT_IMG_MAX_IMAGES`(10) 张、**OCR 阶段**总预算 `ATT_OCR_TIMEOUT_MS`(60 s，
 **整次解析共享**、不是每图)；注意它只覆盖 **OCR 阶段** —— 取图调用 `pageImages` / `renderCrops` / `renderPages` 各自另有一次 60 s 超时，
 取图极慢时整条解析的墙钟会超过 60 s。融合后正文超 `ATTACH_TEXT_MAX`(131072 字符) 截断并标 `clipped`。
 达到任一预算**立即停**并如实注记（不等满 60 s 再丢图）；`OCRKit.recognize` 单次调用不可中断（只能 `terminate`）⇒ 超时 / 中止的生效点只在两张之间。
@@ -162,8 +166,9 @@ worker 路径(真实 `OfficeKit`)与主线程参照(注入库体 + 胶水直接�
 
 ## 8. 写入（OfficeWrite）—— docx / pptx 生成与改写
 
-> 本章只记**已实现的事实**。范围 = 方案 `shared/specs/office-tool-plan.md` 的批次 A–D（载荷地基 / docx / pptx / 工具接线）；
-> 批次 F（图表 + 内嵌工作簿）、G（页眉页脚）、H（表格 / 图片 / 套用版式）落地后须回来补本章对应小节。
+> 本章只记**已实现的事实**。范围 = 方案 `shared/specs/office-tool-plan.md` 的批次 A–H（载荷地基 / docx / pptx / 工具接线 /
+> 图表与内嵌工作簿 / 页眉页脚 / 表格·图片·套用版式）；0.2.1 的 docx·pptx 补口（`set_paragraph` / `paragraph_index` / `item_offset` /
+> `set_table_cell` / `slide_index` / `move_slide` / `delete_shape` / `set_geometry` / `add_text_box`）与 xlsx·xls 写路径另见 `CHANGELOG.md` 与 §9，本章不再逐 op 补小节。
 
 **文件与分层**：源码 `src/officewrite.src.js`（IIFE，ES5 + `var` + `function`），由 `scripts/make-office-part.js`
 追加为 `src/office.part` 里的**第二个可执行 `<script>` 块**（现盘块结构 = 5 个 `text/plain` 载荷 + 可执行 OfficeKit + 可执行 OfficeWrite = 7 块）。
@@ -224,7 +229,7 @@ opts  = { signal: AbortSignal, onProgress: fn }
   （`toolPermOf` 回落 `defaultPerm` ⇒ `activeTools()` 对 `deny` 直接跳过 ⇒ 请求体 `tools[]` 不含 `Office`），
   但设置 → MCP 工具的「文件」组**默认态就显示这一行**（组标题计数由运行时的 `g.list.length` 得出）。
 - `CAP.office = !!(OfficeKit.available && OfficeWrite.available)`：office 载荷缺失时整条工具自动隐藏。
-- 参数判据的唯一出口 = `officeSpecCheck()`（13 项 operation → 后缀 × `file_type` → 按 `file_type` 选表逐参数 →
+- 参数判据的唯一出口 = `officeSpecCheck()`（现行 **28 项** operation —— docx 12 / pptx 17 / xlsx 11 / xls 4，逐格式 scope 见 §9.1 → 后缀 × `file_type` → 按 `file_type` 选表逐参数 →
   必填 → 值域 → 文件类型绑定（pptx 传 `header` 一类 ⇒ `EINVAL` 点名句）→ 交叉一致性（`chart.series[].values` 长度 ==
   `categories` 长度、`table.rows` 各行列数一致）→ `image_path` 后缀 / 存在性 / 大小）。**失败一律 `EINVAL` + 点名句，不碰工作区**；
   `properties.page` 不在 schema 内（v1.3 已移出 v1）⇒ 按"未知字段"报 `EINVAL`。
@@ -237,6 +242,105 @@ opts  = { signal: AbortSignal, onProgress: fn }
 `validatePackage` 四条注入负例、**真实 PowerPoint COM** 双向复现（正名能开 / 只改回错名 `0x80070570` / 修前件打不开而仅改名即能开）。
 读数与脚本存档在 `shared/tmp/office-tool/{a,b,c,d}/`（临时装置，按方案 `E` 批收口）；逐批摘要见 `shared/progress/office-tool-*-done.md`。
 
-**边界（未做，别当已验）**：批次 F/G/H 的五个 operation（`add_table` / `add_image` / `add_chart` / `set_header_footer` / `apply_layout`）
-只有 schema 与参数判据，**载荷未实现**（调用返回 `EINVAL` 并说明）；docx 侧未走 COM；改变既有图表数据 / 批注 / 公式 / 智能艺术 / 宏 / 加密文档 /
+**边界面（「本章未补小节」≠「未实现」）**：批次 F/G/H 的五个 operation（`add_table` / `add_image` / `add_chart` / `set_header_footer` / `apply_layout`）
+**已实现并过审（0.2.0 起）** —— `officeRun` 分派与 `OFFICE_SCOPE` 都在位，本章只是没为它们逐 op 补小节（细节见 `CHANGELOG.md` 与各自批次报告）。**真正未做**：**Word / PowerPoint COM 不可用**（本机 Word 的 `AddChart2` / `SaveAs2` 会挂起、PowerPoint COM 不可用）⇒ docx / pptx 写 op 的产物未在 Word / PowerPoint 里打开复核；docx 侧未走 COM；改变既有图表数据 / 批注 / 公式 / 智能艺术 / 宏 / 加密文档 /
 老格式（`.doc`·`.ppt`）写回一律不支持；`normal` / `minimal` 两档的页内验收与 Thorium M122（Win7）真机未实测（分发目标，待目标机复跑装置）。
+
+## 9. xlsx / xls 写路径（Excel 外科编辑与值级重写）
+
+> 本章只记**已实现的事实**（X1-a…X2-b 五批，各批 PASS 后入账）；docx / pptx 写路径见 §8，读路径见 §6 / §7。
+> 分层：载荷仍是 `src/officewrite.src.js`（= `src/office.part` 的第二个可执行块，见 §8「文件与分层」），本章只补 Excel 侧。
+
+### 9.1 能力面（工具 `Office` 的 xlsx / xls scope）
+
+- **xlsx 恰 11 项**：`create` / `outline` / `set_cell` / `set_range` / `add_sheet` / `rename_sheet` / `delete_sheet` / `move_sheet` / `insert_rows` / `delete_rows` / `set_properties`。
+  `set_cell` 用 `address` + `value` / `formula`（二选一）/ `value_type` / `number_format`；`set_range` 用 `range` + `rows`；**`rename_sheet` / `delete_sheet` / `move_sheet` 强制点名 `sheet`**（不给就默认第一张的误伤面太大）；`insert_rows` / `delete_rows` 用 `at` + `count`；`outline` 用 `cell_offset` 分页（不是 docx / pptx 的 `item_offset`）。
+- **xls 恰 4 项**：`create` / `set_cell` / `set_range` / `convert`。**`outline` 已撤下**（BIFF 没有"工作表摘要"这条读语义，列了就是"工具面放行、载荷恒拒"的说谎面）⇒ 读 `.xls` 内容统一走 `ReadOffice`（grid 视图能读）。
+- 上限（`OfficeWrite.limits`，与 `make-office-part.js` 断言面同值）：单文件 20 MB、表数 ≤ 20、每表 ≤ 200 行 × 30 列（create / set_range 面）；xls 另有**双闸**（§9.3）。
+- 工具层与载荷层的分工：参数判据（键集合 / 必填 / 类型 / 值域 / 后缀与 `file_type` 一致）在工具面 `officeSpecCheck`；**数值与语义规则（地址、表名、格式串、引用同步）的唯一实现在载荷**，工具面不写第二份。
+
+### 9.2 xlsx 外科编辑：机制与保证面
+
+- 编辑一律「全量解包 → 只改被点名的部件 → 重压」；**未点名的 zip 条目逐字节保留**。判据 = 解包后**逐条目内容** 100% 相等，且"预期被改部件集"**每用例运行期现算**（普通值 = 目标 sheet；`formula` = + `xl/workbook.xml`；`number_format` = + `xl/styles.xml`；增 / 删 / 改名 / 移表 = + `xl/workbook.xml` / `xl/_rels/workbook.xml.rels` / `[Content_Types].xml` 等）。
+- **`insert_rows` / `delete_rows`**：只动目标表部件的两处机械量 —— 每个 `<row>` / `<c>` 的 `r` 属性 + `dimension@ref`；行的属性（`ht` / `customHeight` / `s` / `spans`）随元素一起走。`dimension` 口径：insert 只扩不缩（与原 ref 取并集）、delete 允许收缩、整表无格时落 `"A1"`。**引用（公式文本 / 条件格式 / 数据验证 / 合并区 / 超链接 / 表对象）一律不重写** ⇒ 成功体**恒带**告知（R-X2 的"确定发生"）；`insert ×n` 后 `delete ×n` 同数可逐字节回到原部件（位移是可逆的纯机械变换）。
+- **`number_format`**：三路解析（界面名别名 → 内建格式串 → 受控自定义 ≤ 64 字符）；内建两路**不落 `numFmts`**；自定义走 `numFmts`（同 code **复用**、新 id ≥ 164）且 `cellXfs` 同 `numFmtId` 复用（**不新增 xf** —— 每次新建 xf 会让用户文件的样式表无限膨胀）；显式格式**优先于** `value_type:date` 的默认 numFmt 14；替换既有 `s` 如实进 `warnings`；非法格式拒（`EINVAL`）—— 格式串是写进产物 XML 的**外部输入**，不收口会被 Excel 判"修复"。
+- **`move_sheet`**：重排 `<sheets>`；**表身份不动**（`sheetId` / `r:id` / 部件 / rels / CT 全不变，包内只改 `xl/workbook.xml`）；`definedNames/@localSheetId` 与 `bookViews/@activeTab` 是**表序号** ⇒ 按同一置换重映射（不重映射 = 命名区域静默改挂）；`xl/calcChain.xml` 的表序号**未重写 ⇒ 如实进 `warnings`**。
+- 写"只有公式没有缓存值"的格会置 `calcPr@fullCalcOnLoad="1"`（仅当原文件没有该属性）让 Excel 自己重算；合并区非左上角、表名非法 / 重名、删到没有可见表、`at` / `count` 非法或越界等一律拒绝并点名。
+- 校验：`validateXlsx` 自检 + Excel COM 接受（只读打开无修复提示 + 逐格相符；真值件含 `definedNames` / `calcChain` / `activeTab` / 多表 / 一个表级名字与打印区域）。
+
+### 9.3 xls 路线：值级重写、损失清单与双闸
+
+**读选项固定** `{type:"array", cellStyles:true, cellNF:true}` —— `cellStyles` 才让 SheetJS 读出列宽（`!cols`），默认读法（`!cols === undefined`）重写即丢。SheetJS 经 **CJS 垫片 + 影子 `window` / `self` / `global`** 装载（`sheetjsOf()`）：正常路径 `typeof window.XLSX === "undefined"` ∧ `typeof window.fflate === "undefined"`（全程三处采样）。
+
+**损失清单（成功体 `warnings` 恒带；措辞边界 = 实测，不写没量过的话）**：
+
+- **公式未保留** —— BIFF 写出面不含 `f`（`B4=SUM(B2:B3)` 重写后只剩缓存值 `v=15.5`；**没有缓存值的公式格会整格消失**）；写公式**直接拒**（`ENOTSUP`，请写结果值）。
+- **样式 / 行高未保留** —— 字体 / 填充 / 边框 / 对齐读得出、落不下去（`!rows` 写读 = `undefined`）。
+- **内嵌对象不复制** —— 图表 / 图片 / 批注 / 透视表等（重写只带 SheetJS 的值层模型）。
+- **文档属性（标题 / 作者等）不保留** —— 写出前清 `Props` / `Custprops`（见下"Excel 拒开"）。
+- **保留项（实测）**：值（含中文、空格敏感串）/ 数字格式（日期 `z` 与显示值原样）/ 列宽 / 合并单元格。
+- `convert`（xls→xlsx）另有自己的口径：值 / 公式 / 日期格式 / 合并 / 列宽全在，样式、行高、内嵌对象不在；产出是**新文件**（原 `.xls` 不动，同名 `.xlsx` 已存在报 `EEXIST`）。
+
+**双闸（为什么按格数设闸）**：
+
+- 内存的真正驱动量是**格数**而非字节（实测最坏 **≈ 1.2 KB/格**；Excel 真 BIFF8 的密度跨度约 **6–26 B/格** —— 23 件真值件实测）⇒ 只按字节设闸在 2 MiB 附近**天生对不齐**：旧的 2 MiB 单闸内实测到 **217.8 / 224.8 / 239.7 MB** 三件反例（宽表形态）。
+- 现口径 = 双闸：`maxLegacyXlsBytes = 1,572,864`（**1.5 MiB 输入尺寸粗闸**：读相位与全流程时间上界 —— 最坏形态 1.5 MiB 读 ≈ 85 MB / 0.4 s）+ `maxLegacyXlsCells = 150,000`（**内存对齐闸**：读盘后按实际格数判 —— 15 万格 × 1.2 KB ≈ 181 MB，留 ~10% 余量）。两条闸都在 `xlsBookOf()` 里、create / set_cell / set_range / convert 全部经它（无旁路）；超任一闸 ⇒ `E2BIG` + 引导「先在 Excel / WPS 里另存为 `.xlsx`」。
+- 读数（23 件真值件，含宽表 / 密集 / 字符串三种形态）：**双闸内最坏 163.9 MB / 432 ms**（审查者独立复测同件 163.7 MB）；超阈值件（605 MB / 995 MB 两件 ≥5 MB）**全在闸外**；首次 xls 操作含 SheetJS 懒加载 ≈ 47–77 ms。
+- **代价（如实登记）**：尺寸粗闸会拒掉一部分内存上安全的件（如 2.09 MB / 8 万格 / 实测 143.9 MB）。优化项 = 读前扫 BIFF `DIMENSIONS` 记录、把拒绝提前到读盘前（**未做**）。
+
+**两处"值级回读看不见"的真缺陷（X2-a 抓到；均已修 + 成为常规判据）**：
+
+1. `x.write(wb, {bookType:"xls", type:"array"})` 在 SheetJS 0.20.3 回的是 **ArrayBuffer**（node 与浏览器同）⇒ 取不到 `length`、写出为空 ⇒ create / set_cell / set_range / convert 全挂。收口 = `xlsBytesOf()`（Uint8Array / Node Buffer / 带 `byteLength` 的视图三种形态）。
+2. **带任何文档属性的 BIFF8 会被 Excel 16.0 的"文件验证"拒开**（"Office 检测到此文件存在一个问题…不能打开此文件"；最小对照：全新小簿 + 任一属性（Title / Author / Company / 字符串日期）即拒，`Props={}` 或 `undefined` 即开）。而 **BIFF8 的 read 恒把 SummaryInformation 填进 `wb.Props`（且 `Props === Custprops` 同一对象）** ⇒ **所有"读→改→写"的 .xls 在 Excel 里都打不开**；SheetJS 自己能读回 ⇒ **值级回读判据天然看不见**。修法 = 写出前清 `wb.Props` / `wb.Custprops`（`xlsWriteBook()`）。两面守护：`make-office-part.js` **检测 12c**（**顺序**断言：清属性语句必须出现在 `x.write(wb, {bookType:"xls"` **之前**）+ 套件判据 **X2**（产物字节里 `\u0005SummaryInformation` / `\u0005DocumentSummaryInformation` **都不出现**，且先断言输入件带这两条流 ⇒ 判据非空转）。
+
+**回归纪律**：凡改到 xls 写出面（`xlsWriteBook` / `xlsBytesOf` / 损失文案）的批次**必须**跑一次 Excel COM 只读抽验（正例 = 逐格读数与工具自报一致）；**且必须在批末按 PID 复核并清理 `EXCEL.EXE`** —— 实测即使 `Quit` + `ReleaseComObject` 都执行了，进程仍可能滞留（不能只依赖脚本内的释放）。
+
+### 9.4 未覆盖边界（不得当已验证）
+
+- **真模型工具调用链未跑**：没有发起过一次真模型的 `Office` 调用；"模型侧可达"= `enum` / `OFFICE_SCOPE` / 文案逐条读回 + `officeSpecCheck` **运行期**收 / 拒读数 + **执行级 `officeToolRun`**（真工具实现 × 内存工作区）。
+- **只测本机 Excel 16.0**：其它 Office 版本 / LibreOffice / WPS 对 SheetJS xls 的接受度未验；`.xlsm` / `.xlsb` / ODS 与 xls 批注读面未涉及。
+- `number_format` 在 Excel 里的**显示值**渲染核对（断言只到 `numFmtId` / `formatCode` / 格上的 `s` 指向）；`move_sheet` / `insert_rows` 的 COM 接受度；合并区 / CF / DV 在位移后的语义正确性（只保证"如实告知未重写"，不保证 Excel 侧的最终解释）。
+- **Word / PowerPoint COM 不可用**（本机无 PowerPoint COM）：pptx 的 `move_slide` 顺序、`add_slide@k` 落点、段级 `set_paragraph` 在真 PowerPoint 里的观感未实测；docx 产物未用 Word 打开（域 / 修订 / 内容控件包裹的段只验"文本被换 + warning 如实"）。
+- `full` / `normal` 两档的浏览器真机未跑（沿用既有口径只验 `minimal` 档）；Win7 本体未测。
+
+## 10. docx 渲染页图（S7 批：docx-preview + jszip + modern-screenshot）
+
+> 本章只记**已实现的事实**（b31-S7 批；三档产物均在 `src/render.part` 内联三库）。读路径总览见 §6/§7，写路径见 §8。
+
+### 10.1 库、生成链与加载约束
+
+- **三库**（`vendor/render-src/MANIFEST.json` 锁定字节 / sha256 / tgz 哈希）：[docx-preview](https://github.com/VolodymyrBaydalka/docxjs) 0.4.0（Apache-2.0）· [jszip](https://github.com/Stuk/jszip) 3.10.2（双许可，**采 MIT 支**）· [modern-screenshot](https://github.com/qq15725/modern-screenshot) 4.7.0（MIT，dist 无许可头 = 上游事实）。生成 = `node scripts/make-render-part.js`（断言 1–12 + `--verify` + 幂等；主机白名单并集恰 8 个）；产物 `src/render.part` ≈ **203,364 B**（4 个可执行块：jszip → docx-preview → modern-screenshot → `window.RenderKit`），由 `build.js` 拼在 **office 之后、pyodide 之前**；缺件 ⇒ 警告 + 跳过（能力表自动 false，走既有降级文案）。
+- **加载顺序硬约束**：docx-preview 的 UMD 在**加载时**读 `globalThis.JSZip` ⇒ jszip 必须在前（`render.part` 块序即依赖序）。
+- **OPTIONS 钉死**（parse 与 render 传同一对象）：`useBase64URL:true`（图 / 内嵌字体全 `data:` URL，无 `blob:` 路径）· **`renderAltChunks:false`**（斩断 altChunk 的 `<iframe srcdoc>` 取网面）· **`ignoreLastRenderedPageBreak:false`**（按 Word 存的 `<w:lastRenderedPageBreak/>` 分页 —— 贴 Word 页数的关键一项）· `breakPages:true` / `renderHeaders/Footers:true` / `inWrapper:true` 等。
+- **资源守卫 = wrap 三方法（值级阻断；唯一有效层）**：把 `doc.loadDocumentImage` / `loadNumberingImage` / `loadFont` 三个装载口一并包装，原实现返回空或抛错时改返回 1×1 透明 GIF 的 `data:` 哨兵，计数 `{img,numbering,font,errors}`。**为什么必须是值级**：缺失部件 ⇒ 三方法返回 `null`，而 `null` 被赋给 `img.src` / 拼进 CSS `url()` 的**那一刻**就发起加载尝试 —— 晚挂载、拆 parse+render、事后属性守卫**都拦不住**（对照实验：晚挂载 = 1 次、去 wrap = 1 次、只包 `loadDocumentImage` 而漏 numbering/font ⇒ 0→2 次；三方法 wrap = 0 次）。游离态资源清洗是**两层 + 两个计数**（防御纵深）：**属性面**（`src/srcset/poster/data/xlink:href` + 非 `<a>/<area>` 的 `href` 中和，`<a href>` 豁免）+ **样式文本面**（`<style>` 文本里的 `url(http(s)://…)` → `url(about:blocked#)`）；计数 `clean = {attr, styleUrl}` 随渲染结果返回，**正常输入下应为 0、非 0 进 `notes`**。样式文本面**当前不可由真实 docx 触达**（三库 CSS `url()` 发射点只有 `@font-face` 与 numbering 变量两处，均已被 wrap 值级截住）⇒ 用**合成节点实验**验证其承重：合入一条会命中的 `<style>url(http…)` 规则，不中和 ⇒ 请求真的发起（nonDoc=1）、中和 ⇒ 0 请求 + `clean.styleUrl=1`（修正轮 `styleurl`/`styleurln` 两变体）。
+- **挂载 = 双容器（`host` + `styleHost` 两个都挂）**：`renderDocument` 的产物里 `<style>` 进 `styleHost`、其余进 `host`，两者都 `appendChild(document.body)` 后才开始布局；**只挂 `host` ⇒ `<style>` 不生效 ⇒ 页盒 794×1123 变 1034×1315、页图全变**（`file://` 实测，批内咬合对）。宿主用后即删（成功 / 失败 / 超时三条路径）。
+- **零请求审计口径**：`file://` + CDP `Network.requestWillBeSent` 全量计数 ⇒「**外部主机请求 = 0 ∧ 非主文档请求 = 0**」（主文档自身、`data:`/`blob:` 不计）。产品级真机复跑（Thorium 122 非 headless，附着 + 渲染全程）实测 = 0；对照注入（去 wrap / 漏一个装载口）必红。
+
+### 10.2 参数与闸门（与 PDF 图片档同口径 + 附加闸）
+
+- 光栅化：`modern-screenshot.domToCanvas(section, {scale: dpi/96, backgroundColor:"#fff"})` ⇒ A4@150 DPI = **1240×1753**（与 PDF 侧 1240×1754 差 1 px = docx-preview 的 cm→px 取整，参数逐项同源）；JPEG **q0.86 首选档**；页数 ≤ `pdfMaxPages()`；超限 ⇒ `clipped=true` + 注记「文档共 N 页,按页数上限仅渲染前 M 页」。
+- **附加闸门**：每张过 `attCanvasFitForModel(cv, "image/jpeg", 0.86, {maxEdge: Math.min(2000, imgMaxSide())})`（单张 **1 MiB 硬顶** + 最长边 ≤ `min(2000, imgMaxSide())`）。超硬顶 / 单页抛错 ⇒ 该页不发 + 注记（不静默）。DPI=300 边界实测：2830×4000 原生画布经闸门降为 **1414×2000 / 48,738 B** 交付。
+- **空页守卫**：出图后按原生分辨率步长 8 抽样算 `inkRatio`；`=== 0` 且该 section 有非空文本 ⇒ 跳过该页 + 注记「第 N 页渲染为空,已跳过」（防 SVG foreignObject 路线的静默空白）。
+- 预算：整体 `Promise.race` 上限 **60 s**（超时 ⇒ `ok:false` + 中文 error；在跑的渲染无法中止，属已知取舍）· 挂载后等 `<img>` 解码上限 **5 s**（超时继续，不失败）。
+- **外部引用 / 占位注记（来源可信 = 解析层 rels）**：外部图引用 N ⇒ 「文档含 N 个外部引用(未随文档打包),已按离线模式忽略」；`wrap.img > N` ⇒ 「另有 M 张图片…按空白占位」；`wrap.numbering/font > 0`、altChunk 条数 A 各有一条对应注记；第 1 条同时以 toast 呈现一次，全文进 `att.degraded`。
+
+### 10.3 接线与失败回退（`src/appD.part`）
+
+- **唯一渲染出口** `attachRenderPageImages(f, ext, buf, opts)`（`ext` 非 `"docx"` / 库不在位 ⇒ `{ok:false, error:"渲染器未内嵌"}`，不抛；永不 reject）。`resolveOffice` 里以**前置链判别**接入：`isDocxImg = (pre.send==="image" && pre.render==="pages" && sub==="docx")` ⇒ 渲染成功 ⇒ 直接产出图片档 `att`（`mode:"image"` / `renderSrc:"pages"` / `text:""` —— **只发页图、不带正文，与 PDF 图片档同形**）；失败 ⇒ 既有链照走。
+- **渲染失败两支注记必须落在「共同出口」**（O6 块之后再补，不许依赖 O6 块）：`cap="pages"` 时 `pre.images==="send"` ⇒ 内嵌图在 O6 复查**之前**就已落进 `images` ⇒ `!images.length` 恒假 ⇒ **O6 块根本不进**（批内实测出来的静默面）。两支 = 有内嵌图 ⇒ 「本机渲染失败(…),已改用「混合」:发送文档内嵌图」+ toast；无内嵌图 + 有正文 ⇒ 「…已改用「纯文本」:只发送文字」+ toast。
+- 能力表：`ATT_DOCX_RENDER_READY`（唯一开关，S7 起 = `true`）∧ `docxRenderReady()`（`window.RenderKit.available === true`）⇒ `attachRenderCap("office","docx") === "pages"`；库缺失 / 开关翻回 ⇒ `false` + 既有 `toastNoRender` 文案（「文档暂不支持图片档(本机没有可信的离线渲染器):已改用「…」」）。
+- 展示：chip 相位新增 `rendering: "渲染页面…"`；环境面板 `pdfEngineLine()` 追加「· 文档渲染器:docx-preview 0.4.0」；档位 desc 与页数 hint 已改准（`head.part` 两处 + `appD` 档位 desc）。
+- **非视觉 / 混合档 / 工具侧不变**：`vision=false` ⇒ `pre.send!=="image"` ⇒ 不渲染（走内嵌图 OCR 融合腿，实测 `ocrImgs=2` / 无页图）；混合档（默认）仍 `renderSrc="embedded"`（内嵌图，逐字节回归）；`ReadOffice`/`Read` 不吃档位、不进此路径。
+
+### 10.4 批内读数（真机 Thorium `122.0.6261.171` 非 headless / `file://`；证据 = `shared/tmp/b31-s7/{out/r1,out/r1-chrome,out/r2,prod/out/r4,prod/out/r6}`，批末归档到 `shared/archive/b31-s7-evidence-2026-09-19/`）
+
+- **烟测门（装置臂）**：f-batch 强夹具（4 节 = 硬分页 ×2 + LRPB ×1；表格 / CJK / 页眉脚 / 纯图页 / 图片项目符号 / 内嵌字体 / altChunk 三面全中）⇒ 页盒 794×1123、canvas 1240×1753、`taint ok`、每页 ink ≥0.0019、**非主文档请求 = 0**、无异常；三组咬合对（wrap 有无 0↔1 / 双挂载 794×1123↔1034×1315 / 字体面 wrap 全 vs 漏 0↔2）在 Thorium 122 与 Chrome 153 双臂一致复现。
+- **产品级（探针副本）**：docx + 图片档 + 视觉 ⇒ `mode=image / renderSrc=pages / imgs=4 / pages=4 / textChars=0`；页图 4×1240×1753 / **28.0–38.7 KB**；请求部件形状 `IIII`（四张页图，无正文部件）；chip 相位含「渲染页面…」；**逐页保真自证**（对交付页图 OCR）：页 1/2/3 的暗号 `AZUSA-P1/P2/P3` 各现在本页（conf 86–94），交换页文本 ⇒ 判据必红；页 4 只剩页眉页脚文本、无正文暗号。
+- **负例（批内实跑）**：开关翻回 false / `RenderKit.available=false` ⇒ `toastNoRender` 文案逐字；渲染失败 + 有内嵌图 ⇒ 回退「混合」+ 注记（**修复前实测静默 ⇒ 已修**）；渲染失败 + 无内嵌图 + 有正文 ⇒ 回退「纯文本」+ 注记；`maxPages:1` ⇒ 截断注记 + 1 张；非视觉 ⇒ 不渲染页图（走内嵌图 OCR）。
+
+### 10.5 未覆盖边界（不得当已验证）
+
+- 超大 / 复杂真文档（页数 ≫ 上限、巨量表格、内嵌字体实件）的耗时与保真**未实测**；DPI=300 只取到「页 1 / maxPages=1」的闸门读数（全页全 DPI 的批量读数未做）。
+- **Word 逐页对照未做**：保真判据 = 逐页暗号 OCR + 像素统计（非 Word COM 另存 PDF 的像素比对）；分页只保证「硬分页 / LRPB / 节变更 + 本库排版」，与 Word 的自动分页可能不一致（UI 已如实注明）。
+- CJK 字体缺口（系统缺字时回退）与内嵌字体实件的观感差异未验；`file://` 下已验证（`taint` 不抛 / `data:` 链），Win7 本体未测（分发目标声明，验收走用户侧清单）。
+- 产品级读数只在 `minimal` 档的探针副本上取（三档同码；`full`/`normal` 未真机）。

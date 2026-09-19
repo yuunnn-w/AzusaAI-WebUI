@@ -9,13 +9,13 @@
    说明:页面不对外暴露任何接口(window / postMessage / BroadcastChannel / HTTP 都没有),
    只有设置页与页面自身的代码能配置它,只有对话里的模型能触发调用。
    ============================================================================ */
-var TOOL_TURN = { used: 0 };
-var TOOL_WAITS = {};
+var TOOL_TURN = { used: 0 };     /* 非生成路径(页面级直接调用)的退回计数器;生成路径一律用 GEN[id].turn */
+var TOOL_WAITS = {};             /* msgId → { convId, resolve }:按消息定位、带会话归属 */
 var TOOL_LOG = [];
 var TOOL_LOG_MAX = 100;
-/* 工具 run(args, ctx) 的统一签名里 ctx.signal 取「生成中请求的 abortCtrl.signal」;
-   不在生成中的路径没有 abortCtrl,给一个永不 abort 的等价物,免得每个工具都要写
-   `ctx && ctx.signal && ...` 的层层判空 */
+/* 工具 run(args, ctx) 的统一签名里 ctx.signal 取「生成中那次请求的中断器信号」
+   (GEN[convId].ctrl;创建点在 genNew);不在生成中的路径没有 ctrl,给一个永不 abort 的
+   等价物,免得每个工具都要写 `ctx && ctx.signal && ...` 的层层判空 */
 var NO_ABORT_SIGNAL = {
   aborted: false,
   reason: undefined,
@@ -24,8 +24,25 @@ var NO_ABORT_SIGNAL = {
   throwIfAborted: function () {}
 };
 
-function toolBeginTurn() { TOOL_TURN.used = 0; }
-function toolTurnCount() { return TOOL_TURN.used; }
+/* 该会话本轮的调用计数(记录存在时用记录的;非生成路径退回模块级计数器,保持既有语义可用) */
+function turnOf(convId) {
+  var g = genOf(convId);
+  return g ? g.turn : TOOL_TURN;
+}
+function toolBeginTurn(convId) { turnOf(convId).used = 0; }
+/* 视图读数 = 当前会话的本轮计数(状态栏 / 调节浮层共用) */
+function toolTurnCount() { var g = genCur(); return g ? g.turn.used : 0; }
+/* 各等待表的按会话计数(徽标诊断与缓冲 hint 的视图口径) */
+function waitsCountOf(convId, kind) {
+  var table = (kind === "ask") ? ASK_WAITS : TOOL_WAITS;
+  var n = 0, k;
+  for (k in table) {
+    if (!Object.prototype.hasOwnProperty.call(table, k)) continue;
+    var r = table[k];
+    if (r && r.convId === convId) n++;
+  }
+  return n;
+}
 function toolLimit(key) {
   var l = state.settings.toolLimits || {};
   var d = { timeoutMs: 600000, maxCalls: 50, maxOut: 16384 };
@@ -167,14 +184,16 @@ var AGENT_TOOLS = [
       additionalProperties: false
     },
     annotations: { readOnlyHint: true, destructiveHint: false, requiresNetwork: true },
-    run: function (args) {
+    run: function (args, ctx) {
       var code = String((args && args.code) || "");
       code = code
         .split("```javascript").join("")
         .split("```js").join("")
         .split("```").join("");
       if (!code.trim()) return { ok: false, error: "code 为空", logs: [], ms: 0 };
-      return runJsInSandbox(code, { timeoutMs: toolLimit("timeoutMs") });
+      /* conv 必须带给沙箱 entry:abortGen → killSandboxesOf(convId) 是"停止生成立即销毁沙箱"的
+         唯一路径(entry.convId 为空会让它永不命中 ⇒ 沙箱跑到自身超时) */
+      return runJsInSandbox(code, { timeoutMs: toolLimit("timeoutMs"), conv: ctxConv(ctx) });
     }
   },
   /* ---- 以下 8 个是「工作区(沙箱虚拟盘)」文件工具 ----
@@ -234,6 +253,7 @@ var AGENT_TOOLS = [
       "- 文档里的图片:`image_offset` 给出第几张(1 起,按文档顺序)、`n_images` 给一次几张(默认 4,上限 12);给出 `image_offset` 时只回图片不回正文。模型支持图像时直接把图交给你,不支持时自动改用本机 OCR 只回文本。",
       "- 返回末尾状态行:`[file 路径 · 格式 · 共 N 页/表 · 本次 第 a-b 页 · total 总行数 · shown 显示范围 · eof 是否到末尾 · size 字节数 · mtime 修改时间 · next 续读参数]`;图片视图的状态行以「图片 共 N 张 · 本次 第 a-b 张」开头。",
       "- 只读文本文件用 Read;要改文件用 Edit;要看目录用 Glob;要按内容找位置用 Grep。",
+      "- xlsx / xls **默认走地址视图(grid)**:逐表一段,段头 `# 表名  (范围 A1:C3 · 3 行 x 3 列 · 单元格 7 · 合并 A1:B1)`,随后一格一行 `地址<TAB>值`。值里的制表符 / 换行 / 反斜杠写成 `\\t` `\\n` `\\\\`(所以一行永远等于一格);带非 General 数字格式的格会追加第三段 `{z=格式, v=机器值}`(日期拿 `v` 的序列号就能精确回写);公式格显示 `=公式原文`(覆盖它会丢公式)。这套地址与 `Office` 的 `set_cell` / `set_range` **完全同名** —— 读到哪就能改到哪。想整表快速通读可显式给 `sheet_view:\"csv\"`。",
       "- 读不到的部分:超过本工具的单文件上限时,状态行会写明「仅前 N 字符 / 仅前 N 页」——那是文件的硬边界(不要用 ExecutePython 去拆它),如实告诉用户即可。"
     ].join("\n"),
     defaultPerm: "allow",
@@ -246,6 +266,7 @@ var AGENT_TOOLS = [
         line_offset: { type: "integer", description: "全局行游标(1 起;负数表示从文档末尾倒数);给出 page_offset 时不得同时给出" },
         n_lines: { type: "integer", minimum: 1, description: "最多返回多少行;省略表示读到本次覆盖范围的末尾" },
         max_chars: { type: "integer", minimum: 1, maximum: 65536, description: "本次返回的最大字符数(默认取本次可用预算的上限,不超过 65536)" },
+        sheet_view: { type: "string", enum: ["grid", "csv"], description: "xlsx / xls 的读视图:grid = 一格一行「地址<TAB>值」(默认;地址与 Office 的 set_cell / set_range 完全同名,可精确回写)、csv = 整表 CSV(快速通读)。别的格式给出本字段会报错" },
         column_offset: { type: "integer", minimum: 0, description: "正向读时从首个返回行的第几个字符开始(续读被截断的超长行);给出 page_offset 或负数 line_offset 时报错" },
         image_offset: { type: "integer", minimum: 1, description: "图片视图:要读的第几张图(1 起,按文档顺序);给出它就只返回图片(或 OCR 文本),不返回正文" },
         n_images: { type: "integer", minimum: 1, description: "图片视图一次最多交付几张(默认 4,上限 12)" }
@@ -451,27 +472,36 @@ var AGENT_TOOLS = [
   },
   {
     name: "Office",
-    title: "生成与编辑办公文档",
+    title: "生成与编辑办公文档(Word / Excel / PowerPoint)",
     scope: "write",
     icon: "file",
     cap: "office",
-    desc: "在工作区里新建或修改 docx / pptx 文件(Word 文档与 PowerPoint 演示文稿)。只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。生成用 `operation=create`(不覆盖已存在的文件);改文字 / 段落 / 幻灯用 `replace_text` / `append` / `add_slide` / `set_text` / `delete`;插表格 / 图片 / 图表、设页眉页脚、给幻灯套版式分别用 `add_table` / `add_image` / `add_chart` / `set_header_footer` / `apply_layout` —— 只改被点名的内容,其余部件(既有图片、图表、主题、母版等)逐字节原样保留。",
+    desc: "在工作区里新建或修改 docx / xlsx / pptx / xls 文件(Word 文档、Excel 工作簿与 PowerPoint 演示文稿)。只能访问本会话挂载的工作区(虚拟盘),不能访问你的磁盘。生成用 `operation=create`(不覆盖已存在的文件);改文字 / 段落 / 幻灯用 `replace_text` / `append` / `set_paragraph` / `set_table_cell` / `add_slide` / `move_slide` / `set_text` / `delete` / `delete_shape` / `set_geometry` / `add_text_box`;改 Excel 表格按地址写用 `set_cell` / `set_range`(可带 `number_format` 设数字格式),插行 / 删行用 `insert_rows` / `delete_rows`,增删改名 / 移表用 `add_sheet` / `rename_sheet` / `delete_sheet` / `move_sheet`;插表格 / 图片 / 图表、设页眉页脚、给幻灯套版式分别用 `add_table` / `add_image` / `add_chart` / `set_header_footer` / `apply_layout` —— 只改被点名的内容,其余部件(既有图片、图表、主题、母版、工作表的其它区域等)逐字节原样保留;`.xls`(旧二进制)只能按值级改(`create` / `set_cell` / `set_range` / `convert`),公式与样式不保留(见描述)。",
     modelDesc: [
-      "在工作区里新建或修改 docx / pptx 文件(Word 文档 / PowerPoint 演示文稿);不能访问你的磁盘。",
+      "在工作区里新建或修改 docx / xlsx / pptx / xls 文件(Word 文档 / Excel 工作簿 / PowerPoint 演示文稿);不能访问你的磁盘。",
       WS_PATH_DUAL_NOTE,
       "",
-      "- 三种意图请分清:要看内容用 `Read` / `ReadOffice`;要全新生成用 `operation=create`;要改已有文件用 `replace_text` / `append` / `add_slide` / `set_text` / `delete` / `set_properties`。",
-      "- 关键参数:`operation` 与 `path` 必填(路径以 `/` 开头);`file_type` = `docx` | `pptx`(`create` 必填,编辑时省略则按扩展名推断);**`create` 不覆盖已存在的文件**(报 `EEXIST`,要替换请先换名字或先 FileOps 删除)。",
-      "- **改已有文件前先 `operation=outline` 拿索引**:docx 给 `paragraphs[...]`(另有 `header` / `footer` 文本与是否多节);pptx 给 `slides[{i,layout,shapes[...]}]` + `layouts[...]`(套版式用的索引);索引 0 起、**任何一次编辑之后都可能变**,改完请重新 outline 再接着改。",
-      "- `create` 的内容格式:docx 用 `content`(支持 `#`/`##`/`###` 标题、普通段落、`-`/`*` 无序列表、`1.` 有序列表、行内 `**加粗**` 与 `*斜体*`);pptx 用 `slides`(每项 `{title, bullets:[...], layout:\"title\"|\"content\"|\"blank\"}`,`layout:\"title\"` 的封面页只填 `title`)。",
+      "- 三种意图请分清:要看内容用 `Read` / `ReadOffice`(xlsx/xls 用 `sheet_view=\"csv\"` 时是整表 CSV,**默认是带地址的 grid 视图** —— 地址与 `set_cell` 同名);要全新生成用 `operation=create`;要改已有文件用 `set_cell` / `set_range` / `replace_text` / `append` / `set_paragraph` / `add_slide` / `set_text` / `delete` / `set_properties`。",
+      "- 关键参数:`operation` 与 `path` 必填(路径以 `/` 开头);`file_type` = `docx` | `xlsx` | `pptx` | `xls`(`create` 必填,编辑时省略则按扩展名推断);**`create` 不覆盖已存在的文件**(报 `EEXIST`,要替换请先换名字或先 FileOps 删除)。",
+      "- **改已有文件前先 `operation=outline` 拿索引**:docx 给 `paragraphs[...]`(另有 `header` / `footer` 文本与是否多节);pptx 给 `slides[{i,part,layout,shapes[...]}]` + `layouts[...]`(套版式用的索引;形状项带 `name` / `ph` / `geom`,幻灯项带 `part` 部件名);**xlsx 给 `sheets[{i,name,dims,rows,cols,cells,formulas,merges,hidden}]`**,带 `sheet` 再 outline 会给出该表的格清单 `{a, t, v, w, z?, f?}`(`cell_offset` 分页);索引 0 起、**任何一次编辑之后都可能变**,改完请重新 outline 再接着改。docx / pptx 的 outline 另可用 `item_offset` 从第几项起读(每页仍 `head_limit` 条,结果带 `item_offset`)与 `text_chars` 调每项文本长度(默认 80,上限 400)。",
+      "- **docx 段落级编辑**(索引取自 outline):`append` 用 `paragraph_index` 把新段落插在该项之后(省略 = 追加到正文末尾),`set_paragraph` + `paragraph_index` + `text` 整段改写该段文字(支持 `**加粗**` / `*斜体*`);`set_paragraph` **保留段属性**(标题级别 / 编号 / 对齐不动),但**段内 run 级格式(字体 / 字号 等)不再保留**(`warnings` 会写明)—— 只想换几个字、要保住原格式请用 `replace_text`。",
+      "- **pptx 幻灯结构编辑**(索引一律取自 outline 的 `items[i].i`):`add_slide` 可带 `slide_index` 把新页**插到第 k 位**(省略 = 末尾;原第 k 页起整体顺移);`move_slide` + `from` / `to` 只重排幻灯顺序(部件名与关系都不动);`delete` 删第 k 张。⚠ **写幻灯一律用 `outline` 给的 `i`(`slide_index`)**:`ReadOffice` 看到的是**按 `slideN.xml` 文件名序号排序**的页码 —— 删页会**跳号**(如「第1页/第3页」)、插页的新页序号最大而落在最末,`slide_index` 则是**演示顺序**(`p:sldIdLst`)位置,**两者不要互相换算**;要对齐请看 `outline` 的 `items[i].part`(如 `ppt/slides/slide3.xml`,文件名里的号就是读侧页码)。",
+      "- **pptx 段落级编辑**:`set_paragraph` + `slide_index` + `paragraph_index`(+ `shape_index`,省略 = 该页第 0 个形状)整段替换该段文字(纯文本);**保留 `a:pPr`**(项目级别 / 缩进不动),一段多 run 时 **run 级格式(字体 / 字号等)不再保留**(`warnings` 会写明)—— 只想换几个字请用 `replace_text`。`outline` 的形状项另给 `name`(形状名)、`ph`(占位符 type / idx)、`geom`(EMU 与像素两套几何)—— **三者缺值一律 `null`**(无名 / 无占位符 / 无 `a:xfrm`)。",
+      "- **docx 表格**:`outline` 的表格项带 `table:{rows,cols}`;`set_table_cell` + `table_index`(**该项在 outline 里的 `i`**,该 `kind` 必须 = `table`)+ `row` / `col`(0 起)+ `text` 写单元格文字(支持 `**加粗**` / `*斜体*`,按 `\\n` 分行成多段)。**含合并单元格(横向 / 纵向)或嵌套表格的表一律拒绝**(`EINVAL` 点名)—— 那类表的行列坐标会歧义,请先在 Word 里拆并;单元格原有 run 级格式不再保留(`w:tcPr` 与首段 `w:pPr` 保留,`warnings` 会写明)。",
+      "- **pptx 形状操作**:`delete_shape` + `slide_index` + `shape_index` 删形状(连带清理**只被它引用**的幻灯关系;删到该页无形状会给警告)·`set_geometry` + `x` / `y` / `cx` / `cy`(单位 **EMU**,与 outline 的 `geom` 同口径;1 px = 9525 EMU)移动 / 缩放该形状(已有旋转 / 镜像不丢)·`add_text_box` + 同一套坐标 + `lines` 在指定页新建自由文本框(`lines` 至少一行)。形状的删 / 改只影响该形状,不动同页其它形状与其它页。",
+      "- **Excel(xlsx)按地址改**:`set_cell` + `address`(如 `B4` 或 `Sheet1!B4`)+ `value` 或 `formula`(二选一,`value:null` = 清空该格);整片写用 `set_range` + `range`(`B2` 或 `B2:D5`)+ `rows`(二维数组,null = 清空该格);`value_type` 可强制 `text` / `number` / `boolean` / `date`(`date` 收 `YYYY-MM-DD`,写成序列号 + 日期格式);`number_format` 设数字格式(别名 `general` / `number` / `currency` / `percent` / `date` / `time` / `datetime`,或内建格式串 `0.00` / `#,##0.00` / `m/d/yy`,或受控自定义格式串);`sheet` 给表名或 `sheet_index`(省略 = 第 0 张;**改名 / 删表 / 移表必须点名**)。新表用 `create` + `sheets:[{name?, rows:[[…]]}]`(每表 ≤200 行 × ≤30 列,单次 ≤20 表),加表用 `add_sheet`,改名用 `rename_sheet` + `new_name`,删表用 `delete_sheet`。",
+      "- **xlsx 的保真承诺**:只改被点名的工作表部件,其余部件(图表、图片、批注、透视表、条件格式、主题、共享字符串)与**其它工作表逐字节保留**;因此**不会重算公式里的引用**(`insert_rows` / `delete_rows` 只位移行号与 dimension:公式 / 条件格式 / 数据验证 / 合并区的引用**都不重写**,`warnings` 会写明)。**插行 / 删行**:`insert_rows` / `at`(从第几行,1 起)/ `count`(默认 1),`delete_rows` 同参;移表用 `move_sheet` + `to`(移到第几位,0 起)。写公式会置工作簿 `fullCalcOnLoad`,`value` 覆盖公式、日期或 `number_format` 替换既有数字格式都会进 `warnings`。",
+      "- **xlsx 删表 / 改名 / 移表的连带影响**:可能动到工作簿级的命名区域 / 打印区域 / 计算链 —— **能安全同步的都同步了**(改名会重写引用文本;删表会把挂在该表上的表级名字一并删掉;移表会按新顺序重映射表序号 `localSheetId` / `activeTab`),**其余逐条列在 `warnings` 里**(含指向被删表的命名区域、成为孤儿的部件、算式链的表序号未重写)—— 请读一遍。`delete_sheet` 不允许删掉最后一张可见表。",
+      "- `create` 的内容格式:docx 用 `content`(支持 `#`/`##`/`###` 标题、普通段落、`-`/`*` 无序列表、`1.` 有序列表、行内 `**加粗**` 与 `*斜体*`);pptx 用 `slides`(每项 `{title, bullets:[...], layout:\"title\"|\"content\"|\"blank\"}`,`layout:\"title\"` 的封面页只填 `title`);xlsx 用 `sheets`(每项 `{name?, rows:[[值,…],…]}`,值可以是字符串 / 数值 / 布尔 / null,表名省略时按 `Sheet1`… 顺排)。",
       "- **插表格**:`add_table` + `table:{rows:[[...],[...]], header:true}`(首行加粗);docx 用 `paragraph_index` 指定插在哪一段之后(省略 = 追加到末尾),pptx 用 `slide_index`(省略 = 最后一页)。",
       "- **插图片**:`add_image` + `image_path`(工作区里的 png / jpeg 路径,先用 Read 或 Glob 确认存在);可选 `image_width_px` / `image_height_px`(只给一边就按原比例缩放,都不给按原尺寸且自动限宽)。",
       "- **插图表**:`add_chart` + `chart:{type:\"bar\"|\"line\"|\"pie\", title, categories:[\"Q1\",\"Q2\",...], series:[{name:\"收入\", values:[100,125,...]}]}`;数值会同时写进图表与**内嵌工作簿**(用户双击图表改数据时能看到同一批数);**只能新增图表,不能改已有图表的数据**。",
       "- **页眉页脚**:`set_header_footer` + `header:{text}` / `footer:{text}`(header 只有 docx 有;pptx 传 header 会报错),pptx 另可 `slide_number:true`;docx 另可 `first_page_different` / `even_odd`。",
       "- **给幻灯套版式**:`apply_layout` + `slide_index` + `layout_index`(取自 outline 的 `layouts[...]`);套用后占位符按新版式重定位,**不会删掉原有文字**。",
-      "- 编辑**只动被点名的内容**:其余 zip 部件(既有图片、图表、内嵌工作簿、主题、母版、页眉页脚)**逐字节原样保留**;因此**不会重排版式、不会改字体字号** —— 那些由文档自己的样式决定。",
-      "- 已知边界:`replace_text` 的 `old_string` 若被拆在多个 run 里,会退化为「整段重写」(该段 run 级格式丢失,结果 `warnings` 里会如实写明);不支持改已有图表的数据 / 批注 / 公式 / 智能艺术 / 宏(`.docm`·`.pptm`)/ 加密文档 / 老格式(`.doc`·`.ppt`,只读不写);图片只收 png 与 jpeg(单张 ≤8 MB)。",
-      "- 结果:`{path,file_type,operation,size,sizeDelta,counts:{...},warnings:[...]}`。**`warnings` 非空请读一遍** —— 它说明有内容走了降级路径(例如\"跨 run 重写,该段格式已丢失\")。",
+      "- 编辑**只动被点名的内容**:其余 zip 部件(既有图片、图表、内嵌工作簿、主题、母版、页眉页脚、以及 xlsx 里没被点名的工作表)**逐字节原样保留**;因此**不会重排版式、不会改字体字号** —— 那些由文档自己的样式决定。",
+      "- 已知边界:`replace_text` 的 `old_string` 若被拆在多个 run 里,会退化为「整段重写」(该段 run 级格式丢失,结果 `warnings` 里会如实写明);不支持改已有图表的数据 / 批注 / 公式 / 智能艺术 / 宏(`.docm`·`.pptm`)/ 加密文档 / 老格式(`.doc`·`.ppt` 仍**只读不写** —— 要改请先在 Word / PowerPoint 里另存为新格式);图片只收 png 与 jpeg(单张 ≤8 MB)。",
+      "- **`.xls`(旧二进制 BIFF)是值级通道**:能读(ReadOffice 的 grid 视图)、能新建、能按地址改、能 `convert` 转成 `.xlsx`;但**改动 = 整包重写** ⇒ **公式与样式不保留**(公式格只剩缓存值,没有缓存值的公式格会整格消失)、图表 / 图片 / 批注 / 透视表等内嵌对象不复制、**文档属性(标题 / 作者等)也不保留**(值 / 数字格式 / 列宽 / 合并单元格按实测保留)——每次成功都会在 `warnings` 里逐条列出,请读一遍。**优先另存为 `.xlsx` 再改**:`convert` 把 `.xls` 转成同名 `.xlsx`(新文件,原 `.xls` 不动;若同名 `.xlsx` 已存在会报 `EEXIST`),之后按 xlsx 的地址改法就是无损的。`.xls` 单文件上限 1.5 MB / 15 万格(超了报 `E2BIG`,引导先另存为 `.xlsx`);`.xls` 写不了公式(报 `ENOTSUP`,用 `value` 写结果值)。",
+      "- 结果:`{path,file_type,operation,size,sizeDelta,counts:{...},changes:[...],warnings:[...]}`(`convert` 另多一段 `source_path` / `source_file_type` / `source_size`,排在 `changes` **之前**)。**xlsx 的 `changes` 逐格给出改动前后摘要**(≤50 条),不必再读一遍就能自证改对了;**`warnings` 恒为结果的最后一个字段**(超预算截断时必然存活)且**非空请读一遍** —— 它说明有内容走了降级路径或被替换(例如\"跨 run 重写,该段格式已丢失\"、\"原本是公式,本次按 value 覆盖\")。",
       "- 写回是**整份替换**(同一次事务内完成,不会留半个文件):文件上限 20 MB;**超过上限的文件本工具无法写入**(请拆分内容或另存为更小的文档)。",
       "- 本工具**默认禁止**——默认态下它**不在你的工具列表里**;需要用的时候请让用户在 设置 → MCP 工具 里把权限改成「询问」或「允许」。"
     ].join("\n"),
@@ -482,12 +512,15 @@ var AGENT_TOOLS = [
         operation: {
           type: "string",
           enum: ["create", "outline", "append", "replace_text", "set_text",
-                 "delete", "add_slide", "set_properties",
-                 "add_table", "add_image", "add_chart", "set_header_footer", "apply_layout"],
-          description: "要执行的操作(见工具描述);docx 支持 create/outline/append/replace_text/delete/set_properties/add_table/add_image/add_chart/set_header_footer,pptx 支持 create/outline/add_slide/replace_text/set_text/delete/set_properties/add_table/add_image/add_chart/set_header_footer/apply_layout"
+                 "delete", "delete_shape", "set_geometry", "add_text_box",
+                 "set_paragraph", "set_table_cell", "add_slide", "move_slide", "set_properties",
+                 "add_table", "add_image", "add_chart", "set_header_footer", "apply_layout",
+                 "set_cell", "set_range", "add_sheet", "rename_sheet", "delete_sheet",
+                 "move_sheet", "insert_rows", "delete_rows", "convert"],
+          description: "要执行的操作(见工具描述);docx 支持 create/outline/append/replace_text/set_paragraph/set_table_cell/delete/set_properties/add_table/add_image/add_chart/set_header_footer,pptx 支持 create/outline/add_slide/move_slide/replace_text/set_text/set_paragraph/delete/delete_shape/set_geometry/add_text_box/set_properties/add_table/add_image/add_chart/set_header_footer/apply_layout,xlsx 支持 create/outline/set_cell/set_range/add_sheet/rename_sheet/delete_sheet/move_sheet/insert_rows/delete_rows/set_properties,xls 支持 create/set_cell/set_range/convert(读 .xls 用 ReadOffice)"
         },
-        path: { type: "string", description: "工作区里的绝对路径,以 / 开头,后缀必须是 .docx 或 .pptx" },
-        file_type: { type: "string", enum: ["docx", "pptx"], description: "文档类型;create 必填;编辑时省略则按 path 后缀推断,与后缀不符会报错" },
+        path: { type: "string", description: "工作区里的绝对路径,以 / 开头,后缀必须是 .docx / .xlsx / .pptx / .xls(.xls 只支持 create / set_cell / set_range / convert;读 .xls 请用 ReadOffice)" },
+        file_type: { type: "string", enum: ["docx", "xlsx", "pptx", "xls"], description: "文档类型;create 必填;编辑时省略则按 path 后缀推断,与后缀不符会报错" },
         content: { type: "string", description: "create(docx):正文;支持 # / ## / ### 标题、段落、- 或 * 列表、1. 有序列表、**加粗**、*斜体*" },
         slides: {
           type: "array", minItems: 1, maxItems: 200,
@@ -503,16 +536,50 @@ var AGENT_TOOLS = [
           },
           description: "create(pptx):幻灯片数组;add_slide 用单元素数组(只取第 0 个)"
         },
-        head_limit: { type: "integer", minimum: 1, maximum: 200, description: "outline 最多返回多少项(默认 80);被截断时结果里 truncated=true 与 total" },
+        head_limit: { type: "integer", minimum: 1, maximum: 200, description: "outline 最多返回多少项(默认 80);被截断时结果里 truncated=true 与 total;docx / pptx 可配 item_offset 从第几项起读" },
+        item_offset: { type: "integer", minimum: 0, description: "outline(docx / pptx):从第几项开始返回(0 起,默认 0);给了它结果里会带 item_offset,truncated 表示该窗口之后还有项" },
+        text_chars: { type: "integer", minimum: 1, maximum: 400, description: "outline(docx / pptx):每项文本最多给多少字符(默认 80,上限 400;超长会以 … 收尾)" },
+        cell_offset: { type: "integer", minimum: 0, description: "xlsx outline:从该表第几个单元格开始返回(0 起,默认 0;一次最多 500 格);结果里给 total / truncated / cell_offset,续读只需把 cell_offset 往后挪" },
+        sheets: {
+          type: "array", minItems: 1, maxItems: 20,
+          description: "create(xlsx):工作表数组,每项 {name?, rows:[[值,…],…]};表名默认按 Sheet1… 顺排(≤31 字、不含 [ ] : * ? / \\ ),每表 ≤200 行 × ≤30 列"
+        },
+        sheet: { type: ["string", "integer"], description: "xlsx:目标工作表 —— 表名(推荐,索引会随增删表变化)或 sheet_index(0 起);set_cell / set_range / outline 省略 = 第 0 张,**rename_sheet / delete_sheet 必填**" },
+        address: { type: "string", minLength: 1, description: "set_cell(xlsx):单元格地址,如 B4(也可写 Sheet1!B4 带表名前缀;与 sheet 同时给出时必须指向同一张表)" },
+        range: { type: "string", minLength: 1, description: "set_range(xlsx):左上角地址 B2,或区域 B2:D5(给区域时 rows 的行列数必须相符)" },
+        rows: {
+          type: "array", minItems: 1,
+          items: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
+          description: "set_range(xlsx):要写的二维数据(行 ⇒ 值);每格 string / number / boolean / null(null = 清空该格);单次最多 2000 格;xlsx create 的 sheets[i].rows 同形(那里每格再多限 200 行 x 30 列)"
+        },
+        value: { type: ["string", "number", "boolean", "null"], description: "set_cell(xlsx):要写入的值;`null` = 清空该格;与 `formula` 二选一" },
+        formula: { type: "string", minLength: 1, description: "set_cell(xlsx):公式原文(不带前导 `=`,如 SUM(B2:B3));写入 `f` 并置工作簿 fullCalcOnLoad(Excel 打开即重算);与 `value` 二选一" },
+        value_type: { type: "string", enum: ["auto", "text", "number", "boolean", "date"], description: "xlsx:值类型(默认 auto = 按值的 JS 类型);`text`/`number`/`boolean` 用于强制转换字符串,`date` 收 YYYY-MM-DD 写成日期序列号 + 日期格式" },
+        name: { type: "string", minLength: 1, description: "add_sheet(xlsx):新工作表名(≤31 字、不含 [ ] : * ? / \\,与现有表名不区分大小写地不重名)" },
+        new_name: { type: "string", minLength: 1, description: "rename_sheet(xlsx):新表名(规则同 add_sheet 的 name)" },
+        from: { type: "integer", minimum: 0, description: "move_slide(pptx):要移动的幻灯序号(0 起,取自 outline 的 items[i].i;与 to 相同会报错)" },
+        to: { type: "integer", minimum: 0, description: "move_sheet(xlsx)/ move_slide(pptx):移到第几位(0 起,0 = 首位,不能超过末位);与当前位置相同会报错" },
+        at: { type: "integer", minimum: 1, maximum: 1048576, description: "insert_rows / delete_rows(xlsx):从第几行开始(1 起,Excel 行号)" },
+        count: { type: "integer", minimum: 1, maximum: 1048576, description: "insert_rows / delete_rows(xlsx):插 / 删几行(默认 1)" },
+        number_format: { type: "string", minLength: 1, description: "set_cell / set_range(xlsx):数字格式 —— 别名(general / text / integer / number / currency / accounting / percent / scientific / fraction / date / time / datetime)、内建格式串(0.00 / #,##0.00 / m/d/yy / @ …)或受控自定义格式串(≤64 字符,只用数字格式的常规字符);自定义格式串同一次调用最多 1 个" },
         paragraphs: { type: "array", items: { type: "string" }, description: "append(docx):追加的段落文本(逐条一段)" },
         content_append: { type: "string", description: "append(docx):追加正文(与 content 同格式);与 paragraphs 二选一" },
+        text: { type: "string", description: "set_paragraph(docx):该段落的新文字(整段替换;支持 **加粗** 与 *斜体*;**保留段属性**(标题级别 / 编号 / 对齐),段内 run 级格式不再保留并写进 warnings)。set_paragraph(pptx):该段的纯文本新内容(不解析 Markdown 行内标记;a:pPr 的项目级别 / 缩进保留,一段多 run 时的 run 级格式不再保留并写进 warnings)。set_table_cell(docx):该单元格的新文字(支持 **加粗** 与 *斜体*;`\\n` 分会成多段;保留单元格属性 w:tcPr 与首段 w:pPr)" },
+        table_index: { type: "integer", minimum: 0, description: "set_table_cell(docx):表格在 outline 里的**项序号**(items[i].i,该项 kind 必须 = table;不是「第几张表」);表格尺寸见该项的 table{rows,cols}" },
+        row: { type: "integer", minimum: 0, description: "set_table_cell(docx):行号(0 起;该表行数见 outline 的 table.rows)" },
+        col: { type: "integer", minimum: 0, description: "set_table_cell(docx):列号(0 起;该行的格数见 outline 的 table.cols;含合并单元格 / 嵌套表的表会被拒,EINVAL 会点名)" },
+        x: { type: "integer", minimum: 0, description: "pptx set_geometry / add_text_box:左上角 x(单位 **EMU**;与 outline 的 geom.x 同口径,1 px = 9525 EMU)" },
+        y: { type: "integer", minimum: 0, description: "pptx set_geometry / add_text_box:左上角 y(单位 **EMU**;与 outline 的 geom.y 同口径)" },
+        cx: { type: "integer", minimum: 9525, description: "pptx set_geometry / add_text_box:宽度(单位 **EMU**,至少 9525 = 1 px;与 outline 的 geom.cx 同口径)" },
+        cy: { type: "integer", minimum: 9525, description: "pptx set_geometry / add_text_box:高度(单位 **EMU**,至少 9525 = 1 px;与 outline 的 geom.cy 同口径)" },
+        lines: { type: "array", minItems: 1, items: { type: "string" }, description: "add_text_box(pptx):文本框的每行文字(至少一行,每行一段)" },
         old_string: { type: "string", minLength: 1, description: "replace_text:要被替换的原文" },
         new_string: { type: "string", description: "replace_text:替换成的新文本(空串 = 删除)" },
         replace_all: { type: "boolean", description: "replace_text:是否替换全部命中(默认 true);false 时要求唯一命中" },
-        slide_index: { type: "integer", minimum: 0, description: "pptx:幻灯片序号(0 起,取自 outline);add_table/add_image/add_chart 省略 = 最后一页(apply_layout 与 set_header_footer 不需要)" },
-        shape_index: { type: "integer", minimum: 0, description: "pptx set_text:形状序号(0 起,取自 outline);省略 = 该页第 0 个文本框" },
+        slide_index: { type: "integer", minimum: 0, description: "pptx:幻灯片序号(0 起,**取自 outline 的 items[i].i**);set_text / set_paragraph / delete / delete_shape / set_geometry / add_text_box 用它定位(add_text_box 必填);add_table/add_image/add_chart 省略 = 最后一页;add_slide 时 = **插入位**(省略 = 末尾,取值 0 ~ 张数;原第 k 页起整体顺移)(apply_layout 与 set_header_footer 不需要)" },
+        shape_index: { type: "integer", minimum: 0, description: "pptx set_text / set_paragraph / delete_shape / set_geometry:形状序号(0 起,取自 outline 的 slides[i].shapes[j].i);set_text / set_paragraph 省略 = 该页第 0 个形状(delete_shape / set_geometry 必填)" },
         shape_text: { type: "array", items: { type: "string" }, description: "pptx set_text:把该形状的文字整体换成这些行(每条一行/一段;空数组 = 清空该文本框)" },
-        paragraph_index: { type: "integer", minimum: 0, description: "docx:段落序号(0 起,取自 outline);delete = 删该段,add_table/add_image/add_chart = 插在该段之后,省略 = 追加到正文末尾(sectPr 之前)" },
+        paragraph_index: { type: "integer", minimum: 0, description: "docx:段落序号(0 起,取自 outline);delete = 删该段,set_paragraph = 改该段文字,append/add_table/add_image/add_chart = 插在该段之后(省略 = 追加到正文末尾)。pptx set_paragraph:该形状文本框里的第几段(0 起;按 shape 的 text 换行分段,与 slide_index 一起给)" },
         table: {
           type: "object",
           properties: {
@@ -579,10 +646,14 @@ var AGENT_TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: true, requiresNetwork: false },
     needsWorkspace: true,
     wsPathArgs: ["path", "image_path"],
-    /* 13 个 operation 的**参数作用域判据**全在 officeSpecCheck()(唯一出口,见文件工具实现区);
+    /* 全部 operation 的**参数作用域判据**全在 officeSpecCheck()(唯一出口,见文件工具实现区);
        载荷实现全部就位:批次 D(基础 8 项)/ F(add_chart)/ G(set_header_footer)/
-       H(add_table / add_image / apply_layout)—— 13 项各有对应的载荷 builder,
-       OfficeWrite 只对"该 file_type 没有这个 op"报 EINVAL(如 docx 传 apply_layout) */
+       H(add_table / add_image / apply_layout)/ X1-d·X2-b(xlsx 与 xls 的各 op)/
+       W-docx(set_paragraph;append@index 与 outline 的 item_offset / text_chars 是新参数)/
+       W-pptx(move_slide 与 pptx 的 set_paragraph;add_slide 的 slide_index 是新参数)/
+       W-p2(docx set_table_cell;pptx delete_shape / set_geometry / add_text_box)——
+       每个 op 都有对应的载荷 builder,OfficeWrite 只对"该 file_type 没有这个 op"报 EINVAL
+       (如 docx 传 apply_layout) */
     run: function (args, ctx) { return wsToolRun("Office", args, ctx, officeToolRun); }
   },
   {
@@ -661,7 +732,7 @@ var AGENT_TOOLS = [
         "**后台任务**",
         "- 长任务请用 `run_in_background=true`:立刻返回 `task_id`,执行在后台继续跑;完成时**会自动通知你**(空闲时自动回到对话),所以**不要反复轮询**。要看进度用 TaskOutput(task_id),要阻塞等它结束用 WaitFor(timeout_ms ≤60000,等超时**不是错误**),要停它用 TaskStop;后台任务有独立的超时上限(设置里可配,默认 30 分钟)。",
         "- 停止生成或超时都会直接销毁解释器:变量与导入全部丢失,下次执行要重新启动(约几秒);已经写进工作区的产物不受影响。",
-        "- TaskStop 与超时一样是直接销毁解释器:① 变量与已导入的包全丢;② 下次执行要重新启动并重装包;③ 未回写的产物丢失。停止生成(Ctrl+X)只中止前台执行,**不会**杀后台任务(除非在设置里打开「停止生成时也终止后台任务」);同时最多 2 个未完成任务,第 3 个会被拒绝(`EBUSY`),请先 TaskStop 或用 WaitFor。",
+        "- TaskStop 与超时一样是直接销毁解释器:① 变量与已导入的包全丢;② 下次执行要重新启动并重装包;③ 未回写的产物丢失。停止生成(Ctrl+X)只中止前台执行,**不会**杀后台任务(要停后台任务,请在任务弹窗 `/tasks` 里手动停止);同时最多 2 个未完成任务,第 3 个会被拒绝(`EBUSY`),请先 TaskStop 或用 WaitFor。",
         "- 任务只活在当前页面:刷新或关闭页面后任务与记录**全部消失**(没有失联历史);长任务请让脚本把中间结果写进工作区文件。"
       ].join("\n");
     },
@@ -1206,13 +1277,27 @@ function sandboxSource(id, code, allowNet) {
   return head + SANDBOX_TAIL.replace("__USER_CODE__", function () { return code; });
 }
 /* 运行代码:独立线程 + 硬超时 + 输出上限。返回 {ok, text, error, logs, logsDropped, ms} */
-/* 正在运行的沙箱(停止生成 / 关闭页面时一并销毁,避免后台空转) */
+/* 正在运行的沙箱(停止生成 / 关闭页面时一并销毁,避免后台空转)。
+   entry 带 convId ⇒ abortGen 的 killSandboxesOf(convId) 只杀该会话自己的沙箱(G5 不误伤);
+   全表版 killAllSandboxes 是**页面级兜底**(stopAllGen 末尾调用,收掉无归属条目) */
 var SANDBOX_LIVE = [];
 function killAllSandboxes(reason) {
   var list = SANDBOX_LIVE.slice();
   SANDBOX_LIVE.length = 0;
   for (var i = 0; i < list.length; i++) {
     try { list[i].finish({ ok: false, error: reason || "已被用户中止", logs: [] }); } catch (e) {}
+  }
+}
+/* 只中止指定会话的沙箱(与 killAllSandboxes 同表,按 convId 过滤) */
+function killSandboxesOf(convId, reason) {
+  if (!convId) return;
+  var list = SANDBOX_LIVE.slice(), i, e, ix;
+  for (i = 0; i < list.length; i++) {
+    e = list[i];
+    if (!e || e.convId !== convId) continue;
+    ix = SANDBOX_LIVE.indexOf(e);
+    if (ix > -1) SANDBOX_LIVE.splice(ix, 1);
+    try { e.finish({ ok: false, error: reason || "已被用户中止", logs: [] }); } catch (err) {}
   }
 }
 function runJsInSandbox(code, opts) {
@@ -1250,7 +1335,7 @@ function runJsInSandbox(code, opts) {
       res.ms = Date.now() - t0;
       resolve(res);
     }
-    var entry = { finish: finish };
+    var entry = { convId: (opts && opts.conv && opts.conv.id) || null, finish: finish };
     SANDBOX_LIVE.push(entry);
     try {
       w = new Worker(url);
@@ -1390,22 +1475,39 @@ function toolResultText(res, toolName) {
 }
 
 /* ---- 用户放行 ---- */
-function askToolApproval(msgId) {
-  return new Promise(function (resolve) { TOOL_WAITS[msgId] = resolve; });
+/* 等待项带 convId:① 停止 / 删除只拒掉**该会话**的等待(G5);② 徽标能按会话算"等你操作" */
+function askToolApproval(msgId, convId) {
+  return new Promise(function (resolve) { TOOL_WAITS[msgId] = { convId: convId || null, resolve: resolve }; });
 }
 function resolveToolApproval(msgId, act) {
   var r = TOOL_WAITS[msgId];
   if (!r) return;
   delete TOOL_WAITS[msgId];
-  r(act);
+  r.resolve(act);
 }
+/* 全表拒绝(页面级收尾保留;按会话的收口 = denyToolWaitsOf,abortGen 用它) */
 function denyAllToolWaits() {
   var keys = [];
   for (var k in TOOL_WAITS) if (Object.prototype.hasOwnProperty.call(TOOL_WAITS, k)) keys.push(k);
   for (var i = 0; i < keys.length; i++) {
     var r = TOOL_WAITS[keys[i]];
     delete TOOL_WAITS[keys[i]];
-    try { r("deny"); } catch (e) {}
+    try { r.resolve("deny"); } catch (e) {}
+  }
+}
+/* 只拒绝指定会话的等待项(停 B 不得拒掉 A 的放行卡 —— 缺陷 C 的修法) */
+function denyToolWaitsOf(convId) {
+  if (!convId) return;
+  var keys = [], k;
+  for (k in TOOL_WAITS) {
+    if (!Object.prototype.hasOwnProperty.call(TOOL_WAITS, k)) continue;
+    var it = TOOL_WAITS[k];
+    if (it && it.convId === convId) keys.push(k);
+  }
+  for (var i = 0; i < keys.length; i++) {
+    var r = TOOL_WAITS[keys[i]];
+    delete TOOL_WAITS[keys[i]];
+    try { r.resolve("deny"); } catch (e) {}
   }
 }
 
@@ -1416,7 +1518,7 @@ function denyAllToolWaits() {
    防滥用上限:每轮调用次数受 toolLimits.maxCalls 约束(toolRun 统一计数,不另设专属上限)、
    同会话同时只有一张待答卡、用户随时可「跳过」、Ctrl+X/停止经 ctx.signal 结算为 aborted、
    刷新/关页后由 askUserSweepStale() 把没人等的残卡收敛掉。 */
-var ASK_WAITS = {};          /* msgId → resolve(out);空表 = 页面上没有任何人在等答案 */
+var ASK_WAITS = {};          /* msgId → { convId, finish(out) };空表 = 页面上没有任何人在等答案 */
 var ASK_DRAFT = {};          /* msgId → {sel:{i:idx|[idx]}, text:{i:string}, other:{i:bool}}(纯内存,结算即清) */
 var ASK_MAX_Q = 4, ASK_MAX_OPT = 4, ASK_MIN_OPT = 2;
 var ASK_HEADER_MAX = 12;     /* 题头小标签的长度上限(Kimi 同口径) */
@@ -1515,16 +1617,16 @@ function askUserResolve(msgId, act) {
     /* 结算即收起详情:头部状态行与「已回答」摘要已足够回执,表单/回显不再默认占屏
        (toolOpen=false 随消息落盘 ⇒ 历史重绘与刷新后的默认态同样是收起) */
     if (m) { m.askAnswers = list; m.toolOpen = false; }
-    r({ ok: true, text: JSON.stringify({ answers: answers }) });
+    r.finish({ ok: true, text: JSON.stringify({ answers: answers }) });
     return;
   }
   if (act === "skip") {
     if (m) { m.askAnswers = []; m.toolOpen = false; }
-    r({ ok: true, text: JSON.stringify({ answers: {}, note: ASK_SKIP_NOTE }) });
+    r.finish({ ok: true, text: JSON.stringify({ answers: {}, note: ASK_SKIP_NOTE }) });
     return;
   }
   if (m) m.toolOpen = true;
-  r({ ok: false, aborted: true, error: "用户中止了这次生成,这次提问没有回答" });
+  r.finish({ ok: false, aborted: true, error: "用户中止了这次生成,这次提问没有回答" });
 }
 function askUserRun(args, ctx) {
   var n = askUserNormalize(args);
@@ -1534,11 +1636,13 @@ function askUserRun(args, ctx) {
   }
   if (!msg) return Promise.resolve({ ok: false, error: "提问失败:没有可用的消息上下文" });
   var msgId = msg.id;
+  var cid = (ctxConv(ctx) || {}).id || null;
   ASK_DRAFT[msgId] = { sel: {}, text: {}, other: {}, cur: 0 };   /* cur = 多题轮播的当前题号 */
   msg.askQs = n.qs;                 /* 卡片题面;结算时清掉(临时字段) */
   msg.askAnswers = null;            /* 重跑同一张卡片时不留上一次的回显 */
   msg.toolOpen = true;              /* 待答卡片必须展开 */
   msg.status = "wait";              /* 此路径下 needsApproval 必为 false(toolRun 放行后已清) */
+  genSetPhase(cid, "wait-ask");     /* 徽标:等你操作(后台会话也保持"生成中"不落下) */
   redrawToolCard(msg);
   /* 卡片刚加上逐题表单(变高):立刻粘底,否则整张卡可能落在可视区之下,用户要手动滚才看得到问题。
      走既有 scrollToBottom(非 force)——它尊重聊天区的粘底语义,用户手动上滚时不抢 */
@@ -1556,9 +1660,11 @@ function askUserRun(args, ctx) {
         try { ctx.signal.removeEventListener("abort", onAbort); } catch (e) {}
       }
       msg.askQs = null;
+      /* 回退①:作答 / 跳过结算后回到流式态;中止路径(Ctrl+X 已置 stopping)不覆盖 */
+      if (!(ctx && ctx.signal && ctx.signal.aborted)) genSetPhase(cid, "streaming");
       resolve(out);
     }
-    ASK_WAITS[msgId] = finish;
+    ASK_WAITS[msgId] = { convId: cid, finish: finish };
     var sig = ctx && ctx.signal;
     if (sig && sig.aborted) { finish(askUserAbortOut()); return; }
     if (sig && sig.addEventListener) {
@@ -1801,13 +1907,14 @@ async function toolRun(call, tmsg, targetConv) {
     toolLogPush("err", tool.name + " 运行环境不可用");
     return tmsg;
   }
-  if (TOOL_TURN.used >= toolLimit("maxCalls")) {
+  var turn = turnOf(tc.id);                 /* 调用计数按**发起会话**记(并发下两次调用不共用额度) */
+  if (turn.used >= toolLimit("maxCalls")) {
     tmsg.status = "error";
     tmsg.content = "已达到本轮工具调用次数上限(" + toolLimit("maxCalls") + " 次),请直接根据现有信息作答";
     toolLogPush("err", "超出调用次数上限,已拒绝 " + tool.name);
     return tmsg;
   }
-  TOOL_TURN.used++;
+  turn.used++;
   var perm = toolPermOf(tool.name);
   /* history-union 后,总开关关闭时请求里仍会带历史工具定义:模型若再调用,一律按「禁用」拒绝。
      外部工具走自己的生效态(只开外部 MCP、关内部工具时外部工具必须能执行;
@@ -1823,11 +1930,17 @@ async function toolRun(call, tmsg, targetConv) {
   if (perm === "ask") {
     tmsg.status = "wait";
     tmsg.needsApproval = true;
+    genSetPhase(tc.id, "wait-approval");    /* 徽标:等你操作 */
     redrawToolCard(tmsg);
     toolLogPush("in", "等待用户放行:" + tool.name + "(" + safeJson(JSON.stringify(tmsg.args || {}), 220) + ")");
-    var act = await askToolApproval(tmsg.id);
+    var act = await askToolApproval(tmsg.id, tc.id);
     tmsg.needsApproval = false;
-    if (abortCtrl && abortCtrl.signal && abortCtrl.signal.aborted) act = "deny";
+    /* 回退①:放行结算后回到流式态(中止路径不覆盖 —— abortGen 已置 stopping)。
+       中止判定改读**该会话**的中断器:并发下 A 的放行不再被 B 的中止污染(缺陷 C 同族) */
+    var gA = genOf(tc.id);
+    var abortedA = !!(gA && gA.ctrl && gA.ctrl.signal.aborted);
+    if (!abortedA) genSetPhase(tc.id, "streaming");
+    if (abortedA) act = "deny";
     if (act !== "once" && act !== "always") {
       tmsg.status = "denied";
       tmsg.content = "用户拒绝了这次工具调用,请不要重试,直接说明无法执行并给出你能给出的答案";
@@ -1847,11 +1960,12 @@ async function toolRun(call, tmsg, targetConv) {
   var out;
   try {
     /* 统一签名 ctx = { msg, signal },另加可选 conv = 发起这次调用的会话
-       (执行侧会话归属的唯一来源,见 ctxConv;缺省 = 当前会话)。signal 是生成中请求的
-       abortCtrl.signal;非生成路径给永不 abort 的占位信号 */
+       (执行侧会话归属的唯一来源,见 ctxConv;缺省 = 当前会话)。signal 取**该会话**本轮
+       请求的中断器(genOf(tc.id).ctrl);非生成路径给永不 abort 的占位信号 */
+    var gS = genOf(tc.id);
     out = await tool.run(tmsg.args || {}, {
       msg: tmsg,
-      signal: (abortCtrl && abortCtrl.signal) || NO_ABORT_SIGNAL,
+      signal: (gS && gS.ctrl && gS.ctrl.signal) || NO_ABORT_SIGNAL,
       conv: tc
     });
   } catch (e) {
@@ -2000,6 +2114,13 @@ function renderMcpPanel() {
   }
   renderMcpServers();
   syncToolLimitInputs();
+  /* 多会话并发上限(genMax)的当前值回填(唯一权威 = state.settings) */
+  var gmEl = $("set-gen-max"), gmOut = $("set-gen-max-v");
+  if (gmEl) {
+    var gmv = genMaxNow();
+    gmEl.value = gmv;
+    if (gmOut) gmOut.textContent = gmv + " 条";
+  }
   renderToolLog();
   updateMcpStatus();
 }
@@ -2071,13 +2192,14 @@ function updateMcpStatus() {
      不在这里自己早退 —— 否则「只开外部 MCP」时状态栏会谎报「工具关闭」 */
   var info = mcpStatusInfo(conv);
   var n = info.activeCount;
+  var tu = toolTurnCount();    /* 本轮计数 = 当前会话的(GEN 记录派生;视图读数不串扰) */
   el.textContent = info.on
-    ? ("工具 " + n + " 个" + (TOOL_TURN.used ? " · 本次 " + TOOL_TURN.used + " 次" : ""))
+    ? ("工具 " + n + " 个" + (tu ? " · 本次 " + tu + " 次" : ""))
     : "工具关闭";
   wrap.className = "st" + (info.on ? (n ? " ok" : " warn") : "");
   wrap.title = info.on
     ? "模型工具调用" + info.text + ":" + (activeTools(conv).map(function (t) { return t.name; }).join("、") || "没有可用工具") +
-      "\n本轮已调用 " + TOOL_TURN.used + " 次(点击打开设置)"
+      "\n本轮已调用 " + tu + " 次(点击打开设置)"
     : "模型工具调用已关闭(点击打开设置)";
 }
 window.__mcpRefresh = renderMcpPanel;
@@ -2150,6 +2272,16 @@ function bindMcpUI() {
       saveSoon();
     });
   });
+  /* 多会话并发的上限(genMax):范围输入就地写设置;展示同步在 renderMcpPanel 里 */
+  var gmEl = $("set-gen-max");
+  if (gmEl) {
+    gmEl.addEventListener("input", function () {
+      state.settings.genMax = clampNum(Number(gmEl.value), GEN_MAX_MIN, GEN_MAX_MAX, GEN_MAX_DEF);
+      var out = $("set-gen-max-v");
+      if (out) out.textContent = state.settings.genMax + " 条";
+      saveSoon();
+    });
+  }
   var clr = $("tool-log-clear");
   if (clr) clr.addEventListener("click", function () {
     TOOL_LOG = [];
@@ -2257,9 +2389,9 @@ function finishInit() {
     toast("浏览器禁用了本地存储,数据只能保留在内存中", "warn", 5000);
   }
   if (!state.settings.baseUrl) {
-    setConn("err", "未配置地址");
+    setConnFor(null, "err", "未配置地址");
   } else {
-    setConn("ok", "已就绪");
+    setConnFor(null, "ok", "已就绪");
     if (state.settings.autoSync) setTimeout(function () { fetchModels(false, true); }, 800);
   }
   updateStatusBar();
@@ -2307,6 +2439,11 @@ var WS_SESSION_BYTES = 16 * 1024 * 1024;        // ① 会话预载默认上限(
 var WS_SESSION_WBACK = 256 * 1024 * 1024;       // ④ 每会话回写默认硬顶(取 settings.wsSessionWbackMb)
 var WS_SESSION_FILES = 2000;                    // ④ 每会话回写文件数默认(取 settings.wsSessionFiles)
 var READ_DEFAULT_CHARS = 16000, READ_MAX_CHARS = 65536;
+/* xlsx / xls 的 grid 视图(一格一行)单次解析上限(X1-c;方案 b32 §4.3 的 D7 裁定):
+   grid 每格比 CSV 多 4-8 B(地址 + 制表符 [+ {z,v} 段]),维持 131072 会让大表一页只看到
+   几百行 ⇒ **grid 模式的 textMax 按次抬到 512K**;csv 模式**维持 131072 不变**(T-A4 的
+   默认路径不变式)。交付侧仍受 max_chars(≤65536)与 next{…} 分页约束,这里只是解析层上限 */
+var READ_SHEET_GRID_TEXT_MAX = 524288;
 /* ---- Read 的多媒体预算(单一权威;口径 = Kimi ReadMedia 对齐 + 我们自己的像素/字节双门) ----
    只服务 Read 的图片/文档路径:附件侧仍走 transcodeImage + ATTACH_*(两条口径各管各的) */
 var READ_IMG_MAX_EDGE = 2000;                    /* 交付最长边上限(= Kimi MAX_IMAGE_EDGE_PX) */
@@ -4279,8 +4416,20 @@ function wsReadOfficeResult(wsId, r, args, ctx) {
       (cap === ATTACH_MAX_BYTES ? "" : "(当前是主线程降级模式)"), path));
   }
   var capMs = Math.min((window.OfficeKit.limits && window.OfficeKit.limits.timeoutMs) || 60000, toolLimit("timeoutMs"));
+  /* X1-c:xlsx / xls 的读视图(§4.3 / D3 —— **默认 grid 是工具面的策略**,故在这里定;
+     kit/胶水只做透传)。csv 模式不传 textMax ⇒ 胶水用 TEXT_MAX 131072(与批前逐字节相同);
+     grid 模式按次抬到 READ_SHEET_GRID_TEXT_MAX(D7)。 */
+  var sufSheet = wsSuffixOf(path);
+  var isSheetFmt = (sufSheet === "xlsx" || sufSheet === "xls");
+  var sheetView = "";
+  if (isSheetFmt) { sheetView = (args.sheet_view == null) ? "grid" : String(args.sheet_view).toLowerCase(); }
+  var parseOpts = { timeout: capMs, onProgress: null };
+  if (isSheetFmt) {
+    parseOpts.sheetView = sheetView;
+    if (sheetView === "grid") { parseOpts.textMax = READ_SHEET_GRID_TEXT_MAX; }
+  }
   return readAs(r.blob, "buffer").then(function (buf) {
-    return window.OfficeKit.parse(buf, wsSuffixOf(path), { timeout: capMs, onProgress: null });
+    return window.OfficeKit.parse(buf, wsSuffixOf(path), parseOpts);
   }, function (e) { return { ok: false, error: wsMsg(e) }; }).then(function (o) {
     if (!o || !o.ok) return wsErr("EBINARY", wsDocErrText(path, o), path);
     var subtype = String(o.subtype || wsSuffixOf(path)).toUpperCase();
@@ -4288,6 +4437,8 @@ function wsReadOfficeResult(wsId, r, args, ctx) {
     var info = ["file " + path, subtype];
     if (o.unit === "页" && o.pages) info.push("共 " + o.pages + " 页");
     else if (o.unit === "表" && o.pages) info.push("共 " + o.pages + " 表");
+    /* X1-c:表读的状态行标明本次用的视图(模型据此知道地址在不在) */
+    if (isSheetFmt) { info.push("视图 " + (sheetView === "grid" ? "grid(地址)" : "csv")); }
     if (o.subtype === "doc" || o.subtype === "ppt") info.push("仅文本(老格式无图像提取)");
     /* S3b(§3.2-6):胶水在 TEXT_MAX(131072)处 `raw.slice(0, TEXT_MAX)` ⇒ 超限部分**真的不存在**,
        任何偏移都取不到 ⇒ 必须如实注记,不得静默截断 */
@@ -4549,6 +4700,19 @@ function wsReadOfficeTool(wsId, args, ctx) {
   }
   if (args.column_offset != null && typeof args.line_offset === "number" && args.line_offset < 0) {
     return Promise.resolve(wsErr("EINVAL", "column_offset 只用于正向读,不能与负数 line_offset 同时给出"));
+  }
+  /* sheet_view(X1-c;方案 §6.2 / D3):只对 xlsx / xls 有意义,且只认 grid / csv ——
+     别的格式给出它就报错(而不是静默忽略),避免模型以为"给了就有用" */
+  if (args.sheet_view != null) {
+    var sv = String(args.sheet_view).toLowerCase();
+    if (sv !== "grid" && sv !== "csv") {
+      return Promise.resolve(wsErr("EINVAL", "sheet_view 只能是 grid 或 csv(收到:" + JSON.stringify(args.sheet_view) + ")"));
+    }
+    var sufSv = wsSuffixOf(path);
+    if (sufSv !== "xlsx" && sufSv !== "xls") {
+      return Promise.resolve(wsErr("EINVAL", "sheet_view 只对 xlsx / xls 有意义(「" + path + "」是 ." + sufSv
+        + ");要按页 / 表 / 幻灯读用 page_offset"));
+    }
   }
   return wsReadBlob(wsId, path).then(function (r) {
     if (wsIsErr(r)) return r;
@@ -5210,20 +5374,43 @@ function wsFileOpsTool(wsId, args) {
 /* 单文件写入上限(方案 §2.6 的 OFFICE_MAX_BYTES):整包解压 + 重压的内存峰值约为输入的 3–8 倍,
    所以本层自己设 20 MB 的门(工作区层不设 —— wsWriteBlob 只判配额) */
 var OFFICE_MAX_BYTES = 20 * 1024 * 1024;
+/* ★ P2-2 裁定(X1-d;承 X1-a 审查「create 的格数预算」):**沿用表限(20 表 x 200 行 x 30 列
+   = 120,000 格/次)为上限,不另设格数闸**。实测依据(探针 `probe-budget.js`,真浏览器、Thorium 122):
+     · 满额 120,000 格 ⇒ **1,037 ms**(主线程一次同步)、产物 **431,639 B**、解压 6.1 MB、
+       26 个部件、`validateXlsx` PASS ⇒ 与"20 MB 单文件门 / 工具 timeoutMs 60 s / UI 冻结约 1 s"都相容;
+     · 该调用的 **JSON 参数 = 1,082,782 B(≈1.06 MB)** —— **真正的闸在模型侧**(任何一次
+       tool 调用都不可能带这种体量的参数),再加一道格数闸只会多出一条永不触发的分支;
+     · 超限形态已被载荷逐条拒(21 表 / 201 行 / 31 列 ⇒ `EINVAL`,读数在案)。
+   判据(套件跑):满额 create ok ∧ `validateXlsx` PASS ∧ 耗时 ≤ 5,000 ms ∧ 产物 ≤ 8 MB;超限三形态必须 EINVAL。
+   将来若真要收紧,改载荷 LIMITS 的 `maxSheets` / `maxTableRows` / `maxTableCols` 即可 ——
+   工具面用 `officeLimitOf()` 从载荷取值(**同源**,不会出现两处数字不一致)。 */
 /* add_image 收的图片后缀(白名单;其余 ⇒ ENOTSUP,方案 §14.2) */
 var OFFICE_IMG_EXT = ["png", "jpg", "jpeg"];
-/* 13 项 operation(= inputSchema 的 enum;唯一权威 = 方案 §2.2) */
-var OFFICE_OPS = ["create", "outline", "append", "replace_text", "set_text", "delete", "add_slide",
-  "set_properties", "add_table", "add_image", "add_chart", "set_header_footer", "apply_layout"];
+/* operation 全集(= inputSchema 的 enum;唯一权威 = 方案 §2.2 ∪ §6.1 的 xlsx 新增项)。
+   各 file_type 各支持其中的**子集**(见 OFFICE_SCOPE);X1-d 起并入 **xlsx 的 5 项新操作**
+   (set_cell / set_range / add_sheet / rename_sheet / delete_sheet);X2-b 再并入
+   **move_sheet / insert_rows / delete_rows**(xlsx)与 **convert**(xls);W-docx 并入
+   **set_paragraph**(docx;append 的 paragraph_index 与 outline 的 item_offset / text_chars
+   是新**参数**,不动本表);**W-pptx 并入 move_slide(pptx)并把 set_paragraph 扩到 pptx**
+   (add_slide 的 slide_index 也是新**参数**);**W-p2 再并入 set_table_cell(docx)与
+   delete_shape / set_geometry / add_text_box(pptx)** —— create / outline / set_properties
+   三型本来就共用,不重复列。**默认权限与能力门不变**(cap: "office")。 */
+var OFFICE_OPS = ["create", "outline", "append", "replace_text", "set_text", "delete",
+  "delete_shape", "set_geometry", "add_text_box", "set_paragraph", "set_table_cell",
+  "add_slide", "move_slide", "set_properties", "add_table", "add_image", "add_chart", "set_header_footer", "apply_layout",
+  "set_cell", "set_range", "add_sheet", "rename_sheet", "delete_sheet",
+  "move_sheet", "insert_rows", "delete_rows", "convert"];
 /* (file_type, operation) → 参数作用域。need = 必填(键必须出现且非 null);opt = 可选。
    本表 = 方案 §2.2 的 base 两张子表 ∪ v1.2 两张新表(P3-5:两表同一判据,只是文档里分表便于读);
    「本表未列出的键一律 ✗」由 officeSpecCheck 的第 ③ 步统一执行 —— 只有这一份定义,不在别处重写 */
 var OFFICE_SCOPE = {
   docx: {
     create: { need: ["content"], opt: ["properties"] },
-    outline: { need: [], opt: ["head_limit"] },
-    append: { need: [], opt: ["content_append", "paragraphs"] },
+    outline: { need: [], opt: ["head_limit", "item_offset", "text_chars"] },
+    append: { need: [], opt: ["content_append", "paragraphs", "paragraph_index"] },
     replace_text: { need: ["old_string", "new_string"], opt: ["replace_all"] },
+    set_paragraph: { need: ["paragraph_index", "text"], opt: [] },
+    set_table_cell: { need: ["table_index", "row", "col", "text"], opt: [] },
     delete: { need: ["paragraph_index"], opt: [] },
     set_properties: { need: ["properties"], opt: [] },
     add_table: { need: ["table"], opt: ["paragraph_index"] },
@@ -5233,17 +5420,60 @@ var OFFICE_SCOPE = {
   },
   pptx: {
     create: { need: ["slides"], opt: ["properties"] },
-    outline: { need: [], opt: ["head_limit"] },
-    add_slide: { need: ["slides"], opt: [] },
+    outline: { need: [], opt: ["head_limit", "item_offset", "text_chars"] },
+    add_slide: { need: ["slides"], opt: ["slide_index"] },
+    move_slide: { need: ["from", "to"], opt: [] },
     replace_text: { need: ["old_string", "new_string"], opt: ["replace_all", "slide_index", "shape_index"] },
     set_text: { need: ["slide_index", "shape_text"], opt: ["shape_index"] },
+    set_paragraph: { need: ["slide_index", "paragraph_index", "text"], opt: ["shape_index"] },
     delete: { need: ["slide_index"], opt: [] },
+    delete_shape: { need: ["slide_index", "shape_index"], opt: [] },
+    set_geometry: { need: ["slide_index", "shape_index", "x", "y", "cx", "cy"], opt: [] },
+    add_text_box: { need: ["slide_index", "x", "y", "cx", "cy", "lines"], opt: [] },
     set_properties: { need: ["properties"], opt: [] },
     add_table: { need: ["table"], opt: ["slide_index"] },
     add_image: { need: ["image_path"], opt: ["slide_index", "image_width_px", "image_height_px"] },
     add_chart: { need: ["chart"], opt: ["slide_index"] },
     set_header_footer: { need: [], opt: ["footer", "slide_number"] },
     apply_layout: { need: ["slide_index", "layout_index"], opt: [] }
+  },
+  /* xlsx(X1-d 接线;字段面 = 方案 §6.1 的表)。与 docx/pptx 的关键差别:
+     · `sheet` 给表名或 sheet_index;**rename_sheet / delete_sheet / move_sheet 强制点名** `sheet`
+       (不给就默认第一张表 —— 改名/删表/移表的误伤面太大,故这里必填;set_cell / set_range /
+        insert_rows / delete_rows / outline 省略则写第 0 张,与 outline 同源);
+     · `address` / `range` / `rows` / `value` / `formula` / `value_type` / `number_format` /
+       `at` / `count` / `to` 是 xlsx 专属;
+     · `outline` 用 `cell_offset` 分页(不是 docx/pptx 的 item_offset);
+     · 数值/表名/地址的**语义规则**由载荷层(OfficeWrite)把关并给文案 —— 那是唯一实现;
+       本表只判"该 op 认哪些键 + 类型对不对"(第 ③–⑤ 步)
+     · X2-b 起 xls(旧二进制)**模型侧可达**,但只有值级四项:create / set_cell / set_range /
+       convert(表结构操作、公式与 outline 都没有 —— 见 officeParamErrMsg 的专属文案) */
+  xlsx: {
+    create: { need: ["sheets"], opt: ["properties"] },
+    outline: { need: [], opt: ["head_limit", "cell_offset"] },
+    set_cell: { need: ["address"], opt: ["sheet", "value", "formula", "value_type", "number_format"] },
+    set_range: { need: ["range", "rows"], opt: ["sheet", "value_type", "number_format"] },
+    add_sheet: { need: ["name"], opt: [] },
+    rename_sheet: { need: ["sheet", "new_name"], opt: [] },
+    delete_sheet: { need: ["sheet"], opt: [] },
+    move_sheet: { need: ["sheet", "to"], opt: [] },
+    insert_rows: { need: ["at"], opt: ["sheet", "count"] },
+    delete_rows: { need: ["at"], opt: ["sheet", "count"] },
+    set_properties: { need: ["properties"], opt: [] }
+  },
+  /* xls(X2-b 接线;字段面 = 方案 §8 X2-a 行的"工具面接线"结转项)。
+     只列**载荷真的做得成的**四项:值级 create / set_cell / set_range + convert(转 .xlsx)。
+     `formula` 不进 set_cell 的 opt —— 载荷会 ENOTSUP 拒它,工具面先给一句能自我纠正的文案
+     (officeParamErrMsg 的 xls 分支);表结构 op / number_format / set_properties 同理不列。
+     ⚠ **`outline` 已按审查 P1-1 撤下**(修正轮):BIFF 没有"工作表摘要"这条读语义,列了就是
+     "工具面放行、载荷恒拒"的说谎面 ⇒ 读内容统一引导 `ReadOffice`(grid 视图能读 .xls)。
+     A 方案(给载荷补 xls 的值级 outline)已评估,**本期不做** —— 代价与触发条件见
+     `progress/b32-x2b-done.md` §修正轮 P1-1 后选项段。 */
+  xls: {
+    create: { need: ["sheets"], opt: ["properties"] },
+    set_cell: { need: ["address"], opt: ["sheet", "value", "value_type"] },
+    set_range: { need: ["range", "rows"], opt: ["sheet", "value_type"] },
+    convert: { need: [], opt: [] }
   }
 };
 /* docProps/core.xml 的可写字段(与 OfficeWrite 的 CORE_WRITABLE 同集;properties 里只认这几个) */
@@ -5251,6 +5481,13 @@ var OFFICE_CORE_FIELDS = ["title", "creator", "subject", "description", "keyword
 
 function officeOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 function officeIsInt(v) { return typeof v === "number" && isFinite(v) && Math.floor(v) === v; }
+/* 载荷 LIMITS 的取值助手(单一来源:数值只在载荷里有一份,取不到才回落默认值 —— 与
+   officeImgMaxBytes 同款)。X1-d 起:create 的表数 / 每表行·列上限从这里取,本文件不写第二份数字 */
+function officeLimitOf(key, dflt) {
+  var w = window.OfficeWrite;
+  var n = (w && w.limits) ? w.limits[key] : 0;
+  return (typeof n === "number" && n > 0) ? n : dflt;
+}
 /* 单张图片上限:与 OfficeWrite.limits.maxImageBytes 同源(取不到才回落 8 MB,不再写死一个数) */
 function officeImgMaxBytes() {
   var w = window.OfficeWrite;
@@ -5263,9 +5500,69 @@ function officeOpList(ft) {
   for (k in t) { if (officeOwn(t, k)) out.push(k); }
   return out;
 }
+/* xlsx 专属键 与 docx/pptx 专属键(X1-d:模型把参数给错格式时给一句能自我纠正的文案,
+   不是干巴巴的"本 operation 不消费参数") */
+var OFFICE_XLSX_ONLY = {
+  sheets: 1, sheet: 1, address: 1, range: 1, rows: 1, value: 1, formula: 1,
+  value_type: 1, name: 1, new_name: 1, cell_offset: 1,
+  at: 1, count: 1, number_format: 1
+};
+/* `to` 自 W-pptx 起不再是 xlsx 专属(move_sheet 与 pptx 的 move_slide 同名)⇒ 从上一张表
+   撤下,改由 officeParamErrMsg 的 from / to 分支分别给文案(见下) */
+var OFFICE_WP_ONLY = {
+  content: 1, content_append: 1, paragraphs: 1, slides: 1, old_string: 1, new_string: 1,
+  replace_all: 1, shape_text: 1, shape_index: 1, slide_index: 1, paragraph_index: 1,
+  layout_index: 1, table: 1, chart: 1, image_path: 1, image_width_px: 1, image_height_px: 1,
+  header: 1, footer: 1, slide_number: 1, first_page_different: 1, even_odd: 1, item_offset: 1,
+  text: 1, text_chars: 1,
+  /* W-p2:docx 表格键 + pptx 形状键(都不是 xlsx 的) */
+  table_index: 1, row: 1, col: 1, x: 1, y: 1, cx: 1, cy: 1, lines: 1
+};
 /* 参数不在该 (file_type, operation) 合法集里时的文案:方案 §2.2 的第 ⑥ 步(文件类型绑定)
-   点名 pptx 的 header 三件与 docx 的 slide_number / layout_index;其余走通用句 */
+   点名 pptx 的 header 三件与 docx 的 slide_number / layout_index;X1-d 起再点名
+   "xlsx 专属键给了 docx/pptx" 与反向两种;其余走通用句 */
 function officeParamErrMsg(ft, op, key) {
+  /* xls(X2-b):先给"为什么不行 + 怎么办"的专属句 —— 这几条是 xls 的**能力边界**,
+     比通用的"本 operation 不消费参数"有用得多(模型据此能自己换路) */
+  if (ft === "xls") {
+    if (key === "formula") {
+      return "xls(旧二进制 BIFF)写不了公式(SheetJS 的 .xls 写出面不含公式,只留缓存值)—— 要公式请改用 .xlsx(可先 operation=convert 转档),或用 value 写结果值";
+    }
+    if (key === "number_format") {
+      return "xls 的改动 = 整包重写,单元格样式/数字格式不随写值落盘 —— 要控数字格式请改用 .xlsx(可先 operation=convert 转档)";
+    }
+    if (key === "properties") {
+      return "xls 重写不保留文档属性(标题 / 作者等会被丢弃)—— 要写属性请改用 .xlsx;convert 转出的 .xlsx 可保留属性";
+    }
+    if (key === "new_name" || key === "name" || key === "to" || key === "at" || key === "count") {
+      return "`" + key + "` 是表结构 / 行列操作参数,xls 这条值级通道做不了(表结构改动请改用 .xlsx,可先 operation=convert 转档)";
+    }
+    if (key === "head_limit" || key === "cell_offset") {
+      /* 修正轮 P1-1:`outline` 已从 xls 的 scope 撤下(BIFF 没有表摘要语义)⇒ 这两个键对 xls
+         不再是"不分页"而是"没有这条读路径",文案必须指向真能读的那条路(ReadOffice) */
+      return "xls 没有 `outline`(旧二进制 BIFF 读不出工作表摘要)—— 要看内容请用 ReadOffice(默认 grid 视图,能读 .xls;`" + key + "` 是 xlsx 的 outline 分页参数)";
+    }
+  }
+  /* W-pptx:`to` 不再是 xlsx 专属(move_sheet 与 pptx 的 move_slide 同名);`from` 只属 move_slide */
+  if (key === "from" || key === "to") {
+    if (ft === "pptx") {
+      return "`" + key + "` 只对 move_slide 有意义(把第 from 张移到第 to 位);operation=" + op + " 不消费它";
+    }
+    if (ft === "docx") {
+      return "`" + key + "` 是 move_slide(pptx)/ move_sheet(xlsx)的参数,docx 用不上 —— docx 里调段落位置用 delete 与 append(paragraph_index)";
+    }
+    if (ft === "xlsx" && key === "from") {
+      return "`from` 是 move_slide(pptx)的起始位;xlsx 移表用 move_sheet(sheet / to),没有 from";
+    }
+  }
+  if (ft === "xlsx" && officeOwn(OFFICE_WP_ONLY, key)) {
+    return "`" + key + "` 是 Word / PowerPoint 的参数,Excel 用不上 —— xlsx 的键是 sheets / sheet / address / range / rows / value / formula / value_type / number_format / name / new_name / to / at / count / cell_offset / properties";
+  }
+  if (ft !== "xlsx" && officeOwn(OFFICE_XLSX_ONLY, key)) {
+    return "`" + key + "` 是 Excel(xlsx)的参数," + ft + " 用不上 —— "
+      + (ft === "docx" ? "docx 改内容用 content / paragraphs / paragraph_index / text / table / image_path 这些"
+        : "pptx 改内容用 slides / slide_index / shape_index / table / image_path 这些");
+  }
   if (ft === "pptx" && key === "header") {
     return "pptx 没有页面页眉这个概念(p:hf 的 hdr 只对备注 / 讲义母版有意义);要页脚请用 footer,要页码请用 slide_number";
   }
@@ -5414,7 +5711,11 @@ function officeSpecCheckValues(a, op) {
   var e, i, k, v;
   var ints = [["head_limit", 1, 200], ["slide_index", 0, 1000000000], ["shape_index", 0, 1000000000],
     ["paragraph_index", 0, 1000000000], ["layout_index", 0, 1000000000],
-    ["image_width_px", 16, 4096], ["image_height_px", 16, 4096]];
+    ["table_index", 0, 1000000000], ["row", 0, 1000000], ["col", 0, 1000000],
+    ["x", 0, 1000000000], ["y", 0, 1000000000], ["cx", 9525, 1000000000], ["cy", 9525, 1000000000],
+    ["image_width_px", 16, 4096], ["image_height_px", 16, 4096],
+    ["cell_offset", 0, 1000000000], ["item_offset", 0, 1000000000], ["text_chars", 1, 400],
+    ["at", 1, 1048576], ["count", 1, 1048576], ["to", 0, 1000000000], ["from", 0, 1000000000]];
   for (i = 0; i < ints.length; i++) {
     k = ints[i][0]; v = a[k];
     if (v == null) continue;
@@ -5429,7 +5730,7 @@ function officeSpecCheckValues(a, op) {
       return wsErr("EINVAL", "`" + bools[i] + "` 必须是 true / false");
     }
   }
-  var strs = ["content", "content_append", "new_string"];
+  var strs = ["content", "content_append", "new_string", "text"];
   for (i = 0; i < strs.length; i++) {
     if (a[strs[i]] != null && typeof a[strs[i]] !== "string") return wsErr("EINVAL", "`" + strs[i] + "` 必须是字符串");
   }
@@ -5442,12 +5743,87 @@ function officeSpecCheckValues(a, op) {
   if (e) return e;
   e = officeStrArrayErr(a.shape_text, "shape_text");
   if (e) return e;
+  /* W-p2:add_text_box 的 lines(至少一行;元素必须是字符串) */
+  e = officeStrArrayErr(a.lines, "lines");
+  if (e) return e;
+  if (a.lines != null && !a.lines.length) {
+    return wsErr("EINVAL", "`lines` 至少给一行(空数组没有内容可写 —— 要空文本框请给一行空串)");
+  }
   if (a.slides != null) { e = officeSlidesErr(a.slides, op); if (e) return e; }
   if (a.table != null) { e = officeTableErr(a.table); if (e) return e; }
   if (a.chart != null) { e = officeChartErr(a.chart); if (e) return e; }
   if (a.header != null) { e = officeTextObjErr(a.header, "header"); if (e) return e; }
   if (a.footer != null) { e = officeTextObjErr(a.footer, "footer"); if (e) return e; }
   if (a.properties != null) { e = officePropsErr(a.properties); if (e) return e; }
+  /* xlsx(X1-d):类型面。**语义面**(表名规则 / 地址越界 / 行列上限 / 合并区 / value XOR formula)
+     由载荷层 OfficeWrite 把关并给文案 —— 那是唯一实现;这里只挡"类型不对 / 空串 / 明显超限",
+     免得把明显错的参数送进解包与 DOM 改写。表数/行列上限**从载荷的 LIMITS 取**(单一来源,
+     与 officeImgMaxBytes 同款取法),不在本文件另写一份数字 */
+  var xs = [["address", "单元格地址(形如 B4 或 Sheet1!B4)"], ["formula", "公式原文(不带前导 =)"],
+    ["name", "工作表名"], ["new_name", "新工作表名"], ["number_format", "数字格式(格式名或格式串)"]];
+  for (i = 0; i < xs.length; i++) {
+    v = a[xs[i][0]];
+    if (v == null) continue;
+    if (typeof v !== "string" || !v) return wsErr("EINVAL", "`" + xs[i][0] + "` 必须是非空字符串(" + xs[i][1] + ")");
+  }
+  if (a.range != null && (typeof a.range !== "string" || !a.range)) {
+    return wsErr("EINVAL", "`range` 必须是非空字符串(左上角地址 B2,或区域 B2:D5)");
+  }
+  if (a.sheet != null && typeof a.sheet !== "string" && !officeIsInt(a.sheet)) {
+    return wsErr("EINVAL", "`sheet` 必须是表名(字符串)或 sheet_index(整数)");
+  }
+  if (a.value_type != null && ["auto", "text", "number", "boolean", "date"].indexOf(String(a.value_type)) < 0) {
+    return wsErr("EINVAL", "`value_type` 必须是 auto / text / number / boolean / date(收到:" + JSON.stringify(a.value_type) + ")");
+  }
+  if (a.value !== undefined && a.value !== null && typeof a.value !== "string"
+    && typeof a.value !== "number" && typeof a.value !== "boolean") {
+    return wsErr("EINVAL", "`value` 只能是字符串 / 数值 / 布尔 / null(收到 " + typeof a.value + ")");
+  }
+  if (a.rows != null) {
+    e = officeGridErr(a.rows, "rows", 0, 0);
+    if (e) return e;
+  }
+  if (a.sheets != null) {
+    if (!(a.sheets instanceof Array) || !a.sheets.length) return wsErr("EINVAL", "`sheets` 必须是非空数组(至少一张工作表)");
+    var maxSh = officeLimitOf("maxSheets", 20);
+    if (a.sheets.length > maxSh) return wsErr("EINVAL", "`sheets` 最多 " + maxSh + " 张(收到 " + a.sheets.length + " 张)");
+    for (i = 0; i < a.sheets.length; i++) {
+      var sh = a.sheets[i];
+      if (!sh || typeof sh !== "object" || sh instanceof Array) {
+        return wsErr("EINVAL", "sheets[" + i + "] 必须是 {name?, rows:[[…]]}");
+      }
+      if (sh.name != null && (typeof sh.name !== "string" || !sh.name)) {
+        return wsErr("EINVAL", "sheets[" + i + "].name 必须是非空字符串");
+      }
+      if (sh.rows == null) return wsErr("EINVAL", "sheets[" + i + "] 缺少 rows");
+      e = officeGridErr(sh.rows, "sheets[" + i + "].rows", officeLimitOf("maxTableRows", 200), officeLimitOf("maxTableCols", 30));
+      if (e) return e;
+    }
+  }
+  return null;
+}
+/* 二维网格(create 的 sheets[i].rows / set_range 的 rows)的类型与**上限**判据:
+   上限从载荷 LIMITS 取(单一来源);maxRows/maxCols 传 0 = 不判上限(set_range 的格数上限
+   由载荷的 maxCellsPerCall 把关 —— 区域大小与 range 的尺寸关系也在那边判) */
+function officeGridErr(g, label, maxRows, maxCols) {
+  var i, j, v;
+  if (!(g instanceof Array) || !g.length) return wsErr("EINVAL", "`" + label + "` 必须是非空二维数组(行 ⇒ 值)");
+  if (maxRows && g.length > maxRows) {
+    return wsErr("EINVAL", label + " 有 " + g.length + " 行,超过每表上限 " + maxRows);
+  }
+  for (i = 0; i < g.length; i++) {
+    if (!(g[i] instanceof Array)) return wsErr("EINVAL", label + "[" + i + "] 必须是数组");
+    if (maxCols && g[i].length > maxCols) {
+      return wsErr("EINVAL", label + "[" + i + "] 有 " + g[i].length + " 列,超过每表上限 " + maxCols);
+    }
+    for (j = 0; j < g[i].length; j++) {
+      v = g[i][j];
+      if (v === undefined || v === null) continue;
+      if (typeof v !== "string" && typeof v !== "number" && typeof v !== "boolean") {
+        return wsErr("EINVAL", label + "[" + i + "][" + j + "] 只能是字符串 / 数值 / 布尔 / null");
+      }
+    }
+  }
   return null;
 }
 /* 参数判据的唯一出口(方案 §2.2 的 ①–⑧)。**失败一律 EINVAL + 点名句**;任一步失败都不碰工作区。
@@ -5455,27 +5831,39 @@ function officeSpecCheckValues(a, op) {
 function officeSpecCheck(a) {
   a = a || {};
   var op = (a.operation == null) ? "" : String(a.operation), i, k;
-  /* ① operation 必须在 13 项 enum 内 */
+  /* ① operation 必须在 OFFICE_OPS(= schema enum)内 */
   if (OFFICE_OPS.indexOf(op) < 0) {
     return wsErr("EINVAL", "operation 必填且必须是 " + OFFICE_OPS.join(" / ") + " 之一(收到:" + (op || "(空)") + ")");
   }
   /* ② path 必填 + 后缀 × file_type 一致 */
   if (typeof a.path !== "string" || !a.path) {
-    return wsErr("EINVAL", "path 必填(工作区里以 / 开头的路径,后缀必须是 .docx 或 .pptx)");
+    return wsErr("EINVAL", "path 必填(工作区里以 / 开头的路径,后缀必须是 .docx / .xlsx / .pptx / .xls)");
   }
   var suf = wsSuffixOf(a.path);
-  if (suf !== "docx" && suf !== "pptx") {
-    return wsErr("EINVAL", "本工具只写 docx / pptx:path 后缀必须是 .docx 或 .pptx(收到「" + a.path + "」)");
+  if (suf !== "docx" && suf !== "pptx" && suf !== "xlsx" && suf !== "xls") {
+    /* X1-d 起 xlsx 进了白名单;X2-b 起 **xls 也进**(它的能力子集见 OFFICE_SCOPE.xls);
+       doc / ppt 两句沿用原样,只在提示里补上 .xls */
+    if (suf === "doc" || suf === "ppt") {
+      return wsErr("EINVAL", "本工具不写 ." + suf + "(老格式):请先另存为 .docx / .xlsx / .pptx(.xls 也行)再用本工具改(收到「" + a.path + "」)");
+    }
+    return wsErr("EINVAL", "本工具只写 docx / xlsx / pptx / xls:path 后缀必须是 .docx / .xlsx / .pptx / .xls(收到「" + a.path + "」)");
   }
-  if (a.file_type != null && a.file_type !== "docx" && a.file_type !== "pptx") {
-    return wsErr("EINVAL", "file_type 必须是 docx 或 pptx(收到:" + JSON.stringify(a.file_type) + ")");
+  if (a.file_type != null && a.file_type !== "docx" && a.file_type !== "pptx"
+    && a.file_type !== "xlsx" && a.file_type !== "xls") {
+    return wsErr("EINVAL", "file_type 必须是 docx / xlsx / pptx / xls(收到:" + JSON.stringify(a.file_type) + ")");
   }
   if (op === "create" && a.file_type == null) {
-    return wsErr("EINVAL", "create 必须给 file_type(docx 或 pptx)");
+    return wsErr("EINVAL", "create 必须给 file_type(docx / xlsx / pptx / xls)");
   }
   var ft = (a.file_type == null) ? suf : String(a.file_type);
   if (ft !== suf) {
     return wsErr("EINVAL", "file_type(" + ft + ")与路径后缀(." + suf + ")不符 —— 请让两者一致,或省略 file_type 由后缀推断");
+  }
+  /* ②′ xls 的**能力子集**在工具面就说清楚(载荷侧也拒,这里先给能自我纠正的一句)。
+     修正轮 P1-1:`outline` 也在这条兜底里 —— 文案要同时给出"没有这条读路径时改用 ReadOffice" */
+  if (ft === "xls" && !(OFFICE_SCOPE.xls || {})[op]) {
+    return wsErr("EINVAL", ".xls(旧二进制 BIFF)只支持 " + officeOpList("xls").join(" / ")
+      + ":表结构操作(插删行 / 增删改名移表)、公式与 `outline`(工作表摘要)都没有 —— 要看内容用 ReadOffice(默认 grid 视图,能读 .xls),要改结构请先用 operation=convert 转成 .xlsx(收到 operation=" + op + ")");
   }
   /* ③ 先按 file_type 选表,再逐参数判定(不在该 (file_type, operation) 合法集里的键一律 EINVAL;
         文件类型绑定判据(第 ⑥ 步)的专属文案在 officeParamErrMsg 里;properties.page 也在这一步被点名) */
@@ -5558,23 +5946,30 @@ function officeSpecOf(args, op, ft) {
   spec.props = args.properties;
   return spec;
 }
+/* convert 的**产出路径**(X2-b;方案 §6.1 的"convert 的路径语义"):同目录同名的 .xlsx。
+   原 .xls **不动** ⇒ 这是"新文件"语义,写出走 mode:"create"(同名 .xlsx 存在 ⇒ EEXIST) */
+function officeConvertPath(p) {
+  var s = String(p);
+  return /\.xls$/i.test(s) ? s.replace(/\.xls$/i, ".xlsx") : (s + ".xlsx");
+}
 /* 工具实现(签名同 wsToolRun 的 impl:(wsId, args, ctx) ⇒ Promise<Result>)
    数据流(方案 §2.6):参数判据 → create 查存在性 / 编辑类读目标文件 → add_image 读图片 →
    OfficeWrite.run → **成功且非只读**才 wsWriteBlob。
    ★ P2-1(批次 B 审查):`outline` 是只读 op,OfficeWrite 返回 readOnly:true 且**不含 bytes**
-     ⇒ 这里按 readOnly 分支,**绝不**走写盘 —— 自保,免得将来字段变动(或误取 undefined)写坏工作区。 */
+     ⇒ 这里按 readOnly 分支,**绝不**走写盘 —— 自保,免得将来字段变动(或误取 undefined)写坏工作区。
+   ★ X2-b:`convert` 的结果写到**新路径**(officeConvertPath),写出模式 = create(不覆盖)。 */
 function officeToolRun(wsId, args, ctx) {
   var bad = officeSpecCheck(args);
   if (bad) return Promise.resolve(bad);
   var op = String(args.operation);
   var isCreate = (op === "create");
+  var isConvert = (op === "convert");
   var suf = wsSuffixOf(args.path);
   var ft = (args.file_type == null) ? suf : String(args.file_type);
   var spec = officeSpecOf(args, op, ft);
+  var outPath = isConvert ? officeConvertPath(args.path) : args.path;
   var srcSize = 0;
-  return officeTargetCheck(wsId, args.path, isCreate).then(function (t) {
-    if (wsIsErr(t)) return t;
-    if (isCreate) return null;                       /* create 没有输入文件 */
+  function readSrc() {
     return wsReadBlob(wsId, args.path).then(function (r) {
       if (wsIsErr(r)) return r;
       if ((r.size || 0) > OFFICE_MAX_BYTES) {
@@ -5585,6 +5980,16 @@ function officeToolRun(wsId, args, ctx) {
         return { ok: true, bytes: new Uint8Array(buf), size: r.size || 0 };
       });
     });
+  }
+  return officeTargetCheck(wsId, args.path, isCreate).then(function (t) {
+    if (wsIsErr(t)) return t;
+    if (isConvert) {
+      /* convert 写的是新文件:先查同名 .xlsx 在不在(在就快速失败,不白跑一次转换) */
+      return officeTargetCheck(wsId, outPath, true).then(function (t2) {
+        return wsIsErr(t2) ? t2 : readSrc();
+      });
+    }
+    return isCreate ? null : readSrc();
   }).then(function (src) {
     if (wsIsErr(src)) return src;
     if (src && src.size) srcSize = src.size;
@@ -5598,7 +6003,7 @@ function officeToolRun(wsId, args, ctx) {
     });
   }).then(function (res) {
     /* 错误码**原样带回**:EINVAL / EBADZIP / ENOTSUP / EOFFICE / EABORT / EINTERNAL / E2BIG
-       (E2BIG 由 zipPrescan 产生,是本工具的合法返回码 —— 见方案 §2.3 与 §2.7) */
+       (E2BIG 由 zipPrescan 或 xls 双闸产生,是本工具的合法返回码 —— 见方案 §2.3 与 §2.7) */
     if (!res || res.ok !== true) {
       var code = (res && res.code) || "EOFFICE";
       var msg = (res && res.error) || "Office 写入没有完成";
@@ -5621,17 +6026,29 @@ function officeToolRun(wsId, args, ctx) {
       return wsErr("EOFFICE", "写入核心没有返回字节,本次没有改动工作区(工具 Office,operation=" + op + ")", args.path);
     }
     var mime = res.mime || "";
-    return wsWriteBlob(wsId, args.path, new Blob([bytes], { type: mime }),
-      { mode: isCreate ? "create" : "overwrite", mime: mime }).then(function (w) {
+    return wsWriteBlob(wsId, outPath, new Blob([bytes], { type: mime }),
+      { mode: (isCreate || isConvert) ? "create" : "overwrite", mime: mime }).then(function (w) {
       if (wsIsErr(w)) return w;                      /* ENOSPC 等配额 / 存在性错误原样带回 */
-      return {
-        ok: true,
-        text: JSON.stringify({
-          path: w.path, file_type: ft, operation: op,
-          size: w.size, sizeDelta: w.size - srcSize,
-          counts: res.counts || {}, warnings: res.warnings || []
-        })
+      /* ★ P2-4 字段序契约(方案 §6.3):`warnings` **恒为结果 JSON 的最后一个字段** ——
+         Office 属 RESULT_TAIL_TOOLS、超预算按**保尾**截断 ⇒ 先被丢的是 changes 的尾部。
+         字段序**只写在这一处字面量里**(别在它之后再 body.xxx = … 追加:修正轮 P1-2 的教训 ——
+         旧写法把 convert 的 source_* 追加在 warnings 之后 ⇒ 末字段变成 source_size,保尾保住
+         的就不是 warnings 了)。convert 的三段 `source_*` 用 `isConvert ? … : undefined` 占位:
+         `JSON.stringify` 会丢掉 undefined 值的键 ⇒ 非 convert 路径不出现它们,而 convert 路径
+         它们**排在 changes 之前**。
+         断言:套件 T6(源码级:字面量里 source_path < changes < warnings,且 warnings 是最后一项)
+         + T5f/T5g(运行期:真 officeToolRun 的 `Object.keys(JSON.parse(text))` 末位 = warnings)。 */
+      var body = {
+        path: w.path, file_type: isConvert ? "xlsx" : ft, operation: op,
+        size: w.size, sizeDelta: w.size - srcSize,
+        counts: res.counts || {},
+        source_path: isConvert ? args.path : undefined,
+        source_file_type: isConvert ? ft : undefined,
+        source_size: isConvert ? srcSize : undefined,
+        changes: res.changes || [],
+        warnings: res.warnings || []
       };
+      return { ok: true, text: JSON.stringify(body) };
     });
   });
 }
@@ -9216,10 +9633,13 @@ function pvTasksOfConv(convId) {
   }
   return out;
 }
-/* targetConv 缺省 = 当前会话(既有行为);显式传会话 = 按那条会话列任务 ——
-   buildBody 的"任务完成回流"注入段要走发起会话,不能偷看当前会话(与 system / 工具集同口径) */
+/* targetConv 缺省 = 当前会话(既有行为);显式传会话对象 = 按那条会话列任务 ——
+   buildBody 的"任务完成回流"注入段要走发起会话,不能偷看当前会话(与 system / 工具集同口径)。
+   **也接受 convId 字符串**(pvNotifyCheck(convId) 逐层往下传的就是字符串;早前只认对象 ⇒ 传字符串时
+   cid 算成 null、列表恒空 ⇒ 自动续跑静默失效) */
 function pvListTasks(targetConv) {
-  var cid = (typeof targetConv === "undefined") ? pvConvId() : ((targetConv && targetConv.id) || null);
+  var cid = (typeof targetConv === "undefined") ? pvConvId()
+    : ((typeof targetConv === "string") ? (targetConv || null) : ((targetConv && targetConv.id) || null));
   var list = pvTasksOfConv(cid);
   list.sort(function (a, b) { return b.startedAt - a.startedAt; });
   return list;
@@ -9345,12 +9765,12 @@ function pvEndTask(t, patch) {
   updateTaskStatus();
   pvRenderTaskSummary();
   /* ★「页面无消息则不注入」的判定**收口在这里**(用户 /clear 之后手动停止任务的场景)——
-     card 停止 / `/tasks` 单行与全部停止 / TaskStop 工具 / pyTaskStopAll / 自然完成
-     共 8 条调用路径全部经过本函数,一处覆盖全部(§4.7-f③,不再各写一份判定)。
+     card 停止 / `/tasks` 单行与全部停止 / TaskStop 工具 / 自然完成与各类收尾
+     共 7 条调用路径全部经过本函数,一处覆盖全部(§4.7-f③,不再各写一份判定)。
      ★ notified 语义改写(有意,已登记 shared/step.md):置 true 表示「这条通知不必再注入」,
        而不是「模型确实收到过」—— 无消息兜底会在**没有任何请求**的前提下置位 */
-  if (!cxConvHasMessages(t.convId)) { t.notified = true; delete PV_NOTIFY_INFLIGHT[t.id]; }
-  pvNotifyCheck();
+  if (!cxConvHasMessages(t.convId)) { t.notified = true; pvInflightDel(t); }
+  pvNotifyCheck(t.convId);
   return true;
 }
 /* 界面上「停止任务」的唯一入口(卡片任务行 / `/tasks` 弹窗的单行与「全部停止」共用)。
@@ -9452,7 +9872,8 @@ function pvRunRun(v, ctx, background) {
   /* 执行侧会话 = 发起这次调用的会话(见 toolRun/ctxConv):任务归属(convId)、工作区
      (wsId)、每会话的"未完成任务"计数都按它判 —— 生成期间切走后不能改投当前会话 */
   var cc = ctxConv(ctx);
-  /* 「停止生成时也终止后台任务」默认关;关着时后台任务不订阅 ctx.signal */
+  /* 后台任务只在启动前检查一次 abort:运行中**不**订阅 ctx.signal ——
+     停止生成不杀后台任务(D-5 裁决);要中止任务,唯一手动收口 = /tasks 弹窗 */
   if (background && sig.aborted) {
     return Promise.resolve({ ok: false, logs: [], ms: 0,
       error: "EABORT: 任务在启动前就被中止了(生成已停止),没有启动。需要的话请重新发起。" });
@@ -9744,16 +10165,42 @@ function pvWaitForTool(args, ctx) {
 function pvUnnotified(targetConv) {
   return pvListTasks(targetConv).filter(function (t) {
     if (t.background !== true || !pvIsTerminal(t.status)) return false;
-    if (t.notified || PV_NOTIFY_INFLIGHT[t.id]) return false;   /* 在途的不再重复注入 */
+    if (t.notified || pvInflightHas(t)) return false;   /* 在途的不再重复注入(在途账本随会话记录走) */
     return true;
   });
 }
-function pvConvKey() { return (typeof conv !== "undefined" && conv) ? conv.id : ""; }
-/* 用户"停止生成"之后的一小段时间内,禁止自动续跑:用户刚按了停止,程序不该自己再发一次请求。
-   不丢信息 —— 被压下的通知仍是 notified:false,会随下一次正常请求的 sys 注入带过去 */
-var PV_STOP_AT = 0;
+/* 「在途通知」账本的读写(唯一收口;等价旧 PV_NOTIFY_INFLIGHT 全局单表):
+   生成中的会话用 GEN[convId].inflight;不在生成中的登记退回无名账本 PV_INFLIGHT_ORPHAN。
+   三个写点都要经这里 —— 漏掉 pvEndTask 的清理会让该 t.id 永久残留 ⇒ 任务永不注入、静默丢失 */
+var PV_INFLIGHT_ORPHAN = {};
+function pvInflightBag(targetConv) {
+  var c = (typeof targetConv === "undefined") ? conv : targetConv;
+  var g = c ? genOf(c.id) : null;
+  return g ? g.inflight : PV_INFLIGHT_ORPHAN;
+}
+function pvInflightHas(t) {
+  if (!t) return false;
+  if (PV_INFLIGHT_ORPHAN[t.id]) return true;
+  var g = t.convId ? genOf(t.convId) : null;
+  return !!(g && g.inflight[t.id]);
+}
+/* 清一条(t 的归属会话可能已不在生成中)⇒ 孤儿的与在生成的那份一起清 */
+function pvInflightDel(t) {
+  if (!t) return;
+  delete PV_INFLIGHT_ORPHAN[t.id];
+  var g = t.convId ? genOf(t.convId) : null;
+  if (g) delete g.inflight[t.id];
+}
+/* 用户"停止生成"之后的一小段时间内,禁止**该会话**自动续跑:用户刚按了停止,程序不该自己再发一次请求。
+   不丢信息 —— 被压下的通知仍是 notified:false,会随下一次正常请求的 sys 注入带过去。
+   载体必须是**独立 per-conv 表**,不能放进 GEN 记录:genDrop 会删记录,而 finally 紧接着就调
+   pvNotifyCheck ⇒ 放进记录会让静默窗在最需要它的时刻失效(方案 P0-2 的机理) */
+var PV_STOP_AT = {};            /* convId → 最近一次"停止"的时刻 */
 var PV_STOP_QUIET_MS = 5000;
-function pvSuppressAutoLoop() { PV_STOP_AT = Date.now(); }
+function pvSuppressAutoLoop(convId) { if (convId) PV_STOP_AT[convId] = Date.now(); }
+function pvStopSuppressed(convId) {
+  return Date.now() - (PV_STOP_AT[convId] || 0) < PV_STOP_QUIET_MS;
+}
 /* 空闲自动续跑上限(无人看管花费的熔断)。
    「任务结束 → 自动请求 → 模型又发起后台任务 → 再结束 → 再自动请求」会成环,每一步都是真实 API 花费,
    所以同一会话连续自动续跑最多 PV_AUTOLOOP_MAX 次;触顶后停手并提示用户手动继续。
@@ -9786,29 +10233,36 @@ function pvAutoLoopPurge() {
     if (!Object.prototype.hasOwnProperty.call(PV_AUTOLOOP_N, k)) continue;
     if (!alive[k]) { delete PV_AUTOLOOP_N[k]; delete PV_AUTOLOOP_HIT[k]; }
   }
+  /* 停止静默窗同族回收(P0-2 的独立 per-conv 表) */
+  for (k in PV_STOP_AT) {
+    if (!Object.prototype.hasOwnProperty.call(PV_STOP_AT, k)) continue;
+    if (!alive[k]) delete PV_STOP_AT[k];
+  }
 }
-function pvNotifyCheck() {
+/* 自动续跑检查(必传 convId):空闲时自动触发一次 Agent Loop(注入完成提醒 + 结果摘要,让模型继续)。
+   全部判据按**目标会话**取 —— 旧实现用 pvConvKey()=当前会话,用户在任务结束前切走就会打到别的会话 */
+function pvNotifyCheck(convId) {
   if (PV_AUTOLOOP) return;
-  if (generating) return;                       /* 生成中:交给下一轮 tool-loop 的 sys 注入 */
-  if (Date.now() - (PV_STOP_AT || 0) < PV_STOP_QUIET_MS) return;   /* 刚按过停止 → 不擅自续跑 */
-  if (!pvUnnotified().length) return;
+  if (!convId) return;                          /* 无归属会话:不自动续跑 */
+  if (genOn(convId)) return;                    /* 该会话生成中:交给下一轮 tool-loop 的 sys 注入 */
+  if (pvStopSuppressed(convId)) return;         /* 刚按过停止 → 不擅自续跑(该会话的静默窗) */
+  if (!pvUnnotified(convId).length) return;
   /* 与 pvEndTask 的「无消息不注入」同一判定(时序的另一侧:任务先结束、用户后 /clear)——
      已经清零上下文的对话没必要被程序自己再发起一次付费请求 */
-  if (!cxConvHasMessages(pvConvKey())) return;
+  if (!cxConvHasMessages(convId)) return;
   if (!apiUrl("") || !effectiveModel().trim()) return;   /* 没配好服务端时不自动发起请求 */
-  if (pvAutoLoopCapped(pvConvKey())) return;             /* 连续自动续跑触顶 → 只提示,不再发请求 */
+  if (pvAutoLoopCapped(convId)) return;                  /* 连续自动续跑触顶 → 只提示,不再发请求 */
   PV_AUTOLOOP = true;
   setTimeout(function () {
     PV_AUTOLOOP = false;
-    if (generating) return;
-    if (Date.now() - (PV_STOP_AT || 0) < PV_STOP_QUIET_MS) return;
-    if (!pvUnnotified().length) return;
-    var cid = pvConvKey();
-    if (pvAutoLoopCapped(cid)) return;
-    PV_AUTOLOOP_N[cid] = (PV_AUTOLOOP_N[cid] || 0) + 1;
+    if (genOn(convId)) return;
+    if (pvStopSuppressed(convId)) return;
+    if (!pvUnnotified(convId).length) return;
+    if (pvAutoLoopCapped(convId)) return;
+    PV_AUTOLOOP_N[convId] = (PV_AUTOLOOP_N[convId] || 0) + 1;
     try {
       toast("后台 Python 任务已结束,正在自动让模型继续(可在设置里看到任务)", "info", 5200);
-      sendMessage(null, { skipUserMsg: true });
+      sendMessage(null, { skipUserMsg: true, targetConvId: convId });   /* I12:显式目标,不认"当前会话" */
     } catch (e) {}
   }, 0);
 }
@@ -9821,22 +10275,41 @@ function pvOutcomeNote(t) {
   if (t.status === "failed") return "失败:脚本非零退出或抛异常(细节用 TaskOutput 看输出与 traceback)";
   return "已失联:页面关闭或刷新时任务仍在运行(无结果)";
 }
-/* 已完成通知的「在途」账本:notified 的语义是「模型**确实收到过**」,不是「我们打算发」。
-   pvTaskBlock() 只登记在途 → 本轮请求**解析成功**(流正常收尾 / 非流式解析通过)后由 appD
-   在 runTurn 末尾调 pvNotifyCommit() 落 notified —— 只挂 HTTP 2xx 不够:服务端可以先回 200
-   再在 SSE 流里报错,那时模型并没拿到通知;
-   请求失败/中断/流内报错由 pvNotifyRollback() 清空,任务回到未通知 → 下次请求照旧带上 */
-var PV_NOTIFY_INFLIGHT = {};
-function pvNotifyCommit() {
-  var k, t;
-  for (k in PV_NOTIFY_INFLIGHT) {
-    if (!Object.prototype.hasOwnProperty.call(PV_NOTIFY_INFLIGHT, k)) continue;
-    t = PV_TASKS[k];
-    if (t) t.notified = true;
+/* 已完成通知的「在途」账本(按会话;等价旧 PV_NOTIFY_INFLIGHT 全局单表):
+   notified 的语义是「模型**确实收到过**」,不是「我们打算发」。pvTaskBlock() 只登记在途 →
+   本轮请求**解析成功**(流正常收尾 / 非流式解析通过)后由 appD 在 runTurn 末尾调 pvNotifyCommit(convId)
+   落 notified —— 只挂 HTTP 2xx 不够:服务端可以先回 200 再在 SSE 流里报错,那时模型并没拿到通知;
+   请求失败/中断/流内报错由 pvNotifyRollback(convId) 清空,任务回到未通知 → 下次请求照旧带上 */
+function pvNotifyCommit(convId) {
+  var k, t, bag = null;
+  var g = genOf(convId);
+  if (g) bag = g.inflight;
+  if (bag) {
+    for (k in bag) {
+      if (!Object.prototype.hasOwnProperty.call(bag, k)) continue;
+      t = PV_TASKS[k];
+      if (t) t.notified = true;
+      delete bag[k];
+    }
   }
-  PV_NOTIFY_INFLIGHT = {};
+  /* 无名账本里属于该会话的条目同样提交(该会话不在生成中时登记的那类) */
+  for (k in PV_INFLIGHT_ORPHAN) {
+    if (!Object.prototype.hasOwnProperty.call(PV_INFLIGHT_ORPHAN, k)) continue;
+    t = PV_TASKS[k];
+    if (t && t.convId === convId) { t.notified = true; delete PV_INFLIGHT_ORPHAN[k]; }
+  }
 }
-function pvNotifyRollback() { PV_NOTIFY_INFLIGHT = {}; }
+/* 只回滚**该会话**的在途标记(别的会话请求在途,不得被清) */
+function pvNotifyRollback(convId) {
+  var k, t;
+  var g = genOf(convId);
+  if (g) g.inflight = {};
+  for (k in PV_INFLIGHT_ORPHAN) {
+    if (!Object.prototype.hasOwnProperty.call(PV_INFLIGHT_ORPHAN, k)) continue;
+    t = PV_TASKS[k];
+    if (t && t.convId === convId) delete PV_INFLIGHT_ORPHAN[k];
+  }
+}
 /* sys 注入段(与 wsContextBlock() 同范式与位置)。返回空串 = 没有未告知的后台任务。
    注意:description / reason / error / traceback 属不可信输入,**一律不进 sys 注入段** ——
    这里只给 id/状态/耗时/退出码/固定枚举结局/输出尾部(按数据标注)/产物与冲突路径。
@@ -9880,11 +10353,13 @@ function pvTaskBlock(targetConv) {
   /* 登记循环:这里**只登记在途**,不直接置 notified —— buildBody 是在发起请求之前拼 sys 的,
      若这次请求随后失败(网络错误 / 4xx / 用户立刻 Ctrl+X),模型根本没看到这条通知,
      置真就等于把完成回流信息静默吞掉(「完成会自动通知你」的承诺就落空了)。
-     真正的 notified:true 由本轮请求**解析成功**之后(不是 HTTP 2xx)的 pvNotifyCommit() 落,
-     失败 / 中止 / 流内报错由 pvNotifyRollback() 回滚。
+     真正的 notified:true 由本轮请求**解析成功**之后(不是 HTTP 2xx)的 pvNotifyCommit(convId) 落,
+     失败 / 中止 / 流内报错由 pvNotifyRollback(convId) 回滚。
+     账本按会话定位(生成中的会话 = GEN[convId].inflight;不在生成中退回无名账本)。
      与 pvTaskBlockText 同处一个同步块:两次 pvUnnotified 的结果一致(同一 list、同一条件) */
   var list = pvUnnotified(targetConv);
-  for (var i = 0; i < list.length; i++) PV_NOTIFY_INFLIGHT[list[i].id] = true;
+  var bag = pvInflightBag(targetConv);
+  for (var i = 0; i < list.length; i++) bag[list[i].id] = true;
   return text;
 }
 
@@ -10078,7 +10553,7 @@ function pvRenderTaskSummary() {
    ============================================================================ */
 /* 全局单实例:同一时刻只允许一个压缩(Kimi: if (this._compacting) return false)。
    phase: idle | summarizing | applying;pending 仅工具路径用(defer=true) */
-var CX_RUN = { convId: null, ctrl: null, phase: "idle", source: "", startedAt: 0, pending: null, regen: false,
+var CX_RUN = { convId: null, ctrl: null, phase: "idle", source: "", startedAt: 0, pending: null,
   /* U-4 运行时态(全部不落盘):
      statusNote = 状态行 / 运行卡 / 工具卡进度行 / 过程区的**唯一**来源(广播枢纽,禁止各写一份);
      stages = 阶段流水({at,text},最多 8 条);stream = 流式草稿 tail(≤4000 字符,完整文本只在局部变量里);
@@ -10887,7 +11362,7 @@ async function cxSummaryWithLadder(c, opts) {
   }
   function statusTick() {
     var el = Math.round((Date.now() - (CX_RUN.startedAt || t0)) / 1000);
-    setConn("busy", "正在压缩上下文…(" + statusNote + " / 已用 " + el + " 秒)");
+    setConnFor(CX_RUN.convId, "busy", "正在压缩上下文…(" + statusNote + " / 已用 " + el + " 秒)");
     /* 同一来源喂四处:状态行 / 运行中卡 / 工具卡进度行 / 过程区(广播枢纽,禁止各写一份) */
     CX_RUN.statusNote = statusNote;
     cxStagePush(statusNote);
@@ -11131,13 +11606,14 @@ async function cxCompactNow(convObj, opts) {
   opts = opts || {};
   var source = opts.source || "manual";
   var mode = (opts.mode === "auto") ? "auto" : "manual";
-  if (CX_RUN.phase !== "idle") return { ok: false, code: "ECOMPACT_BUSY" };      /* ① 单实例闸 */
-  /* ② 空闲闸:**手动**路径要求不在生成中(Kimi 的 tryAcquireQuiescence 同义)。
+  if (CX_RUN.phase !== "idle") return { ok: false, code: "ECOMPACT_BUSY" };      /* ① 单实例闸(按设计全局) */
+  /* ② 空闲闸:**手动**路径要求**目标会话**不在生成中(Kimi 的 tryAcquireQuiescence 同义)。
      工具路径必然发生在生成过程里(模型正在调用工具),不能要求空闲 —— 它靠
-     「只算不落 + 本轮工具结束后唯一应用点 + 前缀漂移闸」保证安全;auto 路径本来就在生成流程中 */
-  if (source === "manual" && generating) return { ok: false, code: "ECOMPACT_BUSY" };
+     「只算不落 + 本轮工具结束后唯一应用点 + 前缀漂移闸」保证安全;auto 路径本来就在生成流程中。
+     注:c 的解析必须在闸之前(按会话判需要它) */
   var c = getConv(convObj && convObj.id) || convObj;
-  if (!c || !Array.isArray(c.messages)) return { ok: false, code: "ECOMPACT_SMALL" };
+  if (!Array.isArray(c && c.messages)) return { ok: false, code: "ECOMPACT_SMALL" };
+  if (source === "manual" && genOn(c.id)) return { ok: false, code: "ECOMPACT_BUSY" };
   var plan = cxPlanFor(c, mode);                                                 /* ③ 规模闸 */
   if (!plan.ok) return { ok: false, code: plan.code, warnFresh: !!plan.warnFresh, plan: plan };
   CX_RUN.phase = "summarizing";
@@ -11145,7 +11621,8 @@ async function cxCompactNow(convObj, opts) {
   CX_RUN.source = source;
   CX_RUN.startedAt = Date.now();
   /* 运行级 AbortController:整段压缩运行(请求 + 退避 sleep + 应用前复检)共用 ——
-     CX_RUN.ctrl 的语义从「每次请求」改为「整段运行」,由 cxAbortActive(Ctrl+X / 停止生成)一键中止。
+     CX_RUN.ctrl 的语义从「每次请求」改为「整段运行」,由 cxAbortActiveOf(convId, …)
+     (Ctrl+X / 停止生成,按会话)一键中止。
      opts.signal(可选的外部 bridge)仍照旧接入:它 abort ⇒ 桥到运行级 ctrl */
   var runCtrl = new AbortController();
   CX_RUN.ctrl = runCtrl;
@@ -11163,7 +11640,7 @@ async function cxCompactNow(convObj, opts) {
   CX_RUN.streamFails = 0;
   CX_RUN.triggerReason = (opts && opts.triggerReason) || "";
   CX_RUN.runMsg = (opts && opts.runMsg) || null;
-  setConn("busy", "正在压缩上下文…");
+  setConnFor(c.id, "busy", "正在压缩上下文…");
   if (conv && conv.id === c.id && typeof renderChat === "function") renderChat();
   var prefix = cxPrefixSnapshot(c, plan.split);
   var hash = cxHistoryHash(c);
@@ -11210,7 +11687,7 @@ async function cxCompactNow(convObj, opts) {
     CX_RUN.convId = null;
     CX_RUN.source = "";
     CX_RUN.triggerReason = "";
-    if (!generating) setConn("ok", "已连接");
+    if (!genOn(c.id)) setConnFor(c.id, "ok", "已连接");
     if (conv && conv.id === c.id && typeof renderChat === "function") renderChat();
   }
 }
@@ -11273,8 +11750,11 @@ async function cxCompactTool(args, ctx) {
   if (!c || !Array.isArray(c.messages)) {
     return { ok: false, error: "当前没有可压缩的会话。", logs: [], ms: Date.now() - t0 };
   }
-  /* 「重新生成 / 编辑重发」路径按 opts.history 组装请求,压缩会被 hash 闸放弃 —— 提前说清 */
-  if (CX_RUN.regen) {
+  /* 「重新生成 / 编辑重发」路径按 opts.history 组装请求,压缩会被 hash 闸放弃 —— 提前说清。
+     读点 = **该会话的**记录字段(不是 CX_RUN.regen,那已被按会话化;CX_RUN.convId 在此刻
+     要么是 null 要么是别的会话 —— cxCompactNow 内部赋值、finally 复位,这里不可用) */
+  var gT = genOf(c.id);
+  if (gT && gT.regen) {
     return { ok: false, logs: [], ms: Date.now() - t0,
       error: "这条消息是「重新生成 / 编辑重发」的路径(按历史截取组装请求),压缩在应用时会被放弃;" +
              "请在正常发送的轮次里调用 Compact。" };
@@ -11316,7 +11796,7 @@ async function cxCompactTool(args, ctx) {
 async function cxCompactUIApply(convId, instruction) {
   var c = convId ? getConv(convId) : conv;
   if (!c) { toast("还没有对话,先发一条消息", "warn"); return; }
-  if (generating) { toast("正在生成中,请先按 Ctrl+X 停止再压缩", "warn", 3600); return; }
+  if (genOn(c.id)) { toast("正在生成中,请先按 Ctrl+X 停止再压缩", "warn", 3600); return; }
   if (CX_RUN.phase !== "idle") { toast("已有压缩在进行,请稍候", "warn", 3600); return; }
   var plan = cxPlanFor(c, "manual");
   if (!plan.ok) { toast("无法压缩:" + cxCodeText(plan.code, true), "warn", 6200); return; }
@@ -11362,21 +11842,23 @@ async function cxCompactUIApply(convId, instruction) {
   });
 }
 /* ---- 中止 / 账本收敛 ---- */
-/* Ctrl+X / 停止生成时中止进行中的压缩(**不读模块级 abortCtrl**:发送前窗口里它是 null);
-   待应用的压缩(pending)一并作废 —— 用户在压缩准备期间按了停止,就不该再改数据 */
-function cxAbortActive(reason) {
-  /* 用户主动中止(取消按钮 / Ctrl+X / 发送冲突)才记失败卡:无压缩在跑时不记 */
+/* 按会话中止(abortGen 的唯一入口):只中止**目标会话**的压缩运行 —— 停 B 不得中止 A 的压缩。
+   首句过滤:没有运行 / 运行的不是这条会话 ⇒ 直接返回(不动 pending / stream / 失败卡)。
+   待应用的压缩(pending)**是单实例**且带 convId:只在属该会话时清 */
+function cxAbortActiveOf(convId, reason) {
+  if (!convId || CX_RUN.phase === "idle" || CX_RUN.convId !== convId) return false;
   var rec = CX_RUN.convId;
   var src = CX_RUN.source || "manual";
-  var live = (CX_RUN.phase !== "idle");
   if (CX_RUN.ctrl) { try { CX_RUN.ctrl.abort(); } catch (e) {} }
-  CX_RUN.pending = null;
+  if (CX_RUN.pending && CX_RUN.pending.convId === convId) CX_RUN.pending = null;
   CX_RUN.stream = null;      /* 草稿即时消失(U5:不得残留半截摘要) */
-  if (live && rec) {
-    cxFailRecord(rec, "ECOMPACT_ABORT", "abort", String(reason || "已取消"), src, "", 0);
-    if (conv && conv.id === rec) renderChat();
-  }
+  cxFailRecord(rec, "ECOMPACT_ABORT", "abort", String(reason || "已取消"), src, "", 0);
+  if (conv && conv.id === rec) renderChat();
+  return true;
 }
+/* 旧入口(「当前运行的那条」语义):委托给按会话版 —— 既有调用点(发送冲突 / 手动取消)零改动。
+   注:`cxAbortActiveOf` 的过滤已覆盖"无运行"的情形(旧实现在 idle 时不记失败卡,语义一致) */
+function cxAbortActive(reason) { return cxAbortActiveOf(CX_RUN.convId, reason); }
 /* 精确清一条(deleteConvNow / wipeAllNow 用)。**不得**挂 selectConv:
    那会打掉 lastAfter 去重 —— 切走再切回同一水位就会重复压一次,白花一次摘要请求 */
 function cxForgetConv(convId) {
@@ -11412,8 +11894,6 @@ function renderPyTaskSettings() {
     el.disabled = !pyReady();
   }
   if (out) out.textContent = Math.round(v / 60000) + " 分钟";
-  var sw = $("set-py-stop-kill");
-  if (sw) sw.checked = state.settings.pyTaskStopKills === true;
   pvRenderTaskSummary();
 }
 function bindPyTaskUI() {
@@ -11426,28 +11906,8 @@ function bindPyTaskUI() {
       saveSoon();
     });
   }
-  var sw = $("set-py-stop-kill");
-  if (sw) {
-    sw.addEventListener("change", function () {
-      state.settings.pyTaskStopKills = !!sw.checked;
-      saveSoon();
-      toast(sw.checked ? "停止生成时会一并终止后台 Python 任务" : "停止生成只中止前台执行,后台任务继续跑", "info", 2600);
-    });
-  }
   var tw = $("st-task-wrap");
   if (tw) tw.addEventListener("click", function () { openSettings("mcp"); });
-}
-/* 「停止生成时也终止后台任务」(默认关)。stopGenerating() 调用 */
-function pyTaskStopAll(reason) {
-  var run = pvRunningList(), i, t, slot;
-  for (i = 0; i < run.length; i++) {
-    t = run[i];
-    pvEndTask(t, { status: "killed", reason: reason || "停止生成",
-      error: "killed: 生成被停止,任务按设置一并终止(解释器已销毁)。" });
-    slot = pySlotOfTask(t.id);
-    if (slot) pySlotKill(slot, "停止生成");
-  }
-  return run.length;
 }
 
 })();

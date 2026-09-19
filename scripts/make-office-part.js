@@ -11,12 +11,15 @@
  * 幂等:同样输入生成完全相同的字节(产物不含时间戳)。
  * 任一条断言失败 → 打印原因 + exit 1,且**不写盘**。
  *
- * 断言清单(十三条,与生成时的自检一一对应):
+ * 断言清单(与生成时的自检一一对应):
  *   1 存在与哈希  2 shebang  3 sourceMappingURL  4 jsdelivr 横幅  5 转义与 HTML 安全
  *   6 URL 中和与主机白名单  7 块结构与编译  8 内容标识  9 幂等  10 输出统计
  *   11 常量同值(TEXT_MAX ↔ ATTACH_TEXT_MAX)
  *   12 常量同值(OfficeWrite 的 5 个 LIMITS ↔ 解析层同值;含 maxImagesPerCall 算式断言)
+ *   12b 常量值域(xlsx 侧的 5 个新 LIMITS 键 ↔ 本脚本期望值;X1-a,方案 b32 §7)
+ *   12c 形态(xlsWriteBook 写出前必须清 Props/Custprops;X2-b,按 X2-a 审查 P1-2 补)
  *   13 模板件必含 XML 声明(var TPL_* 模板块内每个部件都以标准声明开头;批次 A 审查 P3-2 (b))
+ *   14 跨文件契约(data-att-skip 的写出面 / 读取面同现;S6c —— 任一侧改名即红)
  */
 'use strict';
 const fs = require('fs');
@@ -56,7 +59,9 @@ const LIBS = [
     bytes: 1271443,
     sha: '6e54af623064c4c8afd1193cc797fc91d39c909f7ddcfc7f0aba8bb45b0aa9f5',
     header: '/* 内嵌库: @jose.espana/docstream 0.1.3 (MIT) —— officeparser.browser.js,由 make-office-part.js 内联,勿手改 */',
-    marks: [['officeParser', 1], ['parseOffice', 1], ['extractAttachments', 1]],
+    /* S6c:sheetName / attachmentName 是 xlsx「图→表」映射的判据名(office-worker 的 sheetOfAttachments 读 AST)
+       —— 存在性断言:vendor 改名 ⇒ 生成期大声失败,而不是静默退化成"全表映射不到" */
+    marks: [['officeParser', 1], ['parseOffice', 1], ['extractAttachments', 1], ['sheetName', 1], ['attachmentName', 1]],
     shebangs: 2   /* 1 处真 shebang(剥) + 1 处 file-type 魔数字符串 "#!AMR"(保留) */
   },
   {
@@ -275,6 +280,75 @@ if (imgPerCall == null || imgBytes == null || imgTotal == null) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 检测 12b:Excel 侧新 LIMITS 键的值域断言(X1-a / X2-a;方案 b32 §7 与附录 B) */
+/* maxSheets / maxCellsPerCall / maxSheetCellsOutline / maxAddressRow / maxAddressCol
+   这五个键**没有解析层对照物**(解析层 LIMITS 不管 xlsx 的地址口径),但它们是
+   "工具面值域 + outline 分页 + 地址边界"的单一来源 ⇒ 期望值锁在本表:取不到
+   (被改名 / 删除)或值变了都直接 bad()(走既有的"失败不写盘"路径)。
+   ⚠ maxAddressRow / maxAddressCol 不是可随意调的额度,是 **Excel 格式的硬边界**
+   (一张表最多 1048576 行 x 16384 列 = A1 记法的 XFD1048576) —— 改了会让 parseAddr
+   接受 / 拒绝的地址与 Excel 不一致(写出来的包 Excel 会判"修复")。
+   X2-a 新增 **maxLegacyXlsBytes**(xls 整包重写路线的**输入尺寸粗闸**)+ **maxLegacyXlsCells**
+   (**内存对齐闸**:内存随格数涨 ≈1.2 KB/格;两闸的实测读数与理由见 LIMITS 处注释):
+   同样无解析层对照物,是"多大的 .xls 才允许改"这条产品边界的单一来源 ⇒ 一并锁值。
+   ⚠ 修正轮(审查 P1-1):旧值 2097152(B)被闸内反例证伪(1.57 MB / 25.0 万格 ⇒ 240 MB)——
+   1.5 MiB 与 15 万格是"最坏实测形态下仍 < 200 MB"的对齐值,改值须同步本表与 LIMITS 注释。
+   X2-b 再锁 **maxCustomNumFmtPerCall**(number_format 的自定义格式串**一次调用最多登记几个**;
+   方案 §6.1「受控白名单 + 上限 1 个/次」)。单次调用只有一个 number_format 入参 ⇒ 结构上是 1,
+   本表把它写成"不许悄悄放开"的闸:改值 = 改产品边界,必须同步本表与工具面文案。 */
+const XLSX_LIMIT_KEYS = [
+  ['maxSheets', 20, 'xlsx'],
+  ['maxCellsPerCall', 2000, 'xlsx'],
+  ['maxSheetCellsOutline', 500, 'xlsx'],
+  ['maxAddressRow', 1048576, 'xlsx'],
+  ['maxAddressCol', 16384, 'xlsx'],
+  ['maxCustomNumFmtPerCall', 1, 'xlsx'],
+  ['maxLegacyXlsBytes', 1572864, 'xls'],
+  ['maxLegacyXlsCells', 150000, 'xls']
+];
+XLSX_LIMIT_KEYS.forEach((pair) => {
+  const w = constNum(writeSrc, pair[0]);
+  if (w == null) {
+    bad('常量断言无法取值(OfficeWrite 的 ' + pair[0] + ',Excel 侧键):在 officewrite.src.js 的 '
+      + 'LIMITS 里找不到它 —— 常量被改名或删除了吗?(该键由"工具面值域 / outline 分页 / 地址边界 / xls 尺寸闸"共用)');
+  } else if (w !== pair[1]) {
+    bad('常量值不符:' + pair[0] + '(officewrite.src.js=' + w + ') ≠ 本脚本期望 ' + pair[1]
+      + '(改值须同时确认 Excel 格式边界与工具面值域,并更新本表与方案 §7 / §10.1 T-X1)');
+  } else {
+    note('常量同值:' + pair[2] + ' ' + pair[0] + ' == ' + w);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 检测 12c:xls 写出前必须清文档属性(形态断言;X2-b 按 X2-a 审查 P1-2 补)  */
+/* 依据(X2-a 缺陷 B,证据 shared/tmp/b32-x2a/out/com-diag*.txt + out/xlsout6/):
+   BIFF8 的 read 恒把 SummaryInformation 填进 `wb.Props`(且 Props === Custprops),
+   而**带任何文档属性的 BIFF8 写出会被 Excel 16.0 的文件验证拒开**("文件存在一个问题…")
+   —— SheetJS 自己读得回来,所以**值级回读判据天然看不见它**(X2-a 的 34 条判据修复前后
+   全绿)。因此这里加一条只读源码文本的**形态断言**:`xlsWriteBook` 里必须在 write 之前
+   把 `wb.Props` / `wb.Custprops` 清掉;这两句被删 / 被挪出该函数 ⇒ 直接 bad()。
+   与套件里的 xls 产物"属性流不得出现"字节判据是同一保障的两半(形态 + 产物)。 */
+const xlsWriteFn = /function xlsWriteBook\(wb\) \{[\s\S]*?\n  \}/.exec(writeSrc);
+if (!xlsWriteFn) {
+  bad('形态断言失败:officewrite.src.js 里找不到 xlsWriteBook 函数(被改名 / 删除?)'
+    + ' —— 该函数是"xls 产物不带属性流"的唯一落点');
+} else if (xlsWriteFn[0].indexOf('wb.Props = undefined;') < 0
+  || xlsWriteFn[0].indexOf('wb.Custprops = undefined;') < 0) {
+  bad('形态断言失败:xlsWriteBook 里缺少"写出前清 wb.Props / wb.Custprops"——'
+    + '带文档属性的 BIFF8 会被 Excel 16.0 拒开,而值级回读判据看不出来(X2-a 缺陷 B)');
+} else if (xlsWriteFn[0].indexOf('x.write(wb, { bookType: "xls"') < 0) {
+  bad('形态断言失败:xlsWriteBook 里找不到 .xls 写出调用(结构变了 ⇒ 本断言的位置假设要重审)');
+} else if (xlsWriteFn[0].indexOf('wb.Props = undefined;') > xlsWriteFn[0].indexOf('x.write(wb, { bookType: "xls"')
+  || xlsWriteFn[0].indexOf('wb.Custprops = undefined;') > xlsWriteFn[0].indexOf('x.write(wb, { bookType: "xls"')) {
+  /* 修正轮 P2-2:旧版只判"两句在不在"(存在性)—— 现在连**顺序**一起判:清属性必须在 write 之前。
+     (存在但写在 write 之后 = 属性照样进产物、Excel 照样拒开 —— 存在性断言看不见这种回归) */
+  bad('形态断言失败:清 wb.Props / wb.Custprops 的语句出现在 x.write(**之后**)——'
+    + '顺序反了等于没清(属性流仍会进产物);本断言要求先清后写');
+} else {
+  note('形态:xlsWriteBook 先清 Props/Custprops、后 x.write(顺序已锁;属性流不进 xls 产物)');
+}
+
+/* ------------------------------------------------------------------ */
 /* 检测 13:模板件必含 XML 声明(方案 §3 S5;批次 A 审查 P3-2 裁定 (b))     */
 /* 背景:xmlSerialize 对"无声明"的部件会合成标准声明(裁定 (a),运行期兜底),但模板串
    自己漏写声明会让新产出的部件与 docx / pptx 惯例不一致(Word 常容忍、PowerPoint 对
@@ -310,6 +384,20 @@ tplBlocks.forEach((b) => {
     note('模板声明:' + b.name + ' 的 ' + keys + ' 个部件全部以标准 XML 声明开头');
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* 检测 14:跨文件契约(data-att-skip 的写出面 ↔ 读取面必须同现;S6c)        */
+/* worker 对**不可交付的图**写 `data-att-skip="1"`,appD 按同一属性名过滤 —— 跨文件字符串契约,
+   两侧**必须同现**:漏写出侧 ⇒ 标记数 ≠ 图数 ⇒ 整篇回退(静默降级);漏读取侧 ⇒ 不可交付的图
+   占一个编号 ⇒ 图错位。任一侧改名 / 删句 ⇒ 这里直接 bad()(走既有的"失败不写盘"路径)。 */
+const attSkipGlue = countOf(glueSrc, 'data-att-skip');
+const attSkipAppD = countOf(read(path.join(SRC, 'appD.part')), 'data-att-skip');
+if (attSkipGlue < 1 || attSkipAppD < 1) {
+  bad('跨文件契约 "data-att-skip" 两处必须同现:office-worker.src.js x' + attSkipGlue
+    + ' / src/appD.part x' + attSkipAppD + '(写出面与读取面各 ≥1;漏一侧 = 静默降级 / 图错位)');
+} else {
+  note('跨文件契约:data-att-skip 两处同现(office-worker.src.js x' + attSkipGlue + ' / src/appD.part x' + attSkipAppD + ')');
+}
 
 /* ------------------------------------------------------------------ */
 /* 检测 5:转义与 HTML 安全(源内)                                        */
@@ -435,7 +523,17 @@ function report() {
     console.log('  常量算式:maxImagesPerCall x maxImageBytes == 解析层 maxImagesTotal == ' + imgTotal
       + '(' + imgPerCall + ' x ' + imgBytes + ')');
   }
+  /* 检测 12b 的读数(Excel 侧 LIMITS 键;断言跑过必须可见) */
+  XLSX_LIMIT_KEYS.forEach((pair) => {
+    const w = constNum(writeSrc, pair[0]);
+    if (w != null && w === pair[1]) {
+      console.log('  常量同值:' + pair[2] + ' ' + pair[0] + ' == ' + w + '(officewrite.src.js ↔ 本脚本期望值)');
+    }
+  });
   console.log('  源内 <!-- 合计 x' + commentHits + '(转义后产物内未转义计数应为 0)');
+  if (attSkipGlue >= 1 && attSkipAppD >= 1) {
+    console.log('  跨文件契约:data-att-skip 两处同现(office-worker.src.js x' + attSkipGlue + ' / src/appD.part x' + attSkipAppD + ')');
+  }
   /* 检测 13 的读数("断言跑过必须可见") */
   tplReadings.forEach((r) => {
     console.log('  模板声明:' + r.name + ' 部件 ' + r.keys + ' / 标准声明串 x' + r.stds
@@ -453,7 +551,9 @@ function report() {
   } else {
     console.log('  断言:全部通过(1 存在与哈希 / 2 shebang / 3 sourceMappingURL / 4 横幅 / 5 转义与 HTML 安全'
       + ' / 6 URL 中和与主机白名单 / 7 块结构与编译 / 8 内容标识 / 9 幂等 / 10 统计 / 11 常量同值'
-      + ' / 12 常量同值(OfficeWrite ↔ 解析层 LIMITS) / 13 模板含 XML 声明)');
+      + ' / 12 常量同值(OfficeWrite ↔ 解析层 LIMITS) / 12b 常量值域(Excel 侧 LIMITS 键)'
+      + ' / 12c 形态(xls 写出前清属性)'
+      + ' / 13 模板含 XML 声明 / 14 跨文件契约(data-att-skip 两处同现))');
   }
 }
 report();

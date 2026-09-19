@@ -107,6 +107,14 @@
     var n = parseInt(opts && opts.textMax, 10);
     return (isFinite(n) && n > 0) ? n : 0;
   }
+  /* xlsx / xls 的读视图(X1-c;方案 b32 §4.3 / D3):**只认 grid / csv**,其余与空值都映射成 ""
+     (= 未指定 ⇒ 胶水用 csv —— 与 X1-c 之前逐字节相同)。
+     **从这里到胶水的这条通道是纯透传**:默认值(D3 = xlsx/xls 默认 grid)是**工具面(appE)的
+     策略**,不在这层定 —— 免得"库层替调用方决定模型可见行为" */
+  function sheetViewOf(opts) {
+    var v = String((opts && opts.sheetView) == null ? "" : opts.sheetView).toLowerCase();
+    return (v === "grid" || v === "csv") ? v : "";
+  }
   /* ArrayBuffer → base64(分包,避免超长参数的栈/字符串峰值) */
   function abToBase64(buf) {
     var u8 = (buf && typeof Uint8Array !== "undefined" && buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
@@ -193,6 +201,8 @@
   function failResult(errorKind, error, t0) {
     return { ok: false, error: error, errorKind: errorKind || "corrupt", ms: Math.round(now() - t0) };
   }
+  /* ⚠️ 白名单式归一:胶水新产出的**任何字段**都必须在这里显式放行,否则会被静默丢掉
+     (S6c 教训:docxHtml / images[].sheet 少放行一处 ⇒ 数据到不了 appD,锚点形同虚设)。 */
   function normalizeResult(r, t0) {
     if (!r) { return failResult("corrupt", MSG.corrupt, t0); }
     var src = r.images || [];
@@ -208,7 +218,9 @@
         label: im.label || ("图 " + (i + 1)),
         /* 页号原样透传;**0 要保住**(不是"缺省"):pptx 认不出归属的图由胶水显式写 0,
            应用层据此保留整篇序号 + 如实注记(P2-a / S11b)。缺字段时才退回整篇序号。 */
-        page: (typeof im.page === "number" && im.page >= 0) ? im.page : (i + 1)
+        page: (typeof im.page === "number" && im.page >= 0) ? im.page : (i + 1),
+        /* S6c:归属表名(xlsx/xls;其余格式为空串)—— appD 的「图→表」映射读它 */
+        sheet: (typeof im.sheet === "string") ? im.sheet : ""
       });
     }
     return {
@@ -222,7 +234,10 @@
       skippedImgs: r.skippedImgs || 0,
       pages: r.pages || 0,
       unit: r.unit || "",
-      ms: Math.round(now() - t0)
+      ms: Math.round(now() - t0),
+      /* S6c:docx 位置锚的 HTML 输入(**瞬态**:只跨这一次调用回给 appD;
+         绝不进 att / 消息 meta / IndexedDB) —— 空串 = 没有/不需要 */
+      docxHtml: (r.docxHtml == null) ? "" : String(r.docxHtml)
     };
   }
 
@@ -263,7 +278,7 @@
         return;
       }
       try {
-        ctx.worker.postMessage({ type: "parse", id: id, ext: ext, buf: copy, textMax: opts.textMax }, [copy]);
+        ctx.worker.postMessage({ type: "parse", id: id, ext: ext, buf: copy, textMax: opts.textMax, sheetView: opts.sheetView, docxAnchor: opts.docxAnchor }, [copy]);
       } catch (e) {
         delete ctx.pending[id];
         clearTimeout(timer);
@@ -308,7 +323,7 @@
           resolve(failResult("corrupt", "解析失败:没有拿到文件内容", t0));
           return;
         }
-        core.parse(copy, ext, { onProgress: opts.onProgress, textMax: opts.textMax }).then(function (r) {
+        core.parse(copy, ext, { onProgress: opts.onProgress, textMax: opts.textMax, sheetView: opts.sheetView, docxAnchor: opts.docxAnchor }).then(function (r) {
           if (settled) { return; }
           settled = true; clearTimeout(timer);
           resolve(normalizeResult(r, t0));
@@ -331,7 +346,12 @@
 
   /* ---------------- 对外:parse / cancelCurrent / terminate ----------------
      parse(buf, ext, opts):opts.timeout / opts.onProgress / opts.textMax(P2-a:单文档正文上限,
-       0 / 缺省 = 不指定 ⇒ 胶水用 TEXT_MAX 131072;正数则抬高,只在**本次解析**生效)。 */
+       0 / 缺省 = 不指定 ⇒ 胶水用 TEXT_MAX 131072;正数则抬高,只在**本次解析**生效)/
+       opts.sheetView(X1-c:xlsx/xls 的读视图 `"grid"` | `"csv"`;缺省或其它值 = 不指定
+       ⇒ 胶水走 csv,与 X1-c 之前逐字节相同。**默认值不在这层定** —— D3 的"xlsx/xls 默认
+       grid"是工具面(appE)的策略)/
+       opts.docxAnchor(S6c:严格 === true 才开 —— docx 位置锚要 HTML,胶水多产 docxHtml +
+       文档序槽位 + data-att-skip 属性;缺省 / 其它值 ⇒ 与批前**逐字节相同**)。 */
   function parse(buf, ext, opts) {
     opts = opts || {};
     var t0 = now();
@@ -352,7 +372,9 @@
     var timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : DEFAULT_TIMEOUT;
     var hooks = {
       onProgress: typeof opts.onProgress === "function" ? opts.onProgress : null,
-      textMax: textMaxOf(opts)          /* S12:0 = 不指定(胶水用 TEXT_MAX) */
+      textMax: textMaxOf(opts),         /* S12:0 = 不指定(胶水用 TEXT_MAX) */
+      sheetView: sheetViewOf(opts),     /* X1-c:"" = 不指定(胶水用 csv) */
+      docxAnchor: opts.docxAnchor === true   /* S6c:不传 / 非 true ⇒ 批前形态 */
     };
     return enqueue(function () {
       if (api.mode === "main-thread") { return runMainThread(buf, e, hooks, timeout, t0); }

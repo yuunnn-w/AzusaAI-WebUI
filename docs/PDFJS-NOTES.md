@@ -1,7 +1,7 @@
 # pdf.js / PDFKit 内嵌产物笔记
 
 > 状态：现行 —— 内嵌 pdf.js 的取件、ESM→classic 改写与 `file://` 加载约束的唯一记录；升级库版本或改动 `src/pdfjs.part` 前必读
-> 更新：2026-09-18 · 载荷段 `src/pdfjs.part`（**1,882,880 B**，三档产物共用；口径 = `stat -c %s src/pdfjs.part`，2026-09-18 现取——该段由 netdocs-B 重生成后未再变）· 生成脚本 `scripts/make-pdfjs-part.js`（幂等 + 自检）
+> 更新：2026-09-19 · 载荷段 `src/pdfjs.part`（**1,882,880 B**，三档产物共用；口径 = `stat -c %s src/pdfjs.part`，2026-09-18 现取——该段由 netdocs-B 重生成后未再变）· 生成脚本 `scripts/make-pdfjs-part.js`（幂等 + 自检）
 > 上游版本：pdfjs-dist 6.3.289（`legacy` 构建，已修复 CVE-2024-4367）
 
 ## 1. 结论速览
@@ -181,7 +181,7 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 | `src/pdfjs.part` | **最终内嵌片段（1,863,174 B；含 §9 的流异步迭代垫片 + 手动 reader 泵）** |
 | `scripts/make-pdfjs-part.js` | ESM→classic 机械化改写 + 自检 + 转义，幂等 |
 
-- **`ReadOffice` 工具复用本引擎**：`ReadOffice` 对 PDF 先 `extractText`（**文本优先，不吃 `pdfMode()` 设置** —— 读文档的契约是"读内容"），只在确实没有文字层（分页标记 `----- 第 N 页 -----` 不算文字）时才 `renderPages`（页数 = `min(pdfMaxPages(), READ_PDF_IMG_MAX_PAGES=4)`，参数与附件图片模式同参）→ 支持视觉就附页图、否则逐页 OCR；渲染与文本抽取都直接调 `PDFKit`，不走 `resolvePdf` 包装。**`Read` 自己不再读 PDF**：遇 `.pdf` 返回 `EINVAL` 重定向到 `ReadOffice`（按后缀给词 + 可照抄的 `path` JSON），不产生任何解析副作用。
+- **`ReadOffice` 工具复用本引擎**：`ReadOffice` 对 PDF 先 `extractText`（**文本优先，不吃附件图片策略（`attachImgMode()`）设置** —— 读文档的契约是"读内容"），只在确实没有文字层（分页标记 `----- 第 N 页 -----` 不算文字）时才 `renderPages`（页数 = `min(pdfMaxPages(), READ_PDF_IMG_MAX_PAGES=4)`，参数与附件图片模式同参）→ 支持视觉就附页图、否则逐页 OCR；渲染与文本抽取都直接调 `PDFKit`，不走 `resolvePdf` 包装。**`Read` 自己不再读 PDF**：遇 `.pdf` 返回 `EINVAL` 重定向到 `ReadOffice`（按后缀给词 + 可照抄的 `path` JSON），不产生任何解析副作用。
 
 能力探针（实测 module/classic worker、blob、动态 import、`new Function` 在 http/file 下的差异，§3 的设计依据）与一次性测试件（`mk-test-pdf.js` / `mk-libtest-page.js` / `libtest-pdfjs.js` / `pdfjs-cdp.js` / `libtest-pdfjs.html` / `pdfjs-test-log.txt`）及旧 `.build/` 目录均已删除；§5 的数字是当时的原始结论（仓库不保留回归脚本，理由见 `CONTRIBUTING.md`「验证」）。
 
@@ -283,7 +283,7 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 | `READ_DOC_OCR_MAX_IMAGES` | 12 | ReadOffice 侧单次最多 OCR 张数 |
 | `READ_DOC_OCR_MAX_PAGES` | 8 | ReadOffice 侧只扫描前 8 页的图片（文本仍按 `extractText` 的 `maxPages` 取） |
 | `READ_OCR_TIMEOUT_MS` | 120 s | **整次读取**共享的 OCR 总预算（`Read` 读图片与 `ReadOffice` 读文档图片共用同一常量） |
-| `ATT_OCR_MAX_IMAGES` | 6 | **附件侧**单次最多 OCR 张数 |
+| `ATT_IMG_MAX_IMAGES` | 10 | **附件侧**单次最多处理张数（0.2.1 起：取图计划与 OCR 融合**共用同一上限**；批前名 `ATT_OCR_MAX_IMAGES`、值 6）—— 见 §11 |
 | `ATT_OCR_TIMEOUT_MS` | 60 s | **附件侧 OCR 阶段**总预算——**整次附件解析共享**，不是每图；**不是整条解析链的墙钟上限**（取图调用 `pageImages` / `renderCrops` / `renderPages` 各另带一次 60 s 超时） |
 
 字符预算两边都 = `max(512, toolLimit("maxOut") - 512)`；附件侧融合后超 `ATTACH_TEXT_MAX`(131072) 截断并标 `clipped`。
@@ -306,4 +306,46 @@ legacy 构建额外打包 **core-js 3.50.0** 自动打补丁(`Promise.withResolv
 都写页分隔标记，`text.trim()` 永不为空（实测：批前扫描件 PDF 的附件正文只有 17 字节的 `----- 第 1 页 -----`，没有正文）。
 本轮**不改那条分支**：非视觉 + 有图 ⇒ 融合生效，扫描件在文本模式下改由「页图 OCR 进 `att.text`」兜住
 （同一夹具实测：从只有页分隔标记 → 含整页图像的识别文本）；视觉模型下仍是既有的「只有页分隔标记」行为
-（要按图发就在 设置 → 附件 把 PDF 切成「图片模式」）。
+（要按图发就在 设置 → 附件 →「附件图片策略」选「图片」；三档口径见 §11）。
+
+## 11. 附件三档（0.2.1）：图片策略、格式矩阵与自绘表格图
+
+> 口径唯一来源 = `shared/specs/b31-attach-modes-plan.md`（v2.3）与决策档 `shared/decisions/0.2.1-decisions-approved-2026-09-18.md`；本节只记**已实现并已验收**的部分（落地证据 = `shared/progress/b31-main1-done.md` … `b31-main4-done.md`）。
+
+**需求**：附件里的图片「发不发、怎么发」过去只有 PDF 有文本 / 图片两档（旧键 `pdfMode`）；0.2.1 改为 **PDF 与办公附件共用**的单键三档，并给没有渲染器的格式定好如实降级。
+
+**设置口径（`appA` / `appD`）**
+- `attachImgMode ∈ {"text","image","both"}`；读取入口 `attachImgMode()`（`appD`）—— 缺键 / 非法值一律 `both`；选择器恒显三档（`ATTACH_MODE_OPTIONS`：纯文本 / 图片 / 混合），**没有第四个「自动」值**；默认 = **混合**。
+- **旧 `pdfMode` 单向迁移**（`mergeSettings`，只执行一次）：显式 `"image"` ⇒ `image`；`"text"` / 缺键 / 非法 ⇒ **`both`**（不是 `text` —— 存量 PDF 从纯文本变混合，是**用户可见变化**，进 `CHANGELOG.md`）；合法新键优先、旧键被忽略。**有意不 `delete` 旧键**：老用户盘上的 `pdfMode` 原样保留（旧版本回退仍能读到），新版本只写新键 —— 单向兼容，不是「新旧互读一致」。
+
+**判定枢纽（唯一实现）**：`decideAttachPlan(o)`（`appD`，FIRST-MATCH 七条）⇒ `{send:"text"|"both"|"image", images:"send"|"ocr"|"none", render:"pages"|"embedded"|"drawn"|"none", why, toast}`；渲染能力表 `attachRenderCap(kind, subtype)` = `pdf ⇒ "pages"` · `xlsx|xls ⇒ "drawn"` · `docx ⇒ "pages"`（`ATT_DOCX_RENDER_READY`（唯一开关，S7 起 = `true`）∧ `docxRenderReady()`（`window.RenderKit.available`，render.part 在位）；任一不满足 ⇒ `false`）· `pptx`（D11 本批排除）/ `doc` / `ppt` / 图片附件 ⇒ `false`。**硬不变量**：图不进消息时 `send` 只能是 `text`（`images==="ocr"` ⇒ `send==="text"`）。判据 = 判定矩阵 54 格（6 格式 × 3 档 × 3 视觉态）+ 能力表 7 条 + 文案咬合 18 条（三项 = **B 组 79 条**；连同 A 组 17 + C 组 54 + D 组 3 ⇒ **合计 153 条页内断言**，批-1）。
+
+**格式 × 档位矩阵（已实现事实）**
+
+| 格式 | 纯文本档 | 图片档 | 混合档（默认） |
+|---|---|---|---|
+| PDF | 只发抽出的文字；**无文字层且有图 ⇒ 自动升档混合**（`why:"scan"`；视觉发页图 / 非视觉走 OCR） | 逐页渲染页图（`pdfDpi()` 72–300、页数 ≤ `pdfMaxPages()`） | 视觉：文字 + 页图**按页交错**；非视觉：页图本机 OCR 后按页并入正文（原图不发） |
+| docx | 文字 | **逐页渲染页图**（S7 起；与 PDF 同参数：同一 DPI / 页数上限 + 单张 1 MB / 最长边 2000 闸门）——渲染失败 ⇒ 有内嵌图走混合、否则纯文本（注记 + toast 如实说明；`toastNoRender` 只用于「库不在位 / 开关关闭」） | 文字 + 内嵌图（图在前、单 text 在后；**位置锚 = S6c 已落地**：按文档序 `【图 k】` 标记交错，锚不过 ⇒ 回退 flat + 注记） |
+| pptx | 文字（含 `----- 第 N 页 -----` 幻灯标记） | **本批排除（D11）** ⇒ 降级为混合（有内嵌图）/ 纯文本，`toastNoRender` 如实说明 | 文字 + 内嵌图**按幻灯段交错**（认不出幻灯号的图追加文末 + 注记）；非视觉 ⇒ 幻灯内图 OCR 后插在该幻灯段之后 |
+| xlsx / xls | 文字（`# 表名` 段头） | **本机自绘表格图（见下）**；非视觉 ⇒ 不画图（落纯文本；有内嵌图仍走 OCR 腿） | 文字 + 文档内嵌图（**自绘图只在图片档出现**，避免与 CSV 文本重复计费） |
+| doc / ppt | 文字（老格式） | 无渲染器 ⇒ 降级（同上） | 文字（有内嵌图则按内嵌图处理） |
+| 图片附件（png / jpg…） | 按既有图片路径处理（**单图例外**，不受三档影响）：视觉 ⇒ 内联原图；非视觉 ⇒ 本机 OCR | 同左 | 同左 |
+
+**混合档 + 非视觉 = 自动本机 OCR 回退（对外不暴露档位）**
+- 图不原样发送：`PDFKit.pageImages` → `renderCrops`（失败单调降级整页并注记）→ 内嵌 Tesseract 逐张识别 → 按位置插块（PDF 按页 / pptx 按幻灯段 / xlsx、docx 接在正文之后）；三个输出读数 = `att.text` / `att.ocrImgs`（**写入过非空块的张数**；旧数据无此键 = 0，不迁移）/ `att.degraded`（注记）。
+- 「不暴露档位」两层：① 自动升档 / 改档**不新增选项、不改写用户设置**（枢纽是纯函数，只描述这一次怎么发）；② 请求体不含 `attach` 元数据（`protocolContent` 发送前整块剥掉，已断言），信息行**只在 `ocrImgs || degraded` 时**追加模式词 ⇒ 默认路径（视觉、有图）的信息行逐字节不变。
+- 降级必须可见：一次性 toast + `degraded` 注记，逐字来自枢纽（例：「当前模型不支持图像输入;这份PDF已按「混合」处理:图片内容由本机 OCR 提取后随文字发送(原图未发送)」）。
+
+**图片上限**：`ATT_IMG_MAX_IMAGES = 10`（`appD`；D4：原 `ATT_OCR_MAX_IMAGES`(6) 抬到 10 并**改名**，旧名全库归零）—— **取图计划与 OCR 融合共用同一上限**、与默认 `pdfMaxPages()` 对齐；附件侧三处取图调用点统一传 `attPdfOpts()`（`{maxScan: pdfMaxPages(), maxImages: ATT_IMG_MAX_IMAGES}`），自绘图张数上限同源（`{maxSheets: ATT_IMG_MAX_IMAGES}`）。
+
+**交错件的 `blob` 键教训（P1，批-2）**：组装「正文 + 图」有序部件时，图部件带 `attach.blob = f.id + "-p" + (数组下标 + 1)` —— 该键**必须与 `externalizeFiles` 写库的键同源**；`page` 是另一回事（PDF 保留**真页号**、xlsx 为表序号，UI 与断言都靠它）。批-2 首轮真缺陷：拿「下标数组」去找**对象**（`idx.indexOf(obj)` 恒 `-1`）⇒ 下标算成 0 ⇒ 键退化成 `-p0` ⇒ 发送期 `blobMemo` 未命中 ⇒ 请求体里页图变成「图片数据不在本机」占位（模型看不到图）。修法 = `attImgIndexOf(imgs, im)`（`imgs.indexOf(im)`；找不到返回 -1，该图退化为**内联 data**，绝不写无效键）。取证 = `diag3` 探针（判据 = `blobStore.mem` 键集合 ⊇ 部件 `attach.blob`）；修后 35/35 PASS + 两轮负例 `NEG-OK`。
+
+**自绘表格图（S6b / D12；xlsx / xls 的图片档）**
+- 零新库：`attachDrawSheetImages(text, opts)` 用 canvas 逐表画「表名 + 行列网格 + 单元格文本 + 列宽自适应（单列 260 px 裁切）」⇒ `toDataURL`；生产参数 **`scale: 2`**（单元格字体 13px ⇒ 26px）。
+- 可读性依据（真机）：同夹具 **1× ⇒ 309×126、OCR 置信度 57**（暗号 `RUN|ALPHA` 读花）；**2× ⇒ 619×252、置信度 82**（`AZUSA DRAWN 7Q3` 逐字可读）；交付图尺寸与 2× 读数逐位一致（判据钉的是生产参数）。
+- 交付闸门 `attCanvasFitForModel`（R11）：**按 `imgMaxSide()` 下采样 + 单张 1 MiB 硬顶**（`READ_IMG_HARD_MAX`）；质量梯 `q → 0.6 → 0.4`、边长梯 `1400 / 1000 / 768 / 512`，取第一个进硬顶的版本；**取舍 = 可读性优先**（不追 256 KiB 预算 —— 那是给随手拍照片的取舍，表格图缩到 512 px 宽就认不出字）。压不进硬顶的那张**只跳过该表**并记「表 N 的表格图超过单张 1.00 MB 上限,未绘制」，其余表照画。
+- 咬合读数：`heavy` 夹具原始 JPEG 5,357,103 B ⇒ 交付 **265,182 B**；`imgMaxSide=1024` ⇒ **1024×406 / 215,694 B**；`overflow` 自然画布 6280×2492 ⇒ **1400×556 / 267,153 B**（负例轮摘掉硬顶后请求体 1,382,906 B → 5,200,470 B ⇒ 上限确有约束力）。
+- 上限与注记（逐字）：每表 ≤ 60 行 × 12 列、≤ 10 表；`degraded` = 「本机绘制的表格图(仅数据网格,不含原表格式)」+ 截断注记「表 N 仅绘制前 60 行(另有 M 行未画)」「表 N 仅绘制前 12 列」「仅绘制前 10 张表(共 M 张)」。
+- 保真自证：出图后**画回 canvas 采样非空白像素**（dark 像素落在合理区间 ⇒ 不是白板）+ 真机 OCR 读出写死暗号（`AZUSA DRAWN 7Q3` / `WT-2026-0918-01…04`）。同一份 `noimg.xlsx` 两档两图源可判：默认档 `mode=both / renderSrc=embedded / parts=TTIT`；图片档 `mode=image / renderSrc=drawn / parts=II`。
+
+**`file://` 下 canvas 无 taint 的自证方式**：自绘图的像素全部来自 canvas 原生绘制（不加载任何文件 / blob URL 图片）⇒ 不会 taint。自证 = 真机（Thorium 122 + `file://` + minimal 私有副本）对每张产出调 `toDataURL` **断言不抛**（读数 `taint ok:true`），再叠加「画回 canvas 采样 + OCR 暗号」两条独立读数证明交付字节确实是这张图。**边界**：这条只覆盖 **D12 自绘图**；S7 的办公渲染页图若把 `file://` 的 blob URL 画进 canvas，仍需单独取证（R11 原文即为此写）。

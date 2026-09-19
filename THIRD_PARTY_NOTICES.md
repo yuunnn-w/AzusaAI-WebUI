@@ -1,7 +1,7 @@
 # 第三方软件声明（THIRD PARTY NOTICES）
 
 本项目分发产物（`AzusaAI-WebUI-{full,normal,minimal}.html`）是单文件应用，所有第三方库均以「内嵌源码 / 载荷」形式随包分发（零外部请求）。
-以下清单核对自随包源码注释与上游发行版（`vendor/`）的包元数据（2026-09-12；pyodide 段为 2026-09-13 补）；各库的完整许可文本保存在其随包源码的注释头或上游发行版中。
+以下清单核对自随包源码注释与上游发行版（`vendor/`）的包元数据（2026-09-12；后续各段按各自批次的实取日期补记，见各段抬头与取证行）；各库的完整许可文本保存在其随包源码的注释头或上游发行版中。
 
 | 库 | 版本 | 许可证 | 内嵌位置（源码） |
 |----|------|--------|------------------|
@@ -52,3 +52,14 @@ JupyterLite 集成（v0.2.0 轮新增，随 `src/jupyterlite.part` 分发；载�
 **对站点文件的程序化改写（如实声明）**：生成期共 5 处改动（唯一权威表 = `scripts/jupyterlite-patches.json`）：`393.*.js` 去掉动态 import 的 `{type:"module"}` 选项（1 处）· `comlink.worker.*.js` / `coincident.worker.*.js` 尾部 `export{…}` 改为 `self.<导出名>=<本地名>;` 赋值（2 件）· `jupyter-lite.json` 注入内核配置（9 键集合，含 `pyodideUrl` / `pipliteWheelUrl` / `pipliteUrls` / `disablePyPIFallback` / `loadPyodideOptions` 等）· `remoteEntry.*.js` 自定位变量钉为离线伪源 `https://azusa-jupyter.invalid/`（1 处）· `static/pypi/all.json` 以合并索引覆盖（5 键 → 18 键）；`build/schemas/all_federated.json` 另列改点但仅做形状断言、不改字节。改写点均落在加载接线与索引文件，不涉及上列各组件的许可与版权文本。
 
 **取证方式（2026-09-17 实取）**：① 各 wheel 的 `*.dist-info/METADATA`（`License-Expression` / `License` / `Classifier: License ::` 字段）与 `*.dist-info/licenses/LICENSE` 全文（`vendor/jupyterlite-src/` 及其 `site/extensions/…/static/pypi/`）；② 站点与内核扩展自带许可报告（`build/third-party-licenses.json` 逐包 `licenseId` + 配套文本）；③ `pyodide.mjs` / `micropip` 来源 = pyodide 发行版 `v314.0.6/full`（`vendor/jupyterlite-src/MANIFEST.json` 的 `url` 字段；sha256 已与上游逐位对拍）。
+
+docx 渲染页图所用三个库（b31-S7 批新增，随 `src/render.part` 分发；三件均为 npm 上游发行版原样未修改，字节数 / SHA-256 / tgz 哈希的断言清单 = `vendor/render-src/MANIFEST.json` 与 `scripts/make-render-part.js` 的 `LIBS` 表）：
+
+| 库 | 版本 | 许可证 | 内嵌位置（源码） |
+|----|------|--------|------------------|
+| [docx-preview](https://github.com/VolodymyrBaydalka/docxjs) | 0.4.0 | Apache-2.0（dist 内保留 `Released under Apache License 2.0` 横幅与版权行；许可全文 = `vendor/render-src/LICENSE.docx-preview`） | `src/render.part`（`docx-preview.min.js`，仅剥 1 处 sourceMappingURL） |
+| [jszip](https://github.com/Stuk/jszip) | 3.10.2 | **MIT 分支**（双许可 `MIT OR GPL-3.0-or-later`；随包横幅 `Dual licenced under the MIT license or GPLv3` 保留，本包采 MIT 支；许可全文 = `vendor/render-src/LICENSE.jszip.markdown`）。**含打包依赖** pako / lie / readable-stream / setimmediate（均 MIT；横幅自述 `uses the library pako`，四者标识在 min 产物内可寻），随 min 产物一并分发 | `src/render.part`（`jszip.min.js`） |
+| [modern-screenshot](https://github.com/qq15725/modern-screenshot) | 4.7.0 | MIT（**其 dist 无任何许可文本 = 上游事实**；许可全文随 `vendor/render-src/LICENSE.modern-screenshot` 分发，其 sha256 锁定在 `make-render-part.js` 与 MANIFEST 里，块头注释亦自述许可位置） | `src/render.part`（`dist/index.js` IIFE） |
+
+**MPL 差异留痕（P2-9）**：上位方案（`shared/specs/b31-attach-modes-plan.md` §3-S7）里写的「MPL-2.0 声明」= **D11 备选路线（pptx-glimpse / `@resvg/resvg-wasm`）的附条件**；本批实际落地的三件（docx-preview / jszip / modern-screenshot）**无 MPL-2.0 组件**（对三件 dist 精确扫描 `Mozilla Public License` / `MPL-2.0` = 0 命中），故本表不含 MPL 条目。
+

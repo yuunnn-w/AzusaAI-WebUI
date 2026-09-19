@@ -1,0 +1,3 @@
+# 目标声明（指南 §3.4 / 方案 §5.5.3）：无需其它配置 —— 两层接线全部在 build.rs。
+[target.x86_64-win7-windows-msvc]
+[target.i686-win7-windows-msvc]

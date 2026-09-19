@@ -1,0 +1,45 @@
+D13-1 / D13-2 + K8（零内网地址 + 零内网服务标识）+ §12-c 动态解析白名单 —— 判据归档（P6-S10 / B4b · 现取）
+生成时间 = 2026-09-19 21:57:19
+cwd(git 仓库根) = /c/Azusa/Code/AzusaAI-WebUI/AzusaAI-WebUI
+纪律（D13-6 / K10）：needle 一律**运行期分段拼接**构造，本档不写完整私有地址与完整内网服务标识；
+命中正文统一掩码为 <masked-private-addr>；本档自身必须通过同两条 grep（见第四节自检）
+
+== 一、私有网段地址（D13-1）==
+命令（在**仓库根**跑 —— 在 rust-proxy/ 内跑会让 pathspec 变成 rust-proxy/rust-proxy ⇒ 静默假绿）：
+  git grep -nE '\b(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}\b' -- rust-proxy
+命中总数 = 1
+逐条（掩码）：
+rust-proxy/README.md:20:   默认上游 `http://<masked-private-addr>/<masked-service-id>`（首次运行会在 exe 同目录生成 `config.toml`，可改）。
+⇒ 唯一命中 = rust-proxy/README.md:20 —— **属下一批 B4a 的清理范围**（任务书明示本批不碰该文件）；
+  rust-proxy 其余全部被跟踪文件 = **0**
+
+== 二、内网服务标识（K8，needle 分段拼接：k1 + 00ai）==
+命令：git grep -c -e "<needle>" -- rust-proxy   （needle 在脚本里由 "k1""00ai" 拼接，本档不复现字面量）
+按文件计数：
+rust-proxy/README.md:1
+命中总数 = 1
+⇒ 同样**只剩 README.md:20 一处**（B4a 一并清）；rust-proxy 其余被跟踪文件 = **0**
+
+== 三、D13-2 回归判据（rust-proxy/{scripts,win7-verification}/**）==
+私有无网段式 grep 命中行数 = 0（期望 0）
+内网服务标识 grep 命中行数 = 0（期望 0）
+⇒ 本档（win7-verification/ 内）亦在此判据覆盖内
+
+== 四、§12-c 动态解析点白名单（LoadLibrary|GetProcAddress）==
+命令：grep -rn -E 'LoadLibrary|GetProcAddress' rust-proxy/src
+命中 = 7 行 / 文件集合 = {src/osver.rs src/ui/mod.rs }
+逐条：
+src/osver.rs:6://! **Win7 静态导入面纪律**：`RtlGetVersion` 经 `GetProcAddress(ntdll.dll)` **动态取** ——
+src/osver.rs:72:    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+src/osver.rs:77:        let proc = GetProcAddress(module, windows::core::s!("RtlGetVersion"))?;
+src/ui/mod.rs:603:/// **动态取** `dwmapi.dll!DwmSetWindowAttribute`（`GetProcAddress`）：本函数不产生任何静态导入
+src/ui/mod.rs:615:        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+src/ui/mod.rs:616:        let module = match LoadLibraryW(windows::core::w!("dwmapi.dll")) {
+src/ui/mod.rs:625:        let Some(proc) = GetProcAddress(module, windows::core::s!("DwmSetWindowAttribute")) else {
+说明：白名单口径 = **7 行 / 2 文件**（方案 §12-c / §11-①）。现取行号 = osver.rs:6,72,77 · ui/mod.rs:603,615,616,625；
+      其中 osver.rs:6 与 ui/mod.rs:603 为**文档注释**，其余 5 行为代码。
+      ⚠ 相对方案成文时的 599/611/612/621，ui/mod.rs 的 4 处**下移 4 行** —— 原因 = B3 批在 ui/mod.rs 插入了 4 行；
+        **集合与条数未变**（仍是 2 文件 7 行）：新增第 3 处动态解析点即判缺陷。
+
+== 五、本档自检（写完立即复扫）==
+见生成脚本 80-archive-gates.sh 末尾的两次 grep（期望 0 / 0）

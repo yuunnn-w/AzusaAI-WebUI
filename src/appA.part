@@ -175,7 +175,9 @@ var DEFAULT_SETTINGS = {
   /* --- Python 运行时(pyodide,随页面内置) --- */
   pyodideCacheReady: false,      // 运行时是否已缓存(全内嵌下 pyocache 恒空 → 纯展示位)
   pyTaskTimeoutMs: 1800000,      // 后台 Python 任务超时(默认 30 分钟,clamp 60s–60min)
-  pyTaskStopKills: false,        // 「停止生成时也终止后台任务」(默认关)
+  /* 多会话并发:同时生成的会话数上限(1~6,默认 3)。超限的发送转入该会话的待发送缓冲,
+     任一会话收尾后按"槽首项最旧"自动补发(见 appA 的 genNew / genDrop 唤醒扫描) */
+  genMax: 3,
   /* --- 外部 MCP(需求④;默认关闭) --- */
   externalToolsEnabled: false,       // 外部 MCP 总开关(刻意避开 mcpEnabled,旧语义已废弃,见 mergeSettings)
   externalToolDefaultPerm: "ask",    // 外部工具默认权限(ask/allow/deny;个别工具的三态 toolPerms[全名] 优先)
@@ -185,9 +187,11 @@ var DEFAULT_SETTINGS = {
   } ],
   mcpInjectInstructions: false,      // 是否把服务器 instructions 拼进系统提示词(默认不注入)
   /* --- 附件与多模态 --- */
-  pdfMode: "text",          // PDF:纯文本抽取(默认) / 图片渲染
-  pdfDpi: 150,              // PDF 图片模式的渲染分辨率(DPI)
-  pdfMaxPages: 10,          // PDF 图片模式最多处理多少页
+  /* 附件图片策略:纯文本 / 图片 / 混合(默认;PDF 与办公文档共用同一个开关)。
+     旧键 pdfMode 只读兼容(见 mergeSettings 里的条件式迁移)⇒ 不再写它 */
+  attachImgMode: "both",
+  pdfDpi: 150,              // 渲染分辨率(DPI):图片档与混合档的「渲染页图」用
+  pdfMaxPages: 10,          // 渲染/扫描页数上限(图片档与混合档的「渲染页图」用)
   ocrLangs: "chi_sim+eng",  // OCR 语言
   visionForce: "auto",      // auto / yes / no:图像输入能力的手动覆盖
   modelVision: {},          // 每个模型的视觉能力探测结果
@@ -484,9 +488,13 @@ function mergeSettings(st) {
   out.toolOpsAllowOverwrite = out.toolOpsAllowOverwrite !== false;
   /* Python 运行时:全内嵌下 pyocache 恒空,"是否已缓存"退化为纯展示位 */
   out.pyodideCacheReady = !!out.pyodideCacheReady;
-  /* 后台任务超时(clampNum 风格,60s–60min,默认 30min)+ 「停止时终止后台任务」开关 */
+  /* 后台任务超时(clampNum 风格,60s–60min,默认 30min) */
   out.pyTaskTimeoutMs = clampNum(out.pyTaskTimeoutMs, 60000, 3600000, 1800000);
-  out.pyTaskStopKills = out.pyTaskStopKills === true;
+  /* 「停止生成时也终止后台任务」设置项已作废(D-5 裁决:停止生成不杀后台任务,中止任务只能
+     经任务弹窗 /tasks 手动操作)⇒ 旧记录里的残留键**显式丢弃且不再复活**(幂等,每次载入/导入都清一次) */
+  delete out.pyTaskStopKills;
+  /* 多会话并发的上限(1~6,默认 3):超限的发送转入该会话的待发送缓冲,任一会话收尾后自动补发 */
+  out.genMax = clampNum(out.genMax, 1, 6, 3);
   /* ④ 外部 MCP:总开关 / 默认权限 / 服务器列表 / instructions 注入,逐条校验 */
   out.externalToolsEnabled = !!out.externalToolsEnabled;
   out.mcpInjectInstructions = !!out.mcpInjectInstructions;
@@ -510,8 +518,16 @@ function mergeSettings(st) {
       };
     });
   }
-  /* 附件:PDF 模式 / 页数 / OCR 语言 / 视觉能力覆盖 + 每个模型的探测结果 */
-  if (out.pdfMode !== "image") out.pdfMode = "text";
+  /* 附件:图片策略(三档) / 页数 / 渲染分辨率 / OCR 语言 / 视觉能力覆盖 + 每个模型的探测结果 */
+  /* 附件图片策略 = 三值枚举,条件式迁移(方案 §2.3 / D15):
+     合法新键(显式 text / image / both)直取 ⇒ 新键优先、旧键被忽略;
+     否则按旧键 pdfMode 迁移 —— **只保留「显式选过 image」**(那是批前唯一的非默认值),
+     旧 text / 缺键 / 非法值一律落 both(D15:PDF 与办公默认都走混合)。
+     有意不 delete out.pdfMode:老用户盘上的旧键原样留着(旧版本回退时仍能读到),
+     新版本只写新键 —— 这是单向兼容,不是"新旧互读一致"(见方案 §2.3 的口径修正)。 */
+  out.attachImgMode = (st.attachImgMode === "text" || st.attachImgMode === "image" || st.attachImgMode === "both")
+    ? st.attachImgMode
+    : (st.pdfMode === "image" ? "image" : "both");
   if (typeof out.pdfDpi !== "number" || out.pdfDpi < 72 || out.pdfDpi > 300) out.pdfDpi = 150;
   if (typeof out.pdfMaxPages !== "number" || out.pdfMaxPages < 1 || out.pdfMaxPages > 50) out.pdfMaxPages = 10;
   if (out.ocrLangs !== "eng" && out.ocrLangs !== "chi_sim" && out.ocrLangs !== "chi_sim+eng") out.ocrLangs = "chi_sim+eng";
@@ -620,13 +636,175 @@ var CONV_GONE_MS = 10 * 60 * 1000;
 var CONV_GONE_MAX = 2000;
 var state = loadState();
 var conv = null;
-var generating = false;
-var abortCtrl = null;
 var storageBroken = false;
-var connState = { level: "idle", text: "未配置" };
 var draftFiles = [];
 var convSearchKw = "";
-var lastStats = null;
+
+/* ---------------------------------------------------------------------------
+   2.5 生成上下文注册表(多会话并发:b30)
+---------------------------------------------------------------------------
+   在此之前,"哪条会话在生成"由模块级 generating/abortCtrl/genConvId/lastStats 几个全局量
+   混着表达 —— 视图语义(当前看的会话)与生命周期语义(在飞的那条 send)共用一个布尔。
+   并发后二者必须分开:生成上下文一律按会话归属,唯一权威 = 本表(广播枢纽,禁止各写一份)。
+   记录随 genNew 建立、随 genDrop 销毁;不落盘(刷新即失,与既有语义一致)。
+   PV_STOP_AT 是唯一**有意不放进记录**的联动量(见 appE pvSuppressAutoLoop:genDrop 会删记录,
+   而"停止后的静默窗"必须在收尾之后仍然有效)。 */
+var GEN = {};                 /* convId → { convId, seq, ctrl, startedAt, phase, turn, regen, inflight } */
+var GEN_SEQ = 0;              /* 单调创建序号(诊断 + 补发扫描的稳定顺序) */
+var GEN_MAX_DEF = 3, GEN_MAX_MIN = 1, GEN_MAX_MAX = 6;
+var GEN_WAKE_SENT = false;    /* 最近一次 genDrop 是否已做过"缓冲补发"(一次收尾至多补一发) */
+var GEN_TOASTED = {};         /* 「后台完成提示」去重键表:convId + ":" + 该轮末条 assistant 消息 id */
+var CONN = {};                /* convId → { level, text }:按会话的连接状态(发送链 / 压缩链写) */
+var CONN_GLOBAL = { level: "idle", text: "未配置" };   /* 页面级动作(拉模型 / 测试连接 / 启动)的状态 */
+var LASTSTATS = {};           /* convId → 最近一次生成的统计(状态栏按当前会话取) */
+
+function genMaxNow() { return clampNum(state.settings.genMax, GEN_MAX_MIN, GEN_MAX_MAX, GEN_MAX_DEF); }
+function genOf(id) { return (id && GEN[id]) ? GEN[id] : null; }
+function genOn(id) { return !!genOf(id); }
+function genAny() { return genCount() > 0; }
+function genCount() {
+  var n = 0, k;
+  for (k in GEN) if (Object.prototype.hasOwnProperty.call(GEN, k)) n++;
+  return n;
+}
+function genCur() { return genOf(conv && conv.id); }
+/* 开始一次生成(唯一入口)。返回 null = 并发已达上限(调用方转缓冲,不得静默丢弃);
+   同会话重入返回既有记录(调用方按"已在生成"处理 —— 入口门已先行拦截,这里是兜底契约) */
+function genNew(convId) {
+  if (!convId) return null;
+  var ex = GEN[convId];
+  if (ex) return ex;
+  if (genCount() >= genMaxNow()) return null;
+  GEN[convId] = {
+    convId: convId, seq: ++GEN_SEQ,
+    ctrl: new AbortController(),          /* 创建点 = 这里(与开轮同一拍):压缩窗口内按 Ctrl+X 也有可中止对象 */
+    startedAt: Date.now(), phase: "streaming",
+    turn: { used: 0 }, regen: false, inflight: {}
+  };
+  renderConvList();                       /* I6:徽标与记录同拍 */
+  syncConn();
+  return GEN[convId];
+}
+/* 收尾唯一出口(幂等):必须先于任何"读取是否在生成"的 UI 刷新调用。
+   返回 = 本次收尾是否已做过缓冲补发(供同一个 finally 里的 sqFlushAfterTurn 让位;
+   其它调用点可忽略 —— 契约上等价 void) */
+function genDrop(convId) {
+  GEN_WAKE_SENT = false;
+  if (!convId || !GEN[convId]) return false;
+  delete GEN[convId];
+  renderConvList();
+  syncConn();
+  /* 后台完成提示(D-2=B):只在"收尾的不是当前视图"时提示,恰好一次
+     (去重键 = convId + ":" + 该轮末条 assistant 消息 id;记录已删但消息已落盘,重复收尾不会二次弹) */
+  if (conv && conv.id !== convId) {
+    var c = getConv(convId);
+    if (c) {
+      var last = null, i;
+      for (i = c.messages.length - 1; i >= 0; i--) {
+        if (c.messages[i] && c.messages[i].role === "assistant") { last = c.messages[i]; break; }
+      }
+      var key = convId + ":" + (last ? last.id : "none");
+      if (!GEN_TOASTED[key]) {
+        if (Object.keys(GEN_TOASTED).length > 400) GEN_TOASTED = {};   /* 去重表只服务提示层,防无界增长 */
+        GEN_TOASTED[key] = true;
+        /* 文案按本轮结局分档(失败/停止不谎报"已完成") */
+        var what = (last && last.stopped) ? "的生成已停止"
+          : ((last && last.error) ? "的这一轮已结束(有错误,详见会话内提示)" : "的回答已完成");
+        toast("会话《" + (c.title || "新对话") + "》" + what, (last && last.error) ? "warn" : "success", 5600);
+      }
+    }
+  }
+  genWakeBuffers();
+  return GEN_WAKE_SENT;
+}
+/* 缓冲唤醒(D-1=B 的必备件):任一会话收尾后,若仍有空位,按"槽首项最旧"补发 1 条。
+   被上限挡下的会话**没有在飞回合**,既有的两个自动出口(tool 边界 / 回合兜底)都不会再来碰它 ——
+   没有这条扫描,"等空位自动发送"就不成立(sqHintText 的对应文案指的正是这里) */
+function genWakeBuffers() {
+  GEN_WAKE_SENT = false;
+  if (genCount() >= genMaxNow()) return;
+  var best = null, bestAt = 0, k;
+  for (k in SQ) {
+    if (!Object.prototype.hasOwnProperty.call(SQ, k)) continue;
+    var s = SQ[k];
+    if (!s || !s.items || !s.items.length) continue;
+    if (genOn(k) || !getConv(k)) continue;      /* 在飞 / 已删的槽不动 */
+    var head = s.items[0];
+    if (head && head.retryAt && head.retryAt > Date.now()) continue;   /* 刚补发失败过:冷却期内不重试(防即时循环) */
+    var at = head.at || 0;
+    if (!best || at < bestAt) { best = k; bestAt = at; }
+  }
+  if (!best) return;
+  if (sqSendHead(best)) GEN_WAKE_SENT = true;   /* 补发动作自身不得递归触发下一轮扫描 */
+}
+/* 阶段标记:徽标三态文案(生成中 / 工具执行中 / 等你操作)的唯一来源 */
+function genSetPhase(convId, p) {
+  var g = genOf(convId);
+  if (!g || g.phase === p) return;
+  g.phase = p;
+  renderConvList();
+}
+/* 徽标文案(唯一映射点) */
+function genPhaseText(p) {
+  if (p === "tools") return { text: "工具执行中", warn: false, tip: "该会话正在工具执行中" };
+  if (p === "wait-approval" || p === "wait-ask") return { text: "等你操作", warn: true, tip: "该会话正在等你放行 / 回答" };
+  if (p === "stopping") return { text: "停止中", warn: false, tip: "该会话的生成正在停止" };
+  return { text: "生成中", warn: false, tip: "该会话正在生成回答" };
+}
+/* 只中止**指定会话**:本轮请求 → 该会话的压缩 → 它的工具等待 → 它的沙箱 → 它的续跑静默窗 → phase。
+   **不含后台 Python 任务**(D-5 裁决:停止生成不杀任务;任务中止的唯一手动收口 = /tasks 弹窗) */
+function abortGen(convId, why) {
+  var g = genOf(convId);
+  if (!g) return false;
+  if (g.ctrl) { try { g.ctrl.abort(); } catch (e) {} }
+  if (typeof cxAbortActiveOf === "function") { try { cxAbortActiveOf(convId, why || "用户停止生成"); } catch (e) {} }
+  denyToolWaitsOf(convId);
+  killSandboxesOf(convId, "已中止:生成被停止");
+  if (typeof pvSuppressAutoLoop === "function") pvSuppressAutoLoop(convId);
+  genSetPhase(convId, "stopping");
+  return true;
+}
+/* 页面级硬收尾(仅 beforeunload / 清空全部数据这类整页动作):逐会话中止。
+   逐会话的 abortGen 已覆盖 GEN 记录内的会话;末尾再用**全表版**做一次兜底扫描 ——
+   收掉"无归属"(convId 为空)的等待项与沙箱条目(这同时让两个全表变体保持有调用点)。
+   不新增任何 UI 入口 */
+function stopAllGen(why) {
+  var ids = [], k;
+  for (k in GEN) if (Object.prototype.hasOwnProperty.call(GEN, k)) ids.push(k);
+  for (var i = 0; i < ids.length; i++) abortGen(ids[i], why || "页面级收尾");
+  denyAllToolWaits();
+  killAllSandboxes(why || "页面级收尾");
+}
+/* 只读诊断快照(测试与排查;三条纪律:只读 / 不含正文与设置 / 不新增通信面) */
+function genStatSnapshot() {
+  var list = [], k;
+  for (k in GEN) {
+    if (!Object.prototype.hasOwnProperty.call(GEN, k)) continue;
+    var g = GEN[k];
+    list.push({
+      convId: k, seq: g.seq, phase: g.phase, ms: Date.now() - g.startedAt,
+      turnUsed: (g.turn && g.turn.used) || 0,
+      waitApproval: waitsCountOf(k, "approval"), waitAsk: waitsCountOf(k, "ask")
+    });
+  }
+  list.sort(function (a, b) { return a.seq - b.seq; });
+  return { max: genMaxNow(), count: genCount(), cur: (conv && conv.id) || "", list: list };
+}
+window.__GEN_STAT = genStatSnapshot;
+/* 按会话回收 CONN / LASTSTATS / GEN_TOASTED 的残留条目(删会话与整库替换后调用;
+   口径照抄 pvAutoLoopPurge:以 state.conversations 为 alive 集扫表删键) */
+function connStatsPurge() {
+  var alive = {}, i, k;
+  for (i = 0; i < state.conversations.length; i++) {
+    if (state.conversations[i] && state.conversations[i].id) alive[state.conversations[i].id] = 1;
+  }
+  for (k in CONN) if (Object.prototype.hasOwnProperty.call(CONN, k) && !alive[k]) delete CONN[k];
+  for (k in LASTSTATS) if (Object.prototype.hasOwnProperty.call(LASTSTATS, k) && !alive[k]) delete LASTSTATS[k];
+  for (k in GEN_TOASTED) {
+    if (!Object.prototype.hasOwnProperty.call(GEN_TOASTED, k)) continue;
+    if (!alive[k.slice(0, k.indexOf(":"))]) delete GEN_TOASTED[k];
+  }
+}
 
 /* ---------------------------------------------------------------------------
    附件二进制的外置存储(IndexedDB)
@@ -1766,10 +1944,25 @@ if (CAP.matchMedia) {
 }
 
 /* ---------------------------------------------------------------------------
-   6. 连接状态
+   6. 连接状态(按会话)
 --------------------------------------------------------------------------- */
-function setConn(level, text) {
-  connState.level = level; connState.text = text;
+/* 唯一写入口:写 CONN[convId](或页面级 CONN_GLOBAL) —— 渲染一律由 syncConn 单点完成。
+   不再提供"作用于当前会话"的糖:发送链 / 压缩链都显式传自己的会话,拉模型 / 测试连接
+   这类页面级动作显式传 null(写全局值)。
+   刷新触发点固定四处:本函数末尾 / selectConv / genNew 成功后 / genDrop 之后 */
+function setConnFor(convId, level, text) {
+  if (convId) CONN[convId] = { level: level, text: text };
+  else CONN_GLOBAL = { level: level, text: text };
+  syncConn();
+}
+/* 当前会话有状态 ⇒ 显示它(含 busy);否则任一会话在生成 ⇒ "其他 N 条会话正在生成";
+   都没有 ⇒ 显示全局最近值(初始与今日文案逐字一致) */
+function syncConn() {
+  var cur = (conv && conv.id) ? CONN[conv.id] : null;
+  var level, text;
+  if (cur) { level = cur.level; text = cur.text; }
+  else if (genCount() > 0) { level = "warn"; text = "其他 " + genCount() + " 条会话正在生成"; }
+  else { level = CONN_GLOBAL.level; text = CONN_GLOBAL.text; }
   var dot = $("conn-dot");
   dot.className = "conn-dot" + (level === "ok" ? " ok" : level === "err" ? " err" : level === "busy" ? " busy" : "");
   $("conn-text").textContent = text;

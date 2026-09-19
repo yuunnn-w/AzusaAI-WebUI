@@ -1,0 +1,21 @@
+# Rust 构建产物
+/target/
+*.pdb
+*.ilk
+
+# 取件缓存与解包工具（可由 scripts/fetch-assets.ps1 重新取件 ⇒ 不入库；方案 §8.4 / DG14）
+/.cache/
+/tools/depends/
+
+# Win7 资产：不入库（DG14 = 按需取件；避免 ≈38 MB 永久写进历史，
+# 且不把 EPL-2.0 的第三方二进制纳入本仓库再分发）。
+# ⚠ 离线构建需要 .cache/ 已有归档；缺失时构建大声失败，绝不静默降级。
+/assets/vc-ltl/
+/assets/yy-thunks/
+
+# 发布产物（exe 只做 Release 附件，不入库）
+/dist/
+
+# 内网版默认上游的**本地**注入源（P6-K11-a）：只在本地构建「内网版」时被 build.rs 读取。
+# ⚠ 绝不入库（开源红线 D13）：这个文件里就是内网地址，一旦被 git 跟踪即泄露。
+/.internal-default.txt

@@ -15,7 +15,6 @@ function getConv(id) {
 /* opts.keepDraft = true 用于「发送路径上补建会话」:文字 / 附件已经在调用方手上,
    不能被这里的清草稿动作清掉(doSend / sendMessage 的 !conv 分支) */
 function newConversation(opts) {
-  if (generating) { toast("正在生成中,请先停止当前回答", "warn"); return null; }
   conv = {
     id: uid(),
     title: "新对话",
@@ -34,16 +33,18 @@ function newConversation(opts) {
   renderChat();
   renderConvList();
   updateTopbar();
+  updateSendButton();      /* 新会话不是生成态:按钮回"发送" */
   closeSidebarMobile();
   focusInput();
   return conv;
 }
 /* 新建对话的三个入口(命令面板 / 侧栏按钮 / Ctrl+N)统一走这里:输入区非空(文字 / 已解析附件 /
    解析中的占位)时先确认一次 —— newConversation() 会把这些全部清掉,且草稿不按会话保留,
-   误触 Ctrl+N 就再也找不回来。空草稿直接新建;发送路径的补建会话不受影响(见 newConversation 的 keepDraft) */
+   误触 Ctrl+N 就再也找不回来。空草稿直接新建;发送路径的补建会话不受影响(见 newConversation 的 keepDraft)。
+   注:并发后"别的会话在生成"不再挡新建 —— 新会话与在飞的那条互不触碰 */
 function newConversationUI() {
   var dirty = !!(elInput.value.trim() || draftFiles.length || pendingOffice.length);
-  if (generating || !dirty) { newConversation(); return; }   /* 生成中由 newConversation 自己提示,它也不清草稿 */
+  if (!dirty) { newConversation(); return; }
   openAskDialog({
     title: "新建对话",
     icon: "plus",
@@ -54,7 +55,7 @@ function newConversationUI() {
   });
 }
 function selectConv(id) {
-  if (generating && conv && conv.id === id) return;
+  if (conv && conv.id === id && genOn(id)) return;
   conv = getConv(id);
   state.activeId = id;
   saveSoon();
@@ -66,6 +67,8 @@ function selectConv(id) {
   renderChat();
   renderConvList();
   updateTopbar();
+  updateSendButton();      /* 切会话必须重派生按钮:每个会话有自己的生成态(缺陷 G 的修法) */
+  syncConn();              /* 连接文案随视图切换重算(S-5 的四个触发点之一) */
   closeSidebarMobile();
   closeFind();
 }
@@ -84,7 +87,16 @@ function deleteConvNow(id) {
   /* 先把删除意图记成墓碑再落盘:这样紧随其后的记录写就带着它,对侧收到事件时已经知道
      "这条是被删掉的",不会用自己的未落库副本把它顶回来(convsDel 落地后还会再记一次) */
   markConvsGone([id]);
+  /* 删除正在生成的会话:当场中止它的请求(省 token / 省后端占用),不留"幽灵生成中"(I9)。
+     顺序要点:先落 state(让下面 genDrop 里的 getConv(id) 取不到)再 abort+genDrop ——
+     genDrop 的"后台完成提示"只在会话仍存在时才弹,删掉的这条不该弹 */
+  var wasGen = genOn(id);
   state.conversations = state.conversations.filter(function (x) { return x.id !== id; });
+  if (wasGen) {
+    try { abortGen(id, "会话已删除"); } catch (e) {}
+    genDrop(id);
+  }
+  delete SQ[id];                           /* 该会话的待发送槽一并丢弃(会话都没了,队列无归属) */
   if (state.activeId === id) {
     conv = state.conversations[0] || null;
     state.activeId = conv ? conv.id : null;
@@ -94,8 +106,9 @@ function deleteConvNow(id) {
   convsDel([id]).then(function () { return gcBlobs(); }).then(function () { renderDataPanel(); });
   if (typeof pvAutoLoopPurge === "function") pvAutoLoopPurge();   /* 顺手收掉这张会话的自动续跑计数 */
   if (typeof cxForgetConv === "function") cxForgetConv(id);       /* 压缩账本精确清一条(含待应用的 pending) */
-  renderChat(); renderConvList(); updateTopbar(); updateStorageMeter();
-  toast("对话已删除", "success");
+  connStatsPurge();                        /* CONN / LASTSTATS / 完成提示去重表的残留一并回收 */
+  renderChat(); renderConvList(); updateTopbar(); updateStorageMeter(); updateSendButton(); syncConn();
+  toast(wasGen ? "对话已删除(其正在生成的回答已中止)" : "对话已删除", "success");
 }
 function renameConv(id, title) {
   var c = getConv(id);
@@ -129,9 +142,11 @@ function clearConvMessages(id) {
   var c = getConv(id);
   if (!c) return;
   if (!c.messages.length) { toast("这个对话还没有消息", "warn"); return; }
-  /* 忙碌门:生成中清空会让正在回填的那一轮无处落笔(也把上下文与请求体错位),先挡住 */
-  if (generating) { toast("正在生成中,请先按 Ctrl+X 停止再清空", "warn", 3600); return; }
-  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") {
+  /* 忙碌门:生成中清空会让正在回填的那一轮无处落笔(也把上下文与请求体错位),先挡住。
+     **按该会话判**:别的会话在生成与"清空这条"无关 */
+  if (genOn(id)) { toast("正在生成中,请先按 Ctrl+X 停止再清空", "warn", 3600); return; }
+  /* 压缩是单实例资源:只挡"清空**正在压缩的那条**"——清别的会话不破坏压缩的前提哈希(前缀漂移闸仍在) */
+  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle" && CX_RUN.convId === c.id) {
     toast("正在压缩上下文中,请稍候再清空", "warn", 3600); return;
   }
   /* 确认框是异步的:真正清空前按 id 再取一次(弹窗开着时用户可能已经切走 / 删掉) */
@@ -241,12 +256,23 @@ function renderConvList() {
     item.setAttribute("data-id", c.id);
     item.setAttribute("role", "option");
     item.title = c.title;
+    /* 生成态徽标(G4):data-gen 是测试与自动化的稳定读点;文案由 genPhaseText 派生
+       (生成中 / 工具执行中 / 等你操作 / 停止中),I6:与 GEN 记录同拍(genNew/genDrop/genSetPhase 各自刷新) */
+    var g = genOf(c.id);
+    item.setAttribute("data-gen", g ? "1" : "0");
+    var genBadge = "";
+    if (g) {
+      var ph = genPhaseText(g.phase);
+      genBadge = '<span class="ci-gen' + (ph.warn ? " warn" : "") + '" title="' + escAttr(ph.tip) +
+        '" aria-label="' + escAttr(ph.tip) + '"><i></i>' + ph.text + "</span>";
+    }
     var n = c.messages.length;
     item.innerHTML =
       '<span class="ci-pin">' + icon("pin", "sm") + "</span>" +
       '<span class="ci-icon">' + icon("chat", "sm") + "</span>" +
       '<span class="ci-main"><span class="ci-title">' + hlMatch(convPreview(c), kw) + "</span>" +
       '<span class="ci-sub">' + escapeHtml(timeAgo(c.updatedAt)) + (c.model ? " · " + escapeHtml(c.model) : "") + "</span></span>" +
+      genBadge +
       (n ? '<span class="ci-msgs">' + n + "</span>" : "") +
       '<button class="ci-menu" data-menu-opener title="更多操作" aria-label="更多操作">' + icon("down", "sm") + "</button>";
     elConvList.appendChild(item);
@@ -280,7 +306,7 @@ function updateStatusBar() {
   var m = effectiveModel();
   $("st-model").textContent = m || "未设置模型";
   $("st-model-wrap").className = "st" + (m ? "" : " warn");
-  var stats = lastStats;
+  var stats = (conv && LASTSTATS[conv.id]) || null;   /* 读数按**当前会话**取(切会话即换一组,不串扰) */
   $("st-last").textContent = stats
     ? (stats.tokens != null ? (stats.exactTokens ? "" : "≈") + stats.tokens + " tok" : "") +
       (stats.speed ? (stats.tokens != null ? " · " : "") + (stats.exactSpeed ? "" : "≈") +
@@ -401,9 +427,20 @@ var ATTACH_TEXT_MAX = 131072;                 // 单个文本文件读取上限(
    不是每图一个,与 Read 侧既有的 READ_OCR_TIMEOUT_MS(120 s)同口径,只是附件侧在选文件时要等,收紧到 60 s。
    注意它**不是整条解析链的墙钟上限**:取图调用(pageImages / renderCrops / renderPages)各还另带一次
    60 s 超时(同一常量)⇒ 取图极慢时附件解析的墙钟会超过 60 s,而「60 s」只说 OCR 这一段。
-   达到任一预算立即停并如实注记(见 attOcrFuse),不等满预算再丢图。 */
-var ATT_OCR_MAX_IMAGES = 6;
+   达到任一预算立即停并如实注记(见 attOcrFuse),不等满预算再丢图。
+   常量名 = `ATT_IMG_MAX_IMAGES`(D4 拍板:6 → **10**,与默认 `pdfMaxPages` 对齐):它是「附件一次最多处理多少张图」
+   的**唯一**上限 —— 非视觉的 OCR 融合与视觉的取图计划共用同一个值(方案 §2.4「四路统一」)。 */
+var ATT_IMG_MAX_IMAGES = 10;
 var ATT_OCR_TIMEOUT_MS = 60000;
+/* S7(docx 渲染器批)的两个预算(方案 §2.2-⑤/⑦):
+   · RENDER_DOCX_TIMEOUT_MS = 整次「逐页渲染」的墙钟上限(同族 = OfficeKit.limits.timeoutMs)。
+     超时点无法中止在跑的渲染(与既有 OCR「生效点只在两张之间」的取舍一致)⇒ 超时即 ok:false + 中文 error,不静默;
+   · RENDER_IMG_WAIT_MS = 双容器挂载后等 <img> 解码的上限(超时继续渲染,不失败 —— 防"渲染好了图没解码完"缺图)。 */
+var RENDER_DOCX_TIMEOUT_MS = 60000;
+var RENDER_IMG_WAIT_MS = 5000;
+/* 资源守卫的「非取网哨兵」= 1×1 透明 GIF(docx-preview 对缺失部件返回 null,而 null 被写进 img.src /
+   CSS url() 的**那一刻**就发起加载尝试 ⇒ 值级替换是唯一有效阻断层;对照实验见 specs/b31-s7-renderer-plan.md 附录 D)。 */
+var RENDER_IMG_SKIP_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 /* 图片最长边上限 / 重采样算法 / 单条消息附件上限都改成设置项了(见 imgMaxSide() 等) */
 var LEGACY_PDF_MIME = "application/pdf";      // 旧数据里的 pdf 部件(不再整文件内联)
 function extOf(name) {
@@ -1293,7 +1330,11 @@ function pdfDpi() {
   if (!isFinite(v) || v <= 0) v = 150;
   return Math.max(72, Math.min(300, Math.round(v)));
 }
-function pdfMode() { return state.settings.pdfMode === "image" ? "image" : "text"; }
+/* 附件图片策略(三档;唯一读取入口):缺键 / 非法值一律「混合」(方案 §2.3 / D15:单键三值、默认 both) */
+function attachImgMode() {
+  var v = state.settings.attachImgMode;
+  return (v === "text" || v === "image" || v === "both") ? v : "both";
+}
 function ocrLangs() {
   var v = String(state.settings.ocrLangs || "");
   return (v === "eng" || v === "chi_sim" || v === "chi_sim+eng") ? v : "chi_sim+eng";
@@ -1301,24 +1342,789 @@ function ocrLangs() {
 function pdfKitReady() { return !!(window.PDFKit && window.PDFKit.available); }
 function ocrReady() { return !!(window.OCRKit && window.OCRKit.available); }
 
+/* ---- 附件通用三档:判定枢纽 · 文案 · 按锚切段 · 图片档取图 ----
+   口径唯一来源 = specs/b31-attach-modes-plan.md v2.3 的 §2.2/§2.4/§2.6/§2.7。
+   本段全是纯函数:不读 DOM、不写状态、不改既有调用点 —— 接线按方案 §3 的 S3…S6b 逐步进行
+   (本步只落函数本体;「暂不调用」是刻意的,便于逐格比对方案的矩阵)。 */
+
+/* 渲染能力表(唯一来源;✅ D10/D11/D12 已拍板):
+   "pages" = 逐页渲染成页图 · "drawn" = 本机自绘表格图(canvas,零新库) · false = 没有可信的离线渲染器 */
+var ATT_DOCX_RENDER_READY = true;   /* S7(docx 渲染器批)已落地=true;真正可用还要求库在位(docxRenderReady)—— 唯一开关,别处不得另判 */
+function docxRenderReady() { return !!(window.RenderKit && window.RenderKit.available === true); }
+function attachRenderCap(kind, subtype) {
+  if (kind === "pdf") return "pages";
+  if (kind === "office") {
+    var st = String(subtype || "").toLowerCase();
+    if (st === "xlsx" || st === "xls") return "drawn";
+    if (st === "docx") return (ATT_DOCX_RENDER_READY && docxRenderReady()) ? "pages" : false;
+  }
+  return false;   /* pptx(D11 本批排除)/ doc / ppt / 图片附件:没有渲染能力 ⇒ 走降级并如实说明 */
+}
+
+/* 通用附件模式判定(纯函数;**判定顺序 FIRST-MATCH,唯一实现,别处不许重推**;方案 §2.4)
+   o = { kind:"pdf"|"office"|"image", subtype, srcMode:"text"|"image"|"both",
+         vision:true|false|null, hasText:bool, imgCount:number,
+         hasTextLayer:bool(PDF 专有;缺省 = true), cap:"pages"|"drawn"|false(缺省 = 查能力表) }
+   → { send:"text"|"both"|"image",   // 实际发送形态 ⇒ 直接落 att.mode
+       images:"send"|"ocr"|"none",   // 图怎么处理:进消息 / 交本机 OCR / 不涉及
+       render:"pages"|"embedded"|"drawn"|"none",   // 图从哪来
+       why:"vision"|"scan"|"norender"|"noimg"|"noimage"|"",   // 降级原因(给文案与注记)
+       toast:""|"…" }
+   硬不变量(方案 §2.1 的骨架):**真的发了图才可能是 image/both** ⇒ images==="ocr" 时 send 恒为 "text"。 */
+function decideAttachPlan(o) {
+  o = o || {};
+  var src = o.srcMode;
+  if (src !== "text" && src !== "image" && src !== "both") src = "both";    /* ⓪ 缺省/非法 ⇒ both(D15) */
+  var nonVis = (o.vision === false);                  /* true / null 都按「可发图」(未知按项目既有口径) */
+  var hasText = !!o.hasText;
+  var hasLayer = (o.hasTextLayer === undefined) ? true : !!o.hasTextLayer;   /* 非 PDF 一律当有文字层 */
+  var cap = (o.cap === undefined || o.cap === null) ? attachRenderCap(o.kind, o.subtype) : (o.cap || false);
+  var nImg = Number(o.imgCount) || 0;
+  var word = attachKindWord(o);
+  /* 图从哪来:D12 —— 自绘表格图只在「图片档」出现,混合/升档一律用文档内嵌图(避免与 CSV 文本重复计费) */
+  function renderFor(imageMode) {
+    if (!cap) return "embedded";
+    if (!imageMode && cap === "drawn") return "embedded";
+    return cap;
+  }
+  function toastNoRender(sendMode) {
+    return word + "暂不支持图片档(本机没有可信的离线渲染器):已改用「"
+      + (sendMode === "both" ? "混合" : "纯文本") + "」";
+  }
+  function toastVision() {
+    return "当前模型不支持图像输入;这份" + word + "已按「混合」处理:图片内容由本机 OCR 提取后随文字发送(原图未发送)";
+  }
+  function toastScan(render) {
+    var tail = nonVis ? "图片内容由本机 OCR 提取" : (render === "drawn" ? "表格图随文字发送" : "页图随文字发送");
+    return "这份" + word + "没有文字层,已改用「混合」:" + tail;
+  }
+  function mk(send, images, render, why, toast) {
+    return { send: (images === "ocr" ? "text" : send), images: images, render: render, why: why, toast: toast || "" };
+  }
+  /* ① 图片档 + 本格式没有渲染能力 ⇒ 降级(有内嵌图 ⇒ 混合,否则纯文本),如实说清
+     ⚠️ 非视觉 + 有内嵌图这一子例必须发**与其余非视觉路径同一句**的 toastVision 口径(P2-1):
+     它实际走下面的 `"ocr"` 腿(图不发送、内容靠本机 OCR 随文字发)⇒ 再说「已改用「纯文本」」
+     就会与 chip/信息行的「混合模式(图片已本机 OCR 后按原序插入)」在同一串里自相矛盾 */
+  if (src === "image" && !cap) {
+    if (!nImg) return mk("text", "none", "none", "norender", toastNoRender("text"));
+    return mk(nonVis ? "text" : "both", nonVis ? "ocr" : "send", "embedded", "norender",
+      nonVis ? toastVision() : toastNoRender("both"));
+  }
+  /* ② 图片档 + 非视觉 ⇒ 自动改档为「混合」:就地 OCR,原图不发(D2) */
+  if (src === "image" && nonVis) return mk("text", "ocr", renderFor(true), "vision", toastVision());
+  /* ③ 图片档 + 有渲染能力 ⇒ 逐页渲染页图 / xlsx|.xls 自绘表格图(D12) */
+  if (src === "image") return mk("image", "send", renderFor(true), "", "");
+  /* ④ 纯文本档 + 没有文字层(PDF 专有)+ 有图 ⇒ 升档,images 随视觉分流(D1) */
+  if (src === "text" && !hasLayer && nImg) {
+    var r4 = renderFor(false);
+    return mk(nonVis ? "text" : "both", nonVis ? "ocr" : "send", r4, "scan", toastScan(r4));
+  }
+  /* ⑤ 纯文本档 + 没有正文 + 有图 ⇒ 同 ④ 的分流(P1-2:**禁止**用与视觉态绑定的报错文案) */
+  if (src === "text" && !hasText && nImg) {
+    var r5 = renderFor(false);
+    return mk(nonVis ? "text" : "both", nonVis ? "ocr" : "send", r5, "noimage",
+      nonVis ? ("这份" + word + "只有图片,已改用本机 OCR 提取图片内容")
+             : ("这份" + word + "只有图片,已按图片发送"));
+  }
+  /* ⑥ 纯文本档 ⇒ 只发文字:不探页图、不渲染、不 OCR */
+  if (src === "text") return mk("text", "none", "none", "", "");
+  /* ⑦ 混合档(含默认值):视觉发原图,非视觉走本机 OCR;xlsx/xls 在混合档仍走内嵌图(D12) */
+  var r7 = renderFor(false);
+  if (nonVis) return mk("text", "ocr", r7, "vision", toastVision());
+  return mk("both", "send", r7, "", "");
+}
+
+/* 附件用词(单一取词点):"PDF"/"文档"/"演示文稿"/"表格" —— 按 kind/subtype 取,别硬编码 PDF */
+function attachKindWord(f) {
+  if (!f) return "附件";
+  if (f.kind === "pdf") return "PDF";
+  if (f.kind === "image") return "图片";
+  var st = String(f.subtype || "").toLowerCase();
+  if (st === "docx" || st === "doc") return "文档";
+  if (st === "pptx" || st === "ppt") return "演示文稿";
+  if (st === "xlsx" || st === "xls") return "表格";
+  return "办公文档";
+}
+/* 渲染分辨率读数(唯一来源):"150 DPI" 这串字样只在这里拼,五处调用方不再各自写 pdfDpi() */
+function renderDpiText() { return pdfDpi() + " DPI"; }
+/* 附件模式文案的唯一来源(方案 §2.7-①;五处共用:chip / 气泡卡片 / 预览 meta / office 预览分支 /
+   请求体头部信息行)。判据只看「实际发了什么」(mode/images/ocrImgs/renderSrc)+「用户选的档」(srcMode),
+   **不重读设置**;降级原因(why)与一次性 toast 由 decideAttachPlan 给,这里只描述发送形态。 */
+function attachModeLabel(f) {
+  if (!f) return "";
+  var src = f.srcMode || f.mode;
+  var what = attachKindWord(f);
+  /* 图片张数:**气泡卡片 / 预览面拿到的是 attachMetaOf 元数据**(没有 images 数组,只有 imgCount)
+     ⇒ 一律回退 imgCount(P1-1:漏了它就会把"混合"说成"该格式不支持图片档") */
+  var nImg = (f.images && f.images.length) ? f.images.length : (Number(f.imgCount) || 0);
+  function imgWord() {                 /* 图从哪来(单一取词点) */
+    return f.renderSrc === "pages" ? "页图" : (f.renderSrc === "drawn" ? "表格图" : "图");
+  }
+  if (f.mode === "image") {
+    if (f.renderSrc === "drawn") return "图片模式(本机绘制的表格图,已按图片发给模型;仅数据网格,不含原表格式)";
+    return "图片模式(" + renderDpiText() + ",已按图片发给模型)";
+  }
+  if (f.mode === "both" && nImg) {
+    return "混合模式(文字 + " + nImg + " 张" + imgWord() + "按序发送)";
+  }
+  if (f.ocrImgs) {
+    if (src === "text") return "纯文本模式(这份" + what + "没有文字层,图片已本机 OCR)";
+    return "混合模式(图片已本机 OCR 后按原序插入)";
+  }
+  if (src === "both" || src === "image") return "纯文本模式(该格式不支持图片档,已只发文字)";
+  return "纯文本模式(只发文字)";
+}
+/* 按锚把「正文 + 图」切成有序段(纯函数;组装层用它产「该段文本 + 该段图」的交错部件;方案 §2.6):
+   · text   = 已抽好的正文(PDF/pptx 含「----- 第 N 页 -----」;xlsx/xls 含「# <表名>」;docx 含【图 k】标记)
+   · images = [{mime,data,w,h,page,label,…}] —— 归属键 = img.page
+              (pageSep ⇒ 真页号 · sheetHead ⇒ 表序号 1-based · inlineMarker ⇒ 图序号 k 1-based)
+   · anchorKind ∈ {"pageSep","sheetHead","inlineMarker","none"}
+   → { segs:[{key, head, text, images:[…]}], rest:[…], notes:[…] }
+   · head = 锚行原文;段正文的位置**按 kind**:
+     pageSep / sheetHead ⇒ text = 锚行**之后**的正文(调用方按 `head + "\n" + text` 拼回正文);
+     inlineMarker   ⇒ text = 锚行**之前**的正文(标记只作锚、**不回填正文**,段序即文档序)。
+     两种位置的共同点 = 按 segs 顺序「先正文后该段图」渲染出来就是文档序。
+   · rest = 没匹配上任何段的图(调用方追加到文末 + 从 notes 取注记 —— 不静默丢)。
+   · anchorKind="none"(或认不出)⇒ 单段 + 全部图落 rest:调用方对 none 一律走既有「图部件在前、
+     单个 text 部件在后」形态,不套交错模板(方案 §2.6 的 P1-B 修法)。 */
+function attPartitionByPage(text, images, anchorKind) {
+  var imgs = images || [], s = String(text == null ? "" : text), i, j;
+  var out = { segs: [], rest: [], notes: [] };
+  if (anchorKind !== "pageSep" && anchorKind !== "sheetHead" && anchorKind !== "inlineMarker") {
+    out.segs.push({ key: "", head: "", text: s, images: [] });
+    out.rest = imgs.slice(0);
+    return out;
+  }
+  var buf = [], cur = null, no = 0;
+  /* 段 = 「cur 这个锚行 + 它之前累积的正文」:锚行落在段尾(交错时 = 正文之后接该段的图 ⇒ 与文档序一致);
+     flush 一律清掉 cur,免得尾段错挂到上一个锚上 */
+  function flush() {
+    var body = buf.join("\n").replace(/\s+$/, "");
+    if (cur) out.segs.push({ key: cur.key, head: cur.head, text: body, images: [] });
+    else if (body) out.segs.push({ key: "", head: "", text: body, images: [] });
+    buf = [];
+    cur = null;
+  }
+  if (anchorKind === "pageSep") {
+    var rows = pdfPageSplit(s);                       /* 复用既有切页判据(与 PDF 生成端同形) */
+    for (i = 0; i < rows.length; i++) {
+      out.segs.push({ key: String(rows[i].page), head: rows[i].head, text: rows[i].body, images: [] });
+    }
+  } else if (anchorKind === "sheetHead") {
+    var lines = s.split("\n");
+    for (i = 0; i < lines.length; i++) {
+      if (/^#\s/.test(lines[i])) {                    /* 段头 = "# <表名>  (范围 …)";与 ReadOffice 章节索引同形 */
+        flush();
+        no++;
+        cur = { key: String(no), head: lines[i] };
+        continue;
+      }
+      buf.push(lines[i]);
+    }
+    flush();
+  } else {
+    var ls = s.split("\n"), k = 0;
+    for (i = 0; i < ls.length; i++) {
+      var m = /^【图 (\d+)】$/.exec(ls[i]);
+      if (m) {
+        k++;
+        cur = { key: String(parseInt(m[1], 10) || k), head: ls[i] };
+        flush();
+        continue;
+      }
+      buf.push(ls[i]);
+    }
+    flush();
+  }
+  for (i = 0; i < imgs.length; i++) {
+    var im = imgs[i] || {};
+    var key = (anchorKind === "inlineMarker") ? String(i + 1) : String(im.page == null ? "" : im.page);
+    var hit = null;
+    if (key !== "") {
+      for (j = 0; j < out.segs.length; j++) if (out.segs[j].key === key) { hit = out.segs[j]; break; }
+    }
+    if (hit) hit.images.push(im);
+    else {
+      out.rest.push(im);
+      if (anchorKind === "sheetHead") out.notes.push("(原表未在文本中找到)");
+      else if (anchorKind === "inlineMarker") out.notes.push("(原图未在标记文本中找到)");
+      else out.notes.push("(第 " + key + " 页未在文本中找到)");
+    }
+  }
+  return out;
+}
+/* xlsx/xls 的「图 → 表」归属(方案 D7 的 xlsx 位置锚;唯一接线点 = S6c,本批不动 office-worker):
+   · text   = 已抽好的正文(表段头形如 `# <表名>  (范围 …)`)
+   · images = 解析层给的图;每张可带 `sheet` = 归属表名(由 office-worker 的 xlsx 分支照 docstream AST 的
+              `metadata.sheetName` + `attachmentName` 建映射,与 pptx 认 slideNumber 同法)
+   返回 { images:[…(浅拷贝,已写 page = 表序号 1-based)], notes:[…] }
+   · 认不出表名 / 表名不在正文的段头里 ⇒ page = 0(调用方按文末按序 + 注记「(原表未在文本中找到)」) */
+function attachSheetImgPages(text, images) {
+  var imgs = images || [], out = [], notes = [], i;
+  var ord = {}, segs = attPartitionByPage(text, [], "sheetHead").segs;
+  for (i = 0; i < segs.length; i++) {
+    var h = String(segs[i].head || "");
+    if (!h) continue;
+    var nm = h.replace(/^#\s*/, "").replace(/\s{2,}\(.*$/, "").replace(/\s+$/, "");
+    if (nm && !Object.prototype.hasOwnProperty.call(ord, nm)) ord[nm] = parseInt(segs[i].key, 10) || 0;
+  }
+  for (i = 0; i < imgs.length; i++) {
+    var im = imgs[i] || {}, item = {}, kk;
+    for (kk in im) if (Object.prototype.hasOwnProperty.call(im, kk)) item[kk] = im[kk];
+    var name = String(im.sheet || "");
+    item.page = (name && Object.prototype.hasOwnProperty.call(ord, name)) ? ord[name] : 0;
+    if (!item.page) notes.push("(原表未在文本中找到)");
+    out.push(item);
+  }
+  return { images: out, notes: notes };
+}
+/* docx 位置锚(方案 D7;唯一接线点 = S6c):mammoth HTML 的文档序 → 带 `【图 k】` 标记的正文 + 自检。
+   · html     = mammoth convertToHtml 产出的 HTML(worker 的 docx 分支在 docxAnchor 时带回)
+   · flatText = 解析层既有的纯文本(mammoth extractRawText 的 value,自检基准;**未 trim 的原串**)
+   · expectImgs(可选) = 本次要发送的图张数;给了就额外要求"标记数 === 期望数"
+   返回 = 标记后的正文(字符串);**拿不到 HTML / 自检不过 ⇒ null**(调用方回退 flat,不猜、不硬套锚)。
+   块模型(与 extractRawText 的排版逐字节对齐的唯一口径;docx 侧实测差分表见 docs/OFFICE-NOTES.md):
+   · 段 = 块级元素(p/h1-6/li/td/th/blockquote/pre);块级**开**标签与文本片都让"这一段开过"记在
+     `opened` 上 ⇒ **只含空白的段**(`<p>   </p>`)也占一块(HTML 有痕、可修);块级**闭**标签只收段、
+     不反向开段;容器/内联标签与 `<br>` 一律丢弃(实测 extractRawText 对 <w:br/> **不加换行**)
+   · 图独占段:该段在正文侧贡献一次段间隔(空块),`【图 k】` 标记块另占一块、插在它后面
+   · 段内混排(同段既有文字又有图)无法在不破坏逐字节的前提下插整行标记 ⇒ 整篇回退(资格判定)
+   · 自检 = 把标记块整个抽掉后重新拼接,与 flatText 逐字节相同(两侧同一套空行归一 docxAttNorm);
+     ⚠️ 本实现按 `[ \t]+ → " "` 折叠段内空白 ⇒ 段内含制表符的文档判不过 ⇒ 回退(**不是** HTML 的锅:
+     实测 HTML 保留 \t);真空段(mammoth 丢弃 `<w:p/>`、HTML 无痕)⇒ 两侧结构不可对齐 ⇒ 同样回退
+   与 office-worker 的 pptx 标记(`stripPptxMarks(marked) !== plain ⇒ null`)同一取舍:
+   宁可整篇回退,也不冒"图插错位置"的风险。两条守卫:① marked 的整行标记数 == k(防正文里本来就
+   有整行 `【图 k】` 抢段)② k == expectImgs(防 worker 与 app 侧计数漂移)—— 任一不过 = 回退。
+   `data-att-skip`:worker 对**一切不可交付的图**在 HTML 上打这个属性;本函数把它整段丢弃(不产标记)。
+   判定顺序:先丢属性、再数标记 ⇒ 含被跳过图的文档仍能锚(属性漏打 ⇒ 标记数 ≠ 图数 ⇒ 守卫②拦下)。 */
+function docxAttNorm(s) {
+  return String(s == null ? "" : s).replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").replace(/^\n+|\n+$/g, "");
+}
+var DOCX_ATT_BLOCK_OPEN = /^<(p|h[1-6]|li|td|th|blockquote|pre)\b[^>]*>$/i;
+var DOCX_ATT_BLOCK_CLOSE = /^<\/(p|h[1-6]|li|td|th|blockquote|pre)>$/i;
+function attachDocxAnchorText(html, flatText, expectImgs) {
+  var src = String(html == null ? "" : html);
+  var flat = docxAttNorm(flatText);
+  if (!src || !flat) return null;
+  function unesc(t) {
+    return String(t).replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|apos|nbsp);/g, function (mm, e) {
+      if (e === "amp") return "&";
+      if (e === "lt") return "<";
+      if (e === "gt") return ">";
+      if (e === "quot") return '"';
+      if (e === "apos") return "'";
+      if (e === "nbsp") return " ";
+      if (e.charAt(0) === "#") {
+        var n = (e.charAt(1) === "x" || e.charAt(1) === "X") ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        if (isFinite(n) && n > 0 && n <= 65535) return String.fromCharCode(n);
+      }
+      return mm;
+    });
+  }
+  /* ① 去脚本样式;跳过的图整段丢弃(靠 worker 打的 data-att-skip);其余 <img> 换哨兵 */
+  var body = src.replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
+    .replace(/<img\b[^>]*data-att-skip[^>]*>/gi, "")
+    .replace(/<img\b[^>]*>/gi, "\u0001IMG\u0001");
+  /* ② 段落模型(见上方块模型注释):`opened` = 段被开过就占一块;段内文本直接拼接(HTML 里已有的空白就是全部) */
+  var toks = body.split(/(<[^>]*>)/), paras = [], cur = null, k = 0, i, j;
+  function stOpen() { if (!cur) { cur = { text: "", marks: [], opened: false }; } cur.opened = true; }
+  function fl() { if (cur && cur.opened) { paras.push(cur); } cur = null; }
+  for (i = 0; i < toks.length; i++) {
+    var tk = toks[i];
+    if (!tk) { continue; }
+    if (tk.charAt(0) === "<" && tk.charAt(1) !== "\u0001") {
+      if (DOCX_ATT_BLOCK_OPEN.test(tk)) { stOpen(); continue; }
+      if (DOCX_ATT_BLOCK_CLOSE.test(tk)) { fl(); continue; }
+      continue;                              /* 容器/内联标签、<br>:不切段、不产字 */
+    }
+    var parts = tk.split("\u0001IMG\u0001");
+    for (j = 0; j < parts.length; j++) {
+      stOpen();
+      var t = unesc(parts[j].replace(/<[^>]*>/g, "")).replace(/[ \t]+/g, " ").replace(/^\s+|\s+$/g, "");
+      if (t) { cur.text += t; }
+      if (j < parts.length - 1) { k++; cur.marks.push(k); }
+    }
+  }
+  fl();
+  if (!k || !paras.length) { return null; }                       /* 无图 ⇒ 无锚可言 */
+  /* ③ 资格:段内混排(同段既有文字又有图)无法在不破坏逐字节的前提下插整行标记 ⇒ 不锚 */
+  for (i = 0; i < paras.length; i++) {
+    if (paras[i].marks.length && paras[i].text) { return null; }
+  }
+  /* ④ 块序列:一段一个文本块(**空段也占一块** —— 图独占段时 raw text 的那一次段间隔靠它);
+        有图的段再补「整行标记」块 */
+  var blocks = [], all = [], plain = [];
+  for (i = 0; i < paras.length; i++) {
+    var p = paras[i];
+    if (!p.marks.length) { blocks.push({ mark: false, text: p.text }); continue; }
+    blocks.push({ mark: false, text: "" });
+    for (j = 0; j < p.marks.length; j++) { blocks.push({ mark: true, text: "【图 " + p.marks[j] + "】" }); }
+  }
+  for (i = 0; i < blocks.length; i++) { all.push(blocks[i].text); if (!blocks[i].mark) { plain.push(blocks[i].text); } }
+  /* ⑤ 自检(逐字节,两侧同一套归一) */
+  if (docxAttNorm(plain.join("\n\n")) !== flat) { return null; }
+  var marked = all.join("\n\n");
+  /* ⑥ 两条守卫(都指向"宁可整篇回退,也不冒险错插") */
+  if ((marked.match(/^【图 \d+】$/gm) || []).length !== k) { return null; }   /* 正文本来就有整行【图 k】⇒ 会抢段 */
+  if (expectImgs != null && k !== Number(expectImgs)) { return null; }        /* 计数守卫:图数 ≠ 标记数 */
+  return marked;
+}
+/* 自绘表格图的交付收口(方案 R11):**按 imgMaxSide() 下采样 + 单张 1 MiB 硬顶**。
+   口径与 wsImgFitForModel 的第 2/4 条同源(重采样算法取同一预设、硬顶取同一个 READ_IMG_HARD_MAX),
+   只是输入是 canvas —— 像素本来就在本机、也不存在 mime 兼容问题 ⇒ 不重走「解码门 / 直通支」两道门。
+   取舍:**可读性优先** —— 从「最大不过上限的边长」起步、先降质量后降边长,取第一个进硬顶的版本即返回
+   (不追 256 KiB 预算:那是给"随手拍的照片"的取舍,表格图缩到 512 px 宽就再也认不出字了);
+   全梯仍压不进硬顶 ⇒ 跳过这张(`over`),不发半张坏图。
+   opts.maxEdge / opts.hardMax 只作自证读数的覆盖钩子(调用方一律不传 ⇒ 走设置与常量)。 */
+function attCanvasFitForModel(cv, format, quality, opts) {
+  var o = opts || {};
+  var edgeLimit = (Number(o.maxEdge) > 0) ? Number(o.maxEdge) : imgMaxSide();
+  var hardMax = (Number(o.hardMax) > 0) ? Number(o.hardMax) : READ_IMG_HARD_MAX;
+  var w0 = cv.width, h0 = cv.height, longest = Math.max(w0, h0), i, j;
+  var e0 = Math.min(edgeLimit, longest), cand = [e0, 1400, 1000, 768, 512], edges = [];
+  for (i = 0; i < cand.length; i++) {
+    if (cand[i] > 0 && cand[i] <= e0 && edges.indexOf(cand[i]) < 0) edges.push(cand[i]);
+  }
+  for (i = 0; i < edges.length; i++) {
+    var k = edges[i] / longest;
+    var cw = Math.max(1, Math.round(w0 * k)), ch = Math.max(1, Math.round(h0 * k));
+    var c = (k < 1) ? downscaleImage(cv, cw, ch, imgResampleMode(), false) : cv;
+    var qs = (i === 0) ? [quality, 0.6, 0.4] : [0.6, 0.4];
+    for (j = 0; j < qs.length; j++) {
+      var url = "";
+      try { url = c.toDataURL(format, qs[j]); } catch (e) { continue; }
+      if (!url || String(url).indexOf("data:") !== 0) continue;
+      var payload = dataUrlPayload(url);
+      var bytes = Math.round(payload.length * 3 / 4);
+      if (bytes > hardMax) continue;                    /* 单张硬顶:超过即不采 */
+      return {
+        ok: true, mime: (String(url).match(/^data:([^;,]+)/) || [])[1] || format,
+        data: payload, w: cw, h: ch, bytes: bytes
+      };
+    }
+  }
+  return { ok: false, over: true, limit: hardMax,
+           error: "单张表格图超过 " + fmtBytes(hardMax) + " 上限(已压到最小档仍超)" };
+}
+/* xlsx/xls 的「图片档」= 本机自绘表格图(方案 D12;零新库 = canvas + toDataURL)。
+   **数据保真、非视觉保真**:行列表格与文本内容可信;字体/颜色/合并单元格/列宽/公式/条件格式/图表一律不还原
+   —— 调用方必须把这句话写进 degraded(文案见方案 §2.7-① 的 renderSrc="drawn" 分支)。
+   · text = 已抽好的正文(每表一段:`# <表名>` 段头 + 内容);两种读视图都能画(CSV 行 / grid 的 `地址→值` 行)
+   · opts = { maxSheets, maxRows, maxCols, scale, format:"image/jpeg", quality, maxEdge, hardMax }
+   返回 { ok, images:[{mime,data,w,h,bytes,page,label}], notes:[…], error }
+   · page = 表序号(1-based)· label = "表 N · <表名>" · 每表一张图
+   · 每张图交付前一律过 attCanvasFitForModel(R11:按 imgMaxSide() 下采样 + 单张 1 MiB 硬顶);
+     压不进硬顶的那张**不发**,并在 notes 记「表 N 的表格图超过单张 <上限> 上限,未绘制」
+   · 行/列/表数超上限 ⇒ 截断 + notes 记(调用方并入 degraded;文案逐字见方案 R11 与批-4 报告) */
+function attachDrawSheetImages(text, opts) {
+  var o = opts || {};
+  var maxSheets = Math.max(1, Math.round(Number(o.maxSheets) || 10));
+  var maxRows = Math.max(1, Math.round(Number(o.maxRows) || 60));
+  var maxCols = Math.max(1, Math.round(Number(o.maxCols) || 12));
+  var scale = Number(o.scale) > 0 ? Number(o.scale) : 1;
+  var format = String(o.format || "image/jpeg");
+  var quality = (typeof o.quality === "number") ? o.quality : 0.86;
+  var res = { ok: false, images: [], notes: [], error: "" };
+  if (!canvasOK()) { res.error = "当前浏览器不支持图片绘制(canvas)"; return res; }
+  var segs = attPartitionByPage(text, [], "sheetHead").segs;
+  if (!segs.length) { res.error = "没有可绘制的表格段"; return res; }
+  /* CSV 行的引号规则(逗号/双引号/换行都在引号内时才特殊);grid 视图的 `地址\t值` 行只取值 */
+  function cellsOf(line) {
+    var gm = /^[A-Z]{1,3}[0-9]{1,7}\t([\s\S]*)$/.exec(line);
+    if (gm) return [gm[1].replace(/\t\{z=[\s\S]*$/, "")];
+    var out = [], cur = "", q = false;
+    for (var i2 = 0; i2 < line.length; i2++) {
+      var ch = line.charAt(i2);
+      if (q) {
+        if (ch === '"') { if (line.charAt(i2 + 1) === '"') { cur += '"'; i2++; } else q = false; }
+        else cur += ch;
+      } else if (ch === '"') q = true;
+      else if (ch === ",") { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  }
+  var rowsAll = [], si, ri, j3;
+  function nameOf(i2) {
+    var h = String(segs[i2].head || "").replace(/^#\s*/, "").replace(/\s{2,}\(.*$/, "").replace(/\s+$/, "");
+    return h || ("表 " + (i2 + 1));
+  }
+  for (si = 0; si < segs.length && si < maxSheets; si++) {
+    var ls = String(segs[si].text || "").split("\n"), rows = [], rest = 0;
+    for (ri = 0; ri < ls.length; ri++) {
+      if (!ls[ri].replace(/\s/g, "")) continue;
+      if (rows.length >= maxRows) { rest++; continue; }
+      rows.push(cellsOf(ls[ri]));
+    }
+    rowsAll.push({ no: si + 1, name: nameOf(si), rows: rows });
+    if (rest > 0) res.notes.push("表 " + (si + 1) + " 仅绘制前 " + maxRows + " 行(另有 " + rest + " 行未画)");
+  }
+  if (segs.length > maxSheets) res.notes.push("仅绘制前 " + maxSheets + " 张表(共 " + segs.length + " 张)");
+  var gauge = document.createElement("canvas").getContext("2d");
+  var font = Math.round(13 * scale) + "px sans-serif";
+  var headFont = "bold " + Math.round(14 * scale) + "px sans-serif";
+  for (si = 0; si < rowsAll.length; si++) {
+    var it = rowsAll[si], cols = 0, i3;
+    for (i3 = 0; i3 < it.rows.length; i3++) if (it.rows[i3].length > cols) cols = it.rows[i3].length;
+    var cutCols = false;
+    if (cols > maxCols) { cols = maxCols; cutCols = true; }
+    if (cols < 1) cols = 1;
+    var widths = [], wsum = 0;
+    gauge.font = font;
+    for (j3 = 0; j3 < cols; j3++) {
+      var mw = 48 * scale;
+      for (i3 = 0; i3 < it.rows.length; i3++) {
+        var tv = (it.rows[i3][j3] == null) ? "" : String(it.rows[i3][j3]);
+        var tw = gauge.measureText(tv).width + 12 * scale;
+        if (tw > mw) mw = tw;
+      }
+      if (mw > 260 * scale) mw = 260 * scale;          /* 单列上限:超长文本按列宽裁切显示 */
+      widths.push(Math.round(mw));
+      wsum += widths[j3];
+    }
+    var pad = Math.round(10 * scale), headH = Math.round(26 * scale), rowH = Math.round(20 * scale);
+    var cv = document.createElement("canvas");
+    cv.width = Math.max(80, Math.round(wsum + pad * 2));
+    cv.height = Math.max(60, Math.round(headH + it.rows.length * rowH + pad * 2));
+    var g = cv.getContext("2d");
+    g.fillStyle = "#ffffff";
+    g.fillRect(0, 0, cv.width, cv.height);
+    g.fillStyle = "#111111";
+    g.font = headFont;
+    g.fillText(it.name, pad, pad + Math.round(14 * scale));
+    var top = pad + headH, x0 = pad;
+    for (ri = 0; ri <= it.rows.length; ri++) {
+      var y = top + ri * rowH;
+      g.strokeStyle = "#bbbbbb";
+      g.lineWidth = 1;
+      g.beginPath();
+      g.moveTo(x0, y);
+      g.lineTo(x0 + wsum, y);
+      g.stroke();
+      if (ri >= it.rows.length) continue;
+      var xx = x0;
+      g.font = font;
+      g.fillStyle = "#000000";
+      for (j3 = 0; j3 < cols; j3++) {
+        g.save();
+        g.beginPath();
+        g.rect(xx + 1, y + 2, widths[j3] - 2, rowH - 2);
+        g.clip();
+        g.fillText((it.rows[ri][j3] == null) ? "" : String(it.rows[ri][j3]), xx + 6 * scale, y + Math.round(14 * scale));
+        g.restore();
+        xx += widths[j3];
+      }
+    }
+    g.strokeStyle = "#bbbbbb";
+    for (j3 = 0; j3 <= cols; j3++) {
+      var cx = x0;
+      for (i3 = 0; i3 < j3; i3++) cx += widths[i3];
+      g.beginPath();
+      g.moveTo(cx, top);
+      g.lineTo(cx, top + it.rows.length * rowH);
+      g.stroke();
+    }
+    var fit = attCanvasFitForModel(cv, format, quality, { maxEdge: o.maxEdge, hardMax: o.hardMax });
+    if (!fit.ok) {
+      if (fit.over) {                        /* 压不进硬顶 ⇒ 只跳过这一张(其余表照画) */
+        res.notes.push("表 " + it.no + " 的表格图超过单张 " + fmtBytes(fit.limit) + " 上限,未绘制");
+        continue;
+      }
+      res.error = "表格图导出失败(" + fit.error + ")";
+      return res;
+    }
+    res.images.push({
+      mime: fit.mime, data: fit.data, w: fit.w, h: fit.h, bytes: fit.bytes,
+      page: it.no, label: "表 " + it.no + " · " + it.name
+    });
+    if (cutCols) res.notes.push("表 " + it.no + " 仅绘制前 " + maxCols + " 列");
+  }
+  res.ok = res.images.length > 0;
+  if (!res.ok && !res.error) res.error = "没有绘制出任何表格图";
+  return res;
+}
+
+/* ===== S7:docx 逐页渲染成「页图」(唯一渲染出口;方案 specs/b31-s7-renderer-plan.md v2.1 §2.2 十步) =====
+   库 = docx-preview 0.4.0 + jszip 3.10.2 + modern-screenshot 4.7.0(均已由 render.part 内联);
+   · f    = 附件对象(只给日志/未来扩展;不读 f.text)
+   · ext  = "docx"(唯一允许值;其它值直接 {ok:false},防误接)
+   · buf  = ArrayBuffer/Uint8Array(OfficeKit 已读出的同一份字节;**不重新读文件**)
+   · opts = { onProgress?:fn(phase), maxPages?:n, dpi?:n }   // 缺省 = pdfMaxPages() / pdfDpi()
+   返回 Promise<{ ok, images:[PageImage], notes:[String], pages:Number, clipped:Boolean, error:String }>
+   · 永不 reject;整体失败 ⇒ ok:false + error(中文);部分页失败/截断 ⇒ ok:true + notes
+   · images[].page = 1-based 真页号(顺序即渲染序)
+   十步:① 守卫 → ② 双宿主(游离) → ③ parseAsync(OPTIONS 钉死) → ④ 资源守卫(wrap 三方法,值级阻断)
+        → ⑤ renderDocument(仍游离) → ⑥ 游离态资源清洗(防御纵深) → ⑦ 双容器挂载 + 等图
+        → ⑧ 分页(section.docx) → ⑨ 逐页光栅化 + attCanvasFitForModel 闸门(+空页守卫) → ⑩ 注记 + 清理 + 返回 */
+function attachRenderPageImages(f, ext, buf, opts) {
+  var o = opts || {};
+  var res = { ok: false, images: [], notes: [], pages: 0, clipped: false, error: "", clean: { attr: 0, styleUrl: 0 } };
+  /* ① 守卫(不抛) */
+  if (String(ext).toLowerCase() !== "docx" || !docxRenderReady()
+    || !(window.docx && window.JSZip && window.modernScreenshot)) {
+    res.error = "渲染器未内嵌";
+    return Promise.resolve(res);
+  }
+  var maxPages = Math.max(1, Math.round(Number(o.maxPages) || pdfMaxPages()));
+  var dpi = (Number(o.dpi) > 0) ? Number(o.dpi) : pdfDpi();
+  var host = null, styleHost = null;
+  function cleanup() {   /* ⑦ 宿主用后必删(成功/失败/超时三条路径都在收口处执行) */
+    try { if (host && host.parentNode) { host.parentNode.removeChild(host); } } catch (e) {}
+    try { if (styleHost && styleHost.parentNode) { styleHost.parentNode.removeChild(styleHost); } } catch (e) {}
+  }
+  function mkHost() {
+    var d = document.createElement("div");
+    d.style.cssText = "position:absolute;left:-10000px;top:0;pointer-events:none;";
+    return d;                                   /* 只创建、不挂载(第 ⑦ 步才挂) */
+  }
+  /* OPTIONS 钉死(parse 与 render 传同一对象;useBase64URL:true ⇒ 图/内嵌字体全 data: URL;
+     renderAltChunks:false ⇒ 斩断 altChunk 的 iframe srcdoc 取网面;ignoreLastRenderedPageBreak:false
+     = 让 docx-preview 按 <w:lastRenderedPageBreak/> 分页 —— 贴 Word 页数的关键一项) */
+  var OPT = {
+    className: "docx", inWrapper: true, breakPages: true, ignoreLastRenderedPageBreak: false,
+    renderHeaders: true, renderFooters: true, renderFootnotes: true, renderEndnotes: true,
+    useBase64URL: true, renderAltChunks: false
+  };
+  /* ④ 资源守卫(值级阻断):三个装载口任何一个返回空/抛错 ⇒ 透明 GIF 哨兵(计数 img/numbering/font/errors) */
+  function installGuard(d) {
+    var counters = { img: 0, numbering: 0, font: 0, errors: 0 };
+    function wrap(name, key) {
+      var orig = d[name];
+      if (typeof orig !== "function") { return; }
+      d[name] = function (a, b) {
+        return Promise.resolve().then(function () { return orig.call(d, a, b); })
+          .then(function (u) { if (u) { return u; } counters[key]++; return RENDER_IMG_SKIP_GIF; },
+            function () { counters.errors++; return RENDER_IMG_SKIP_GIF; });
+      };
+    }
+    wrap("loadDocumentImage", "img");
+    wrap("loadNumberingImage", "numbering");
+    wrap("loadFont", "font");
+    return counters;
+  }
+  /* ⑥ 游离态资源清洗(防御纵深):白名单外 URL 属性中和(<a>/<area> 的 href 豁免:超链接不发起请求,点击才是用户动作);
+     `<style>` 节点文本里的 url(http(s)://…) 一并中和为 url(about:blocked#)(方案 §2.2-⑥ 的 style 文本面)。
+     两类计数 = {attr: 属性中和数, styleUrl: 样式文本中和数} —— **正常输入下都应为 0**
+     (不为 0 说明还有未驯服的引用 ⇒ 调用方如实进 notes,见步骤 ⑩)。 */
+  function cleanNodes(nodes) {
+    var attrs = ["src", "srcset", "poster", "data", "xlink:href", "href"];
+    var out = { attr: 0, styleUrl: 0 };
+    var URL_RE = /url\(\s*['"]?https?:\/\/[^)'"]*['"]?\s*\)/gi;
+    function walk(el) {
+      if (el.nodeType === 1) {
+        var tag = String(el.tagName || "").toLowerCase(), i, v;
+        for (i = 0; i < attrs.length; i++) {
+          if (i === 5 && (tag === "a" || tag === "area")) { continue; }
+          v = el.getAttribute(attrs[i]);
+          if (v == null) { continue; }
+          if (!/^(data:|blob:|about:|#)/.test(v)) { out.attr++; el.removeAttribute(attrs[i]); }
+        }
+        if (tag === "style") {
+          var t = String(el.textContent || "");
+          var hits = (t.match(URL_RE) || []).length;
+          if (hits) { out.styleUrl += hits; el.textContent = t.replace(URL_RE, "url(about:blocked#)"); }
+        }
+      }
+      for (var j = 0; j < el.childNodes.length; j++) { walk(el.childNodes[j]); }
+    }
+    for (var k = 0; k < nodes.length; k++) { walk(nodes[k]); }
+    return out;
+  }
+  /* ⑦ 等 img 解码(上限 RENDER_IMG_WAIT_MS;超时继续,不失败) */
+  function waitImages(rootEl, ms) {
+    var imgs = rootEl.querySelectorAll("img"), pending = [], i;
+    for (i = 0; i < imgs.length; i++) { if (!imgs[i].complete) { pending.push(imgs[i]); } }
+    if (!pending.length) { return Promise.resolve(); }
+    return new Promise(function (resolve) {
+      var left = pending.length, done = false;
+      var timer = setTimeout(function () { if (!done) { done = true; resolve(); } }, ms);
+      pending.forEach(function (im) {
+        var h = function () { left--; if (left <= 0 && !done) { done = true; clearTimeout(timer); resolve(); } };
+        im.addEventListener("load", h);
+        im.addEventListener("error", h);
+      });
+    });
+  }
+  /* ⑩ 注记来源(解析层 rels):external image / altChunk 两条 */
+  function relsCount(d, kinds) {
+    var out = { extImg: 0, altChunk: 0 };
+    try {
+      var rels = d.documentPart.rels;
+      for (var k in rels) {
+        if (!Object.prototype.hasOwnProperty.call(rels, k)) { continue; }
+        var r = rels[k];
+        if (!r) { continue; }
+        if (r.targetMode === "External" && /\/image$/.test(String(r.type || ""))) { out.extImg++; }
+        if (/\/aFChunk$/.test(String(r.type || ""))) { out.altChunk++; }
+      }
+    } catch (e) {}
+    return out;
+  }
+  /* ⑨ 空页守卫的读数:原生分辨率步长 8 抽样(取不到像素 ⇒ 返回 1,宁可多发一张也不静默丢页) */
+  function inkRatioOf(cv) {
+    try {
+      var g = cv.getContext("2d");
+      var im = g.getImageData(0, 0, cv.width, cv.height).data;
+      var ink = 0, tot = 0, st = 8, px, py, idx;
+      for (py = 0; py < cv.height; py += st) {
+        for (px = 0; px < cv.width; px += st) {
+          idx = (py * cv.width + px) * 4; tot++;
+          if ((im[idx] + im[idx + 1] + im[idx + 2]) / 3 < 200) { ink++; }
+        }
+      }
+      return tot ? (ink / tot) : 1;
+    } catch (e) { return 1; }
+  }
+  var onProgress = o.onProgress;
+  var work = (function () {
+    host = mkHost();                              /* ② 两容器都只创建、不挂载 */
+    styleHost = mkHost();
+    if (onProgress) { onProgress("rendering"); }
+    return window.docx.parseAsync(buf, OPT).then(function (d) {   /* ③ 解析 */
+      var wrap = installGuard(d);                 /* ④ 资源守卫 */
+      return window.docx.renderDocument(d, OPT).then(function (nodes) {   /* ⑤ 渲染(仍游离) */
+        var clean = cleanNodes(nodes);            /* ⑥ 游离态清洗(计数 attr / styleUrl,见 cleanNodes) */
+        res.clean = clean;
+        for (var i = 0; i < nodes.length; i++) {  /* ⑦ STYLE 进 styleHost、其余进 host,再两个都挂 */
+          (nodes[i].nodeName === "STYLE" ? styleHost : host).appendChild(nodes[i]);
+        }
+        document.body.appendChild(host);
+        document.body.appendChild(styleHost);
+        return waitImages(host, RENDER_IMG_WAIT_MS).then(function () {
+          var secs = host.querySelectorAll("section.docx");   /* ⑧ 分页 */
+          res.pages = secs.length;
+          res.clipped = secs.length > maxPages;
+          if (res.clipped) { res.notes.push("文档共 " + secs.length + " 页,按页数上限仅渲染前 " + maxPages + " 页"); }
+          var n = Math.min(secs.length, maxPages);
+          var scale = dpi / 96;
+          var k = 0;
+          function onePage() {
+            if (k >= n) { return Promise.resolve(); }
+            var idx = k, sec = secs[idx];
+            k++;
+            return window.modernScreenshot.domToCanvas(sec, { scale: scale, backgroundColor: "#fff" })   /* ⑨ 光栅化 */
+              .then(function (cv) {
+                /* 单页 try/catch 全覆盖(P2-8):闸门/取样段若同步抛也走"跳过该页 + 注记",不冒泡成整轮失败 */
+                try {
+                  /* 与 PDF 图片档同参数:jpeg / q0.86(首选档) / 同一 DPI 与页数;再额外过 attCanvasFitForModel 闸门 */
+                  var fit = attCanvasFitForModel(cv, "image/jpeg", 0.86, { maxEdge: Math.min(2000, imgMaxSide()) });
+                  if (!fit.ok) {
+                    if (fit.over) {
+                      res.notes.push("第 " + (idx + 1) + " 页页图超过单张 " + fmtBytes(fit.limit) + " 上限,未包含");
+                    } else {
+                      res.notes.push("第 " + (idx + 1) + " 页渲染失败,未包含在页图里(" + fit.error + ")");
+                    }
+                  } else if (inkRatioOf(cv) === 0 && String(sec.textContent || "").trim()) {
+                    res.notes.push("第 " + (idx + 1) + " 页渲染为空,已跳过");   /* D6 空页守卫:有文字却全白 ⇒ 跳过 + 注记 */
+                  } else {
+                    res.images.push({
+                      mime: fit.mime, data: fit.data, w: fit.w, h: fit.h, bytes: fit.bytes,
+                      page: idx + 1, label: "第 " + (idx + 1) + " 页"
+                    });
+                  }
+                } catch (e2) {
+                  res.notes.push("第 " + (idx + 1) + " 页渲染失败,未包含在页图里(" + ((e2 && e2.message) || e2) + ")");
+                }
+                return onePage();
+              }, function (e) {
+                res.notes.push("第 " + (idx + 1) + " 页渲染失败,未包含在页图里(" + ((e && e.message) || e) + ")");
+                return onePage();
+              });
+          }
+          return onePage().then(function () {
+            var rc = relsCount(d);                /* ⑩ 外部引用/占位注记(来源可信:解析层 rels) */
+            if (rc.extImg > 0) { res.notes.push("文档含 " + rc.extImg + " 个外部引用(未随文档打包),已按离线模式忽略"); }
+            if (wrap.img > rc.extImg) { res.notes.push("另有 " + (wrap.img - rc.extImg) + " 张图片在文档里无法解析,已按空白占位"); }
+            if (wrap.numbering > 0) { res.notes.push("有 " + wrap.numbering + " 处图片项目符号在文档里无法解析,已按空白占位"); }
+            if (wrap.font > 0) { res.notes.push("有 " + wrap.font + " 处内嵌字体引用无法解析,已回退系统字体"); }
+            if (rc.altChunk > 0) { res.notes.push("文档含 " + rc.altChunk + " 处嵌入片段(altChunk),已按离线模式忽略"); }
+            /* 清洗层计数只在非 0 时进 notes(方案 §2.2-⑥:正常输入下这两类计数应为 0;不为 0 = 还有未驯服的引用,如实说) */
+            if (clean.attr > 0) { res.notes.push("渲染树里有 " + clean.attr + " 处资源引用已按离线模式中和"); }
+            if (clean.styleUrl > 0) { res.notes.push("样式表里有 " + clean.styleUrl + " 处远程引用已按离线模式中和"); }
+            res.ok = res.images.length > 0;
+            if (!res.ok && !res.error) { res.error = "没有渲染出任何页面"; }
+            return res;
+          });
+        });
+      });
+    }).catch(function (e) {
+      res.error = res.error || ("渲染失败(" + ((e && e.message) || e) + ")");
+      return res;
+    });
+  })();
+  /* P2-2:超时**先于挂载**发生时 cleanNodes 还没跑、宿主尚未 appendChild ⇒ race 结算时的 cleanup 是空刀,
+     work 之后仍会把两个 div 挂进 body ⇒ 在 work 自身结算处再清一次(cleanup 幂等,两条路径都覆盖) */
+  work.then(cleanup, cleanup);
+  var timeout = new Promise(function (resolve) {
+    setTimeout(function () {
+      resolve({ ok: false, images: [], notes: [], pages: 0, clipped: false,
+        error: "渲染超时(" + (RENDER_DOCX_TIMEOUT_MS / 1000) + " 秒)" });
+    }, RENDER_DOCX_TIMEOUT_MS);
+  });
+  return Promise.race([work, timeout]).then(function (r) {
+    cleanup();
+    return r;
+  }, function (e) {
+    cleanup();
+    res.error = String((e && e.message) || e) || "渲染失败";
+    return res;
+  });
+}
+
+/* 附件侧 PDF 取图计划的**统一参数**(方案 §2.4「四路统一」):下面三处调用点全传它,
+   别处不许另立一组(禁止"图片档+非视觉只处理 6 张、纯文本升档却 10 张"这类同结局不同预算) */
+function attPdfOpts() { return { maxScan: pdfMaxPages(), maxImages: ATT_IMG_MAX_IMAGES }; }
+/* 「有没有文字层」的唯一判据:剥掉 pdf.js 的页分隔标记后看还剩不剩内容。
+   ⚠️ 与 Read 侧(appE 的 `realText`,同一条正则)是**同一判据的两份实现** ⇒ 改一处必须同步另一处
+   (登记为跨段同源债;本批不动 appE)。 */
+function pdfRealText(text) {
+  return String(text == null ? "" : text).replace(/^[-\s]*第\s*\d+\s*页[-\s]*$/gm, "").trim();
+}
+/* 非视觉:把取到的图逐张本机 OCR,按原序并入正文(mode 落 `text` —— 图不进消息)。
+   dec = 枢纽产物(取其 toast);plan = 已取到的候选(唯一实现,②/⑦/④ 三处共用) */
+function pdfFuseToAtt(att, text, plan, notes, dec) {
+  var all = (notes || []).slice(0);
+  if (!plan.list.length) {
+    if (all.length) att.degraded = all.join(" · ");
+    return att;
+  }
+  if (plan.leftover > 0) all.push("另有 " + plan.leftover + " 图未处理(超出单次上限)");
+  if (dec && dec.toast) { toast(dec.toast, "info", 4200); all.push(dec.toast); }
+  return attOcrFuse(text, plan.list, "pages").then(function (fz) {
+    att.text = fz.text;
+    att.textChars = fz.text.length;
+    att.ocrImgs = fz.ocrImgs;
+    if (fz.clipped) att.clipped = true;
+    var more = all.concat(fz.notes);
+    if (more.length) att.degraded = more.join(" · ");
+    return att;
+  });
+}
 function resolvePdf(file) {
   if (!pdfKitReady()) {
     return Promise.reject(new Error(file.name + ":PDF 解析库不可用(" +
       ((window.PDFKit && window.PDFKit.why) || "缺少必要能力") + ")"));
   }
-  var mode = pdfMode();
-  if (mode === "image" && visionState().vision === false) {
-    mode = "text";
-    toast("当前模型不支持图像输入,这份 PDF 已改用纯文本模式", "info", 3400);
-  }
+  var src = attachImgMode();                       /* 用户所选档:text | image | both(默认) */
+  var vision = visionState().vision;               /* true | false | null */
+  var cap = attachRenderCap("pdf", "pdf");         /* "pages"(逐页渲染) */
+  /* 形态先按「档 + 视觉」取(此刻还不知道有没有文字层/图 ⇒ 用中性占位);
+     **判定唯一来源 = 枢纽**(decideAttachPlan),本函数只负责执行它给的动作 */
+  var pre = decideAttachPlan({
+    kind: "pdf", subtype: "pdf", srcMode: src, vision: vision,
+    hasText: true, imgCount: 0, hasTextLayer: true, cap: cap
+  });
   return readAs(file, "buffer").then(function (buf) {
-    if (mode === "image") {
+    /* ③ 图片档 + 视觉可用 ⇒ 逐页渲染(批前行为逐字节不变) */
+    if (pre.send === "image") {
       return PDFKit.renderPages(buf, { dpi: pdfDpi(), maxPages: pdfMaxPages(), format: "image/jpeg", quality: 0.86 })
         .then(function (r) {
           if (!r || !r.ok) throw new Error(file.name + ":PDF 渲染失败(" + ((r && r.error) || "未知") + ")");
           if (!r.images || !r.images.length) throw new Error(file.name + ":没有渲染出任何页面");
           return {
             id: uid(), kind: "pdf", name: file.name, size: file.size, mode: "image",
+            srcMode: src, renderSrc: "pages", imgCount: r.images.length,
             pages: r.pages || r.images.length, clipped: !!r.truncated,
             images: r.images.map(function (im) {
               return {
@@ -1333,32 +2139,56 @@ function resolvePdf(file) {
       if (!r || !r.ok) throw new Error(file.name + ":PDF 文本抽取失败(" + ((r && r.error) || "未知") + ")");
       var t = String(r.text || "").trim();
       if (!t) {
-        throw new Error(file.name + ":这份 PDF 里没有可提取的文字(可能是扫描件),可在 设置 → 附件 中改用「图片模式」");
+        throw new Error(file.name + ":这份 PDF 里没有可提取的文字(可能是扫描件),可在 设置 → 附件 中改用「图片」档");
       }
       var att = {
-        id: uid(), kind: "pdf", name: file.name, size: file.size, mode: "text",
+        id: uid(), kind: "pdf", name: file.name, size: file.size, mode: "text", srcMode: src,
         pages: r.pages || 1, text: t, clipped: !!r.truncated
       };
-      /* 图文按序融合(非视觉模型):条件 = 非视觉 **且有图** —— 与「文本是否为空」无关
-         (extractText 对任何 ≥1 页 PDF 都写页分隔标记 ⇒ 文本模式下扫描件也不会走上面那条"没有文字";
-         有图才融合,无图/纯文本 ⇒ 原样返回 = 输出逐字节不变)。视觉路径在 mode 分流处已一字不改。 */
-      if (visionState().vision !== false) return att;
+      /* ②/⑦ 非视觉(图片档或混合档):原图不发,图改用本机 OCR 后按原序并入正文(取图调用点 1/3) */
+      if (pre.images === "ocr") {
+        var n1 = [];
+        return attPdfImgCands(buf, n1, attPdfOpts()).then(function (plan) {
+          return pdfFuseToAtt(att, t, plan, n1, pre);
+        });
+      }
+      /* ⑦ 混合档 + 视觉可用:正文 + 文档内图/页图;真的取到图才落 `both`(无图 ⇒ `text`,正文逐字节不变) */
+      if (pre.send === "both") {
+        var notes0 = [];
+        return attPdfImgCands(buf, notes0, attPdfOpts()).then(function (plan) {    /* 取图调用点 2/3 */
+          if (plan.list.length) {
+            att.mode = "both";
+            att.images = plan.list;
+            att.renderSrc = (pre.render === "drawn") ? "drawn" : "pages";
+            att.imgCount = plan.list.length;
+          }
+          if (plan.leftover > 0) notes0.push("另有 " + plan.leftover + " 图未处理(超出单次上限)");
+          if (notes0.length) att.degraded = notes0.join(" · ");
+          return att;
+        });
+      }
+      /* ⑥ 纯文本档:**严格** —— 有文字层就到此为止(不探页图、不渲染、不 OCR) */
+      if (pdfRealText(t)) return att;
+      /* ④ 纯文本档 + 没有文字层 + 有图 ⇒ 升档(D1):先探图,真的取到图才升 */
       var notes = [];
-      return attPdfImgCands(buf, notes).then(function (plan) {
+      return attPdfImgCands(buf, notes, attPdfOpts()).then(function (plan) {       /* 取图调用点 3/3 */
         if (!plan.list.length) {
           if (notes.length) att.degraded = notes.join(" · ");
           return att;
         }
-        if (plan.leftover > 0) notes.push("另有 " + plan.leftover + " 图未处理(超出单次上限)");
-        return attOcrFuse(t, plan.list, "pages").then(function (fz) {
-          att.text = fz.text;
-          att.textChars = fz.text.length;
-          att.ocrImgs = fz.ocrImgs;
-          if (fz.clipped) att.clipped = true;
-          var all = notes.concat(fz.notes);
-          if (all.length) att.degraded = all.join(" · ");
-          return att;
+        var up = decideAttachPlan({
+          kind: "pdf", subtype: "pdf", srcMode: src, vision: vision,
+          hasText: !!t, imgCount: plan.list.length, hasTextLayer: false, cap: cap
         });
+        if (up.images === "ocr") return pdfFuseToAtt(att, t, plan, notes, up);    /* 升档·非视觉 */
+        att.mode = "both";                                                        /* 升档·视觉可用 ⇒ 发页图 */
+        att.images = plan.list;
+        att.renderSrc = (up.render === "drawn") ? "drawn" : "pages";
+        att.imgCount = plan.list.length;
+        if (plan.leftover > 0) notes.push("另有 " + plan.leftover + " 图未处理(超出单次上限)");
+        if (up.toast) { toast(up.toast, "info", 4200); notes.push(up.toast); }
+        if (notes.length) att.degraded = notes.join(" · ");
+        return att;
       });
     });
   });
@@ -1570,10 +2400,10 @@ function attOcrFuse(text, items, layout) {
   var all = items || [];
   var out = {
     text: base, ocrImgs: 0, clipped: false,
-    over: Math.max(0, all.length - ATT_OCR_MAX_IMAGES),
+    over: Math.max(0, all.length - ATT_IMG_MAX_IMAGES),
     empty: 0, stopped: 0, stop: "", aborted: false, notes: []
   };
-  var use = all.slice(0, ATT_OCR_MAX_IMAGES);
+  var use = all.slice(0, ATT_IMG_MAX_IMAGES);
   if (!use.length) return Promise.resolve(out);
   if (!ocrReady()) {
     out.notes.push("本机 OCR 引擎不可用(" + ((window.OCRKit && window.OCRKit.why) || "缺少 Web Worker / WebAssembly") +
@@ -1634,9 +2464,13 @@ function attOcrFuse(text, items, layout) {
    pageImages 报含图 ⇒ 每图一个候选;mode:"full" 的页用「远超整页的面积」触发 renderCrops 的
    整页护栏 ⇒ 该页退整页渲染;renderCrops 失败 ⇒ renderPages 整页兜底并注记(不静默、不假装成功)。
    扫描页数 = min(用户设置 pdfMaxPages(), READ_DOC_OCR_MAX_PAGES) —— 页数上限与 Read 侧同源,
-   不另立副本。失败/无图 ⇒ list 为空(注记写进 notes) */
-function attPdfImgCands(buf, notes) {
-  var maxScan = Math.min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES);
+   不另立副本。失败/无图 ⇒ list 为空(注记写进 notes)。
+   **opts**(S3 新增)= { maxScan, maxImages }:附件侧三处调用点(②⑦/④ 与 ⑦视觉)一律传 attPdfOpts()
+   ⇒ 同一组预算;不传(缺省)= 上面那组现状值 ⇒ 既有行为的调用点逐字节不变。 */
+function attPdfImgCands(buf, notes, opts) {
+  var oo = opts || {};
+  var maxScan = (Number(oo.maxScan) > 0) ? Math.round(Number(oo.maxScan)) : Math.min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES);
+  var maxImg = (Number(oo.maxImages) > 0) ? Math.round(Number(oo.maxImages)) : ATT_IMG_MAX_IMAGES;
   return window.PDFKit.pageImages(buf, {
     maxPages: maxScan, dpi: pdfDpi(), region: "rect", timeout: ATT_OCR_TIMEOUT_MS
   }).then(function (pr) {
@@ -1663,10 +2497,10 @@ function attPdfImgCands(buf, notes) {
         meta.push({ page: pg.page, kind: "full", seq: 1 });
       }
     }
-    if (groups.length > ATT_OCR_MAX_IMAGES) {            /* 超出的张数如实报出(不静默丢) */
-      out.leftover = groups.length - ATT_OCR_MAX_IMAGES;
-      groups = groups.slice(0, ATT_OCR_MAX_IMAGES);
-      meta = meta.slice(0, ATT_OCR_MAX_IMAGES);
+    if (groups.length > maxImg) {                        /* 超出的张数如实报出(不静默丢) */
+      out.leftover = groups.length - maxImg;
+      groups = groups.slice(0, maxImg);
+      meta = meta.slice(0, maxImg);
     }
     function mimeOf(u) { return (String(u || "").match(/^data:([^;,]+)/) || [])[1] || "image/jpeg"; }
     function fill(list) {
@@ -1752,66 +2586,254 @@ function resolveOffice(file, ext, hooks) {
     return Promise.reject(new Error(file.name + ":办公文档解析库不可用(" +
       ((window.OfficeKit && window.OfficeKit.why) || "缺少必要能力") + ")"));
   }
-  var cap = officeSizeCap();
-  if (file.size > cap) {
-    return Promise.reject(new Error(file.name + ":超过 " + fmtBytes(cap) + " 上限,已跳过"
-      + (cap === ATTACH_MAX_BYTES ? "" : "(当前是主线程降级模式)")));
+  var sizeCap = officeSizeCap();
+  if (file.size > sizeCap) {
+    return Promise.reject(new Error(file.name + ":超过 " + fmtBytes(sizeCap) + " 上限,已跳过"
+      + (sizeCap === ATTACH_MAX_BYTES ? "" : "(当前是主线程降级模式)")));
   }
-  var dropImages = visionState().vision === false;
+  /* S6:走同一个枢纽(判定唯一来源);此刻还不知道有没有正文/图 ⇒ 用中性占位取「档 + 视觉」的形态 */
+  var src = attachImgMode();
+  var vision = visionState().vision;
+  var cap = attachRenderCap("office", ext);
+  var nonVis = (vision === false);
+  var sub = String(ext == null ? "" : ext).toLowerCase();
+  var pre = decideAttachPlan({
+    kind: "office", subtype: ext, srcMode: src, vision: vision,
+    hasText: true, imgCount: 0, hasTextLayer: true, cap: cap
+  });
+  /* S6c:docx 位置锚 —— 只在「图可能随消息发出」的形态下向 worker 要 HTML(纯文本档 / 非视觉 OCR
+     不要:要了也不锚,还白跨线程搬 HTML)。后续 docx 分支据此决定"锚 / 回退 + 注记"。 */
+  var wantAnchor = (sub === "docx") && !nonVis && (pre.images === "send" || src === "image");
+  /* OCR 候选的 label 与布局(O2):pptx 认得出真幻灯号 ⇒ "pages"(按幻灯插块),否则 "flat";
+     label 按工具侧口径 `第 N 页 · 图 k`;认不出页号(page===0)⇒ 整篇序号 `图 k` + 一次性注记 */
+  function officeCands(list) {
+    return list.map(function (im, i) {
+      var pg = Number(im.page) || 0;
+      return {
+        mime: im.mime, data: im.data, page: pg, kind: "",
+        label: pg ? ("第 " + pg + " 页 · 图 " + (i + 1)) : (im.label || ("图 " + (i + 1)))
+      };
+    });
+  }
+  function officeLayoutOf(list) {
+    if (String(ext || "").toLowerCase() !== "pptx") return "flat";
+    for (var i = 0; i < list.length; i++) if (Number(list[i].page) > 0) return "pages";
+    return "flat";
+  }
+  /* pptx 有图认不出幻灯号(page===0)时的一次性注记(O2,与工具侧 appE 的口径同源) */
+  function officePageZeroNote(list) {
+    var n = 0, i;
+    for (i = 0; i < list.length; i++) if (!Number(list[i].page)) n++;
+    return n ? ("有 " + n + " 张图认不出所属幻灯,已按整篇顺序编号") : "";
+  }
+  function plainImgs(list) {
+    return list.map(function (im) {
+      return { mime: im.mime, data: im.data, bytes: im.bytes, label: im.label, page: im.page };
+    });
+  }
+  /* S6c:注记去重(多条同句只留一条)后按既有口径 " · " 连接(锚回退 / 图→表映射的如实交代) */
+  function joinNotes(list) {
+    var outN = [], seenN = {}, i, s;
+    for (i = 0; i < list.length; i++) {
+      s = String(list[i] == null ? "" : list[i]);
+      if (s && !seenN[s]) { seenN[s] = 1; outN.push(s); }
+    }
+    return outN.join(" · ");
+  }
   var onProgress = hooks && hooks.onProgress;
+  /* S7:docx 图片档的渲染分支(方案 §2.4「前置链结果判别」)。渲染成功 ⇒ 直接产出「图片档」att
+     (只发页图、不带正文 —— 与 PDF 图片档同形);失败 ⇒ 两支注记串交给既有链消费(见下两处注入点)。
+     注记串在 .then 之前声明、跨链共享;**不许**用 `return null` 表达"落回既有链"(那会终止整个回调)。 */
+  var bufRef = null;
+  var renderFailNote = "", renderFailNote2 = "";
+  var isDocxImg = (pre.send === "image" && pre.render === "pages" && sub === "docx");
   return readAs(file, "buffer").then(function (buf) {
+    bufRef = buf;
     return window.OfficeKit.parse(buf, ext, {
       timeout: (window.OfficeKit.limits && window.OfficeKit.limits.timeoutMs) || 60000,
-      onProgress: onProgress
+      onProgress: onProgress,
+      docxAnchor: wantAnchor          /* S6c:docx 位置锚要 HTML(其余格式 / 档位不要) */
     });
   }).then(function (r) {
     if (!r || !r.ok) throw new Error(file.name + ":" + ((r && r.error) || "解析失败"));
+    if (!isDocxImg) { return { r: r }; }          /* 非「docx 图片档 + 视觉可用」⇒ 既有链照走 */
+    return attachRenderPageImages(file, "docx", bufRef, { onProgress: onProgress }).then(function (rp) {
+      if (rp.ok && rp.images.length) {
+        if (rp.notes.length) { toast(rp.notes[0], "info", 4200); }   /* 一次性;注记全文在 degraded */
+        return { att: {
+          id: uid(), kind: "office", subtype: (r.subtype || ext), name: file.name, size: file.size,
+          mime: "", mode: "image", srcMode: src, renderSrc: "pages",
+          text: "", textChars: 0, images: rp.images, imgCount: rp.images.length,
+          pages: rp.pages, unit: "页", clipped: !!rp.clipped,
+          skippedImgs: r.skippedImgs || 0, degraded: rp.notes.join(" · ")
+        } };
+      }
+      var rpWhy = rp.error || "未知";
+      renderFailNote = "本机渲染失败(" + rpWhy + "),已改用「混合」:发送文档内嵌图";
+      renderFailNote2 = "本机渲染失败(" + rpWhy + "),已改用「纯文本」:只发送文字";
+      return { r: r };                            /* 没有早退产物 ⇒ 既有链照走(注记按下两处注入) */
+    });
+  }).then(function (pass) {
+    if (pass.att) { return pass.att; }            /* 渲染成功 ⇒ 到此为止 */
+    var r = pass.r;
     var rawImgs = r.images || [];
-    var images = [];
-    if (!dropImages) {
-      rawImgs.forEach(function (im) {
-        images.push({ mime: im.mime, data: im.data, bytes: im.bytes, label: im.label, page: im.page });
-      });
-    }
     var text = String(r.text || "").trim();
-    if (!text && !images.length) {
-      throw new Error(file.name + ":没有提取到可发送的内容(空文档或只有图像且当前模型不支持图像)");
+    var notes = [];      /* S6c:锚 / 映射的如实注记(去重后并入 att.degraded;不静默) */
+    /* docx 位置锚(S6c;D1/D2):worker 带回的 HTML 按文档序生成 `【图 k】` 标记(自检与两条守卫都
+       在 attachDocxAnchorText 内完成)。通过 ⇒ att.text = 标记正文;不过 / 被截断 ⇒ 回退 flat + 注记 */
+    if (wantAnchor && !r.clipped && r.docxHtml && rawImgs.length) {
+      var anchored = attachDocxAnchorText(r.docxHtml, r.text, rawImgs.length);
+      if (anchored !== null) { text = anchored; }
+      else { notes.push("图未能在正文里定位,已按原顺序附在文本之前"); }
     }
+    /* S6b(D12):xlsx/xls 的「图片档」= **本机自绘表格图**(canvas,零新库)—— 图源按枢纽产物取,
+       且**先于内嵌图判定**:混合档/升档一律仍用文档内嵌图(自绘图只在图片档出现,免得与 CSV 文本重复计费) */
+    var drawn = null;
+    if (text && pre.send === "image" && pre.render === "drawn") {
+      /* scale=2:自绘按 2× 出图(单元格字体 13px ⇒ 26px)。方案 §9 把"自绘图可读性"列为 S6b 首跑必验项:
+         1× 时单元格字高只有 ~13px,本机 OCR 与视觉模型都读不稳(批-4 真机读数在案);2× 后暗号稳定可读,
+         体积仍远低于 R11 的 imgMaxSide()/1 MiB 双上限。 */
+      drawn = attachDrawSheetImages(text, { maxSheets: ATT_IMG_MAX_IMAGES, scale: 2 });   /* 张数上限与 PDF 同源 */
+      if (!drawn.ok) throw new Error(file.name + ":表格图绘制失败(" + (drawn.error || "未知") + ")");
+    }
+    var wantsImgs = (pre.images === "send") && !drawn;      /* 视觉可用 + 不是「纯文本」档 ⇒ 图随消息发送 */
+    /* S6c:xlsx/xls 的「图 → 表」归属(唯一接线点;D3)—— 认不出表名 ⇒ page=0 ⇒ 落 rest(文末)+ 注记 */
+    var sheetMap = null;
+    if (wantsImgs && (sub === "xlsx" || sub === "xls") && rawImgs.length) {
+      sheetMap = attachSheetImgPages(text, rawImgs);
+      for (var ni = 0; ni < sheetMap.notes.length; ni++) { notes.push(sheetMap.notes[ni]); }
+    }
+    var images = drawn ? drawn.images : (wantsImgs ? (sheetMap ? sheetMap.images : plainImgs(rawImgs)) : []);
     var att = {
       id: uid(), kind: "office", subtype: r.subtype || ext, name: file.name, size: file.size, mime: "",
-      mode: images.length ? "both" : "text",
+      mode: drawn ? "image" : (images.length ? "both" : "text"), srcMode: src,
+      renderSrc: drawn ? "drawn" : (images.length ? "embedded" : ""),
       text: text, textChars: r.textChars || text.length, clipped: !!r.clipped,
       images: images, imgCount: images.length,
       skippedImgs: r.skippedImgs || 0,
       pages: r.pages || 0, unit: r.unit || ""
     };
-    if (att.subtype === "doc" || att.subtype === "ppt") {
-      att.degraded = "老格式只提取文字(不支持图像提取)";
+    if (notes.length) { att.degraded = joinNotes(notes); }
+    if (drawn) {
+      /* R11 + §2.7-①:自绘表格图必须自报口径 —— 「数据网格」声明 + 行/列/表数截断注记(截断必须可见) */
+      att.degraded = ["本机绘制的表格图(仅数据网格,不含原表格式)"].concat(drawn.notes).join(" · ");
     }
-    /* 非视觉模型:图片不再丢弃,改用本机 OCR 识别后按序接在正文之后(纯图文档在上面已拒收 ⇒ 行为不变)。
-       toast 按会话一次(既有机制);解析进度仍走 OfficeKit 的 onProgress 通道 ⇒ 可感知、不静默 */
-    if (dropImages && rawImgs.length && text) {
-      var ocid = (conv && conv.id) ? String(conv.id) : "";
-      if (!Object.prototype.hasOwnProperty.call(officeVisionToastShown, ocid)) {
-        officeVisionToastShown[ocid] = true;
-        toast("当前模型不支持图像输入,正在用本机 OCR 识别「" + file.name + "」里的图片…", "info", 3600);
-      }
-      var cands = rawImgs.map(function (im, i) {
-        return { mime: im.mime, data: im.data, label: im.label || ("图 " + (i + 1)), page: im.page || 0, kind: "" };
+    /* O3(条件化):只有「本机解析器确实没从老格式里收到图」才写这句 —— 否则就是谎报(D8 实测:有图时该句自然不出现) */
+    if ((att.subtype === "doc" || att.subtype === "ppt") && !rawImgs.length) {
+      att.degraded = "本机解析器未从老格式(." + att.subtype + ")里提取到图片";
+    }
+    /* O6:图片档被降级时的如实交代(§2.7-①)。判据 = **用户选了「图片」档但图没随消息发出**;
+       解析后按**真实 imgCount** 复查一次枢纽,再**逐支消费**它的产物(P1-2:只消费 "send" 会把
+       非视觉下的 "ocr" 漏掉 ⇒ 内嵌图既不发也不 OCR = 内容丢) */
+    if (src === "image" && !images.length) {
+      var post = decideAttachPlan({
+        kind: "office", subtype: ext, srcMode: src, vision: vision,
+        hasText: true, imgCount: rawImgs.length, hasTextLayer: true, cap: cap
       });
-      return attOcrFuse(text, cands, "flat").then(function (fz) {
+      if (post.images === "ocr" && rawImgs.length) {
+        /* 降级后仍要**本机 OCR 兜底**(与 O1-① 同一融合腿与注记口径) */
+        return attOcrFuse(att.text || "", officeCands(rawImgs), officeLayoutOf(rawImgs)).then(function (fz) {
+          att.text = fz.text;
+          att.textChars = fz.text.length;
+          att.ocrImgs = fz.ocrImgs;
+          if (fz.clipped) att.clipped = true;
+          var dn6 = fz.notes.slice(0);
+          if (post.toast) dn6.push(post.toast);
+          var n6 = officePageZeroNote(rawImgs);
+          if (n6) dn6.push(n6);
+          if (!dn6.length) dn6.push("当前模型不支持图像输入,图片未随消息发送");
+          att.degraded = att.degraded ? (att.degraded + " · " + dn6.join(" · ")) : dn6.join(" · ");
+          toast(post.toast || "当前模型不支持图像输入,图片内容已改用本机 OCR 提取", "info", 4200);
+          return att;
+        });
+      }
+      if (post.images === "send" && rawImgs.length) {
+        att.images = plainImgs(rawImgs);
+        att.imgCount = att.images.length;
+        att.mode = "both";
+        att.renderSrc = "embedded";
+      }
+      var why6 = (cap === "drawn") ? "" : post.toast;
+      /* cap="drawn"(xlsx/xls)走到这里只剩一种情形:没有可绘制的表(文字为空)⇒ 下面立刻按空文档拒收。
+         此时**不能**说「没有可信的离线渲染器」(xlsx/xls 的渲染器就是本机 canvas,已在上面的
+         drawn 分支落地)⇒ 该子例不发降级 toast,由拒收文案自己说话。 */
+      if (why6) { toast(why6, "info", 4200); att.degraded = att.degraded ? (att.degraded + " · " + why6) : why6; }
+    }
+    /* S7:docx 页图渲染失败的两支回退注记(必须落在这条**共同出口**上,不得依赖上面的 O6 块:
+       cap="pages" 时 pre.images==="send" ⇒ 内嵌图在 O6 复查**之前**就已随 wantsImgs 落进 images
+       ⇒ `!images.length` 恒假 ⇒ O6 块根本不进 —— 而"静默降级"恰好会藏在那里)。
+       · 有内嵌图(images 已就位)⇒ 实际落「混合(内嵌图)」⇒ 注记 renderFailNote;
+       · 无内嵌图 + 有正文 ⇒ 实际落「纯文本」⇒ 注记 renderFailNote2。两支都不得静默。 */
+    if (renderFailNote && images.length) {
+      att.degraded = att.degraded ? (att.degraded + " · " + renderFailNote) : renderFailNote;
+      toast(renderFailNote, "info", 4200);
+    } else if (renderFailNote2 && !rawImgs.length && text) {
+      att.degraded = att.degraded ? (att.degraded + " · " + renderFailNote2) : renderFailNote2;
+      toast(renderFailNote2, "info", 4200);
+    }
+    /* O1 三分支(判据与视觉态**解耦**):禁止再用"当前模型不支持图像输入"解释"没有正文" */
+    if (!text && !rawImgs.length) {
+      throw new Error(file.name + ":没有提取到可发送的内容(空文档)");
+    }
+    if (!text && rawImgs.length) {
+      if (!nonVis) {
+        /* ② 视觉可用 ⇒ 升档发图(用户选 image 档时本来就发图 ⇒ 不触发本条) */
+        att.images = plainImgs(rawImgs);
+        att.imgCount = att.images.length;
+        att.mode = "both";
+        att.renderSrc = "embedded";
+        var note2 = "这份" + attachKindWord(att) + "只有图片,已按图片发送";
+        toast(note2, "info", 4200);
+        att.degraded = att.degraded ? (att.degraded + " · " + note2) : note2;
+        return att;
+      }
+      /* ① 非视觉 ⇒ 本机 OCR 兜底;融合后仍空**才**拒收(文案只说 OCR 没认出) */
+      return attOcrFuse("", officeCands(rawImgs), officeLayoutOf(rawImgs)).then(function (fz) {
+        if (!String(fz.text || "").trim()) {
+          throw new Error(file.name + ":这份文档只有图片,且本机 OCR 没有识别到文字");
+        }
         att.text = fz.text;
         att.textChars = fz.text.length;
         att.ocrImgs = fz.ocrImgs;
         if (fz.clipped) att.clipped = true;
-        var dn = fz.notes.length ? fz.notes.join(" · ") : "当前模型不支持图像输入,图片未随消息发送";
-        att.degraded = att.degraded ? (att.degraded + " · " + dn) : dn;
+        var dn = fz.notes.slice(0);
+        dn.push(pre.toast || "这份文档只有图片,图片内容已改用本机 OCR 提取(原图未发送)");
+        var n0 = officePageZeroNote(rawImgs);
+        if (n0) dn.push(n0);
+        att.degraded = att.degraded ? (att.degraded + " · " + dn.join(" · ")) : dn.join(" · ");
         return att;
       });
+    }
+    /* 非视觉 + 有正文 + 有图 ⇒ 图不进消息,改用本机 OCR 按原序并入正文(toast 按会话一次;解析进度走 onProgress)*/
+    if (pre.images === "ocr" && rawImgs.length && text) {
+      var ocid = (conv && conv.id) ? String(conv.id) : "";
+      if (!Object.prototype.hasOwnProperty.call(officeVisionToastShown, ocid)) {
+        officeVisionToastShown[ocid] = true;
+        toast(pre.toast || ("当前模型不支持图像输入,正在用本机 OCR 识别「" + file.name + "」里的图片…"), "info", 3600);
+      }
+      return attOcrFuse(text, officeCands(rawImgs), officeLayoutOf(rawImgs)).then(function (fz) {
+        att.text = fz.text;
+        att.textChars = fz.text.length;
+        att.ocrImgs = fz.ocrImgs;
+        if (fz.clipped) att.clipped = true;
+        var dn2 = fz.notes.slice(0);
+        if (pre.toast) dn2.push(pre.toast);
+        var n1 = officePageZeroNote(rawImgs);
+        if (n1) dn2.push(n1);
+        if (!dn2.length) dn2.push("当前模型不支持图像输入,图片未随消息发送");
+        att.degraded = att.degraded ? (att.degraded + " · " + dn2.join(" · ")) : dn2.join(" · ");
+        return att;
+      });
+    }
+    /* 纯文本档把图挡下(§2.5 的 P1-1):用户**显式**选了「纯文本」⇒ 不发图、也不用 OCR 兜底 */
+    if (src === "text" && rawImgs.length && !images.length && !nonVis) {
+      var note3 = "已按「纯文本」档发送:图片未随消息发送";
+      att.degraded = att.degraded ? (att.degraded + " · " + note3) : note3;
     }
     return att;
   });
 }
+
 
 function prepareAttachment(file, hooks) {
   return new Promise(function (resolve, reject) {
@@ -1886,8 +2908,8 @@ function attachSizeOf(a) {
   if (!a) return 0;
   if (a.kind === "image") return String(a.data || "").length;
   if (a.kind === "pdf") {
-    if (a.mode === "image") {
-      var n = 0;
+    if (a.mode === "image" || a.mode === "both") {        /* 图发出去 ⇒ 正文 + Σ图(方案 §2.6) */
+      var n = String(a.text || "").length;
       (a.images || []).forEach(function (im) { n += String(im.data || "").length; });
       return n;
     }
@@ -1905,11 +2927,16 @@ function draftAttachBytes() {
   draftFiles.forEach(function (f) { n += attachSizeOf(f); });
   return n;
 }
-/* 附件按 token 粗算:文本走四桶估算,一张图 ≈900,PDF / 办公文档的图片模式按张数累加 */
+/* 附件按 token 粗算:文本走四桶估算,一张图 ≈900,PDF / 办公文档的图片模式按张数累加
+   (混合档同理:文字 + 900×张数;`drawn` 的自绘表格图也走同一条 900/张,方案 §3-S4) */
 function draftAttachTokens(f) {
   if (!f) return 0;
   if (f.kind === "text") return estimateTokens(f.text);
   if (f.kind === "pdf" && f.mode === "image") return 900 * ((f.images && f.images.length) || 1);
+  if (f.kind === "office" && f.mode === "image") return 900 * ((f.images && f.images.length) || 1);   /* S6b:自绘表格图同口径 */
+  if (f.kind === "pdf" && f.mode === "both") {
+    return estimateTokens(f.text) + 900 * ((f.images && f.images.length) || 0);
+  }
   if (f.kind === "office" && f.mode === "both") {
     return estimateTokens(f.text) + 900 * ((f.images && f.images.length) || 1);
   }
@@ -1951,7 +2978,7 @@ function clearDraft() {
   updateCtxMeter();
 }
 var OFFICE_PHASE_TEXT = {
-  started: "开始解析…", extracting: "提取内容…", parsing: "解析中…", done: "即将完成…"
+  started: "开始解析…", extracting: "提取内容…", parsing: "解析中…", rendering: "渲染页面…", done: "即将完成…"
 };
 function addFiles(fileList) {
   var files = Array.prototype.slice.call(fileList || []);
@@ -2088,10 +3115,10 @@ function renderAttachBar() {
     var sub = f.kind === "image"
       ? ((f.w && f.h) ? f.w + "×" + f.h : "图片") + (f.scaled ? " · 已缩放" : "")
       : f.kind === "pdf"
-        ? "PDF · " + (f.pages || 1) + " 页 · " + (f.mode === "image" ? "图片模式" : "文本模式") +
+        ? "PDF · " + (f.pages || 1) + " 页 · " + attachModeLabel(f) +
           (f.ocrImgs ? " · " + f.ocrImgs + " 图已 OCR" : "")
         : f.kind === "office"
-          ? officeBrief(f) + (f.degraded ? " · " + f.degraded : "")
+          ? officeBrief(f) + " · " + attachModeLabel(f) + (f.degraded ? " · " + f.degraded : "")
           : fmtBytes(f.size) + (f.enc ? " · " + wsEncName(f.enc) + "(已转码显示)" : "") +
             (f.clipped ? " · 已截断" : "");
     if (f.ocr) sub += " · OCR";
@@ -2139,6 +3166,9 @@ function attachMetaOf(f) {
     skippedImgs: f.skippedImgs || 0, degraded: f.degraded || "", textChars: f.textChars || 0,
     /* 非视觉模型下已本机 OCR 并入正文的图片张数(旧数据没有这个键 = 0,无需迁移) */
     ocrImgs: f.ocrImgs || 0,
+    /* 用户所选档与"这次图从哪来"(方案 §2.9;旧数据无 ⇒ 空串,读取侧一律回退 mode)。
+       只进气泡展示元数据 —— protocolContent 会把 attach 整块剥掉,请求体不受影响 */
+    srcMode: f.srcMode || "", renderSrc: f.renderSrc || "",
     enc: f.enc || ""        /* 非 UTF-8 文本附件的原始编码(旧数据为空 = 按 UTF-8) */
   };
   if (f.ext) m.blob = f.id;      // payload 在 IndexedDB 里,消息里只留这个键
@@ -2152,6 +3182,80 @@ function imagePartFor(proto, mime, data, attach) {
     : { type: "image_url", image_url: { url: data ? ("data:" + (mime || "image/png") + ";base64," + data) : "" } };
   if (attach) p.attach = attach;
   return p;
+}
+/* 交错锚类型(方案 §2.6 的唯一映射表):pdf / pptx ⇒ 页分隔行 · xlsx/xls ⇒ `# <表名>` ·
+   docx ⇒ 正文里真的有 `【图 k】` 标记(D7 位置锚自检通过后才会写出这种文本)时才算有锚 ·
+   其余(.doc/.ppt/认不出)⇒ none(调用方保持既有"图在前、文本在后"形态)。
+   ⚠️ 四种锚已全部接线(pptx/xlsx = S6;docx = S6c)。 */
+function attAnchorKindOf(f) {
+  var st = String((f && f.subtype) || "").toLowerCase();
+  if (f && f.kind === "pdf") return "pageSep";
+  if (st === "pptx") return "pageSep";
+  if (st === "xlsx" || st === "xls") return "sheetHead";
+  if (st === "docx") return /^【图 \d+】$/m.test(String((f && f.text) || "")) ? "inlineMarker" : "none";
+  return "none";
+}
+/* 混合档的交错组装(方案 §2.6):[头][段1 文本][段1 图…][段2 文本][段2 图…][尾:对不上锚的图 + 注记]
+   · 文本件一律取**原文切片**(不重新拼接)⇒ 正文逐字节不变(§5.4-N5② 的判据靠这一点成立)
+   · 每个 text / image 部件都挂 attach: attachMetaOf(f)(**P2-5 不变量**:漏挂的部件既不进
+     payload.texts 也不进 payload.imgs ⇒ 预览会丢/错位);图部件另带 page(真页号)与 blob 键(与
+     externalizeFiles 的 -pN 对齐,键位按**数组下标**而不是页号)
+   · anchorKind 认不出 / 文本切不出段 ⇒ 返回 null(调用方退回既有形态)
+   · 不变量(S6c/T7):拼接所有 text 部件(排除头件与 rest 尾注件)== f.text 逐字节 —— 见下方补件 */
+function attInterleaveParts(f, proto, meta, anchorKind) {
+  var text = String(f.text || "");
+  var imgs = f.images || [];
+  if (!text || !imgs.length) return null;
+  var segs = attPartitionByPage(text, imgs, anchorKind).segs;
+  if (!segs.length) return null;
+  var bounds = [], cursor = 0, i;
+  for (i = 0; i < segs.length; i++) {
+    var head = String(segs[i].head || "");
+    var at = head ? text.indexOf(head, cursor) : -1;
+    if (at < 0) at = cursor;
+    bounds.push({ from: Math.max(cursor, at), seg: segs[i] });
+    if (head) cursor = at + head.length;
+  }
+  var out = [];
+  /* S6c(P0-1):首个锚之前若还有正文,必须先发一件 —— inlineMarker 的切分把首锚前的正文并进
+     锚段、切片从锚行位置开始,不补这一件 ⇒ 文档首段在部件序列里**整段丢失**(sheetHead 自带
+     前导段 / pageSep 的首锚恒在 0 ⇒ 本补件对它们是逐字节 no-op;D6 的 pptx/pdf 门不受影响) */
+  if (bounds.length && bounds[0].from > 0) {
+    out.push({ type: "text", attach: meta, text: text.slice(0, bounds[0].from) });
+  }
+  for (i = 0; i < bounds.length; i++) {
+    var to = (i + 1 < bounds.length) ? bounds[i + 1].from : text.length;
+    var body = text.slice(bounds[i].from, to);
+    if (body) out.push({ type: "text", attach: meta, text: body });
+    var list = bounds[i].seg.images || [];
+    for (var j = 0; j < list.length; j++) {
+      out.push(attImagePartFor(proto, f, meta, list[j], attImgIndexOf(imgs, list[j])));
+    }
+  }
+  /* 尾:锚对不上的图(按数组序)+ 一条注记(不静默丢) */
+  var rest = attPartitionByPage(text, imgs, anchorKind).rest;
+  if (rest.length) {
+    for (i = 0; i < rest.length; i++) out.push(attImagePartFor(proto, f, meta, rest[i], attImgIndexOf(imgs, rest[i])));
+    out.push({ type: "text", attach: meta, text: "(以上 " + rest.length + " 张图未能在正文里定位到所属页/表,已按序附在末尾)" });
+  }
+  return out;
+}
+/* 图在 f.images 里的**数组下标**(= 外置键 `id + "-p" + (下标+1)` 的唯一来源,必须与 externalizeFiles 一致)。
+   P1 修复:原实现拿"由下标组成的数组"去找**对象**(`idx.indexOf(obj)` 恒为 -1 ⇒ 键退化成 `-p0` ⇒
+   发送期 blobMemo 未命中 ⇒ 请求体里页图变「数据不在本机」占位)。找不到时返回 -1,由调用方退化为内联 data。 */
+function attImgIndexOf(imgs, im) {
+  var k = (imgs || []).indexOf(im);
+  return (k >= 0) ? k : -1;
+}
+/* 交错里的单个图部件:attach 元数据 + 真页号(没有就按数组序号)+ 外置 blob 键(下标键) */
+function attImagePartFor(proto, f, meta, im, i) {
+  var m = {}, k;
+  for (k in meta) if (Object.prototype.hasOwnProperty.call(meta, k)) m[k] = meta[k];
+  m.page = im.page || (i + 1);
+  if (im.label) m.label = im.label;
+  var idxOk = (i >= 0);
+  if (im.ext && idxOk) m.blob = f.id + "-p" + (i + 1);
+  return imagePartFor(proto, im.mime, (im.ext && idxOk) ? "" : im.data, m);
 }
 function attachmentParts(f, proto) {
   var out = [];
@@ -2171,6 +3275,27 @@ function attachmentParts(f, proto) {
       });
       return out;
     }
+    if (f.mode === "both" && f.images && f.images.length) {
+      /* 混合档:按页锚交错(头行单独一件 ⇒ §5.4-N5② 的"排除头行"可判) */
+      var pmeta = attachMetaOf(f);
+      var seg = attInterleaveParts(f, proto, pmeta, attAnchorKindOf(f));
+      if (seg) {
+        out.push({
+          type: "text", attach: pmeta,
+          text: "文件:" + f.name + "(PDF · 共 " + (f.pages || 1) + " 页" + (f.clipped ? " · 已截断" : "") + ")"
+        });
+        for (var q = 0; q < seg.length; q++) out.push(seg[q]);
+        return out;
+      }
+      /* 交错不成立(文本空/切不出段)⇒ 退回既有形态:图在前、单个 text 在后 */
+      f.images.forEach(function (im, i) {
+        var mm = {};
+        for (var k2 in pmeta) if (Object.prototype.hasOwnProperty.call(pmeta, k2)) mm[k2] = pmeta[k2];
+        mm.page = im.page || (i + 1);
+        if (im.ext) mm.blob = f.id + "-p" + (i + 1);
+        out.push(imagePartFor(proto, im.mime, im.ext ? "" : im.data, mm));
+      });
+    }
     out.push({
       type: "text",
       attach: attachMetaOf(f),
@@ -2179,6 +3304,39 @@ function attachmentParts(f, proto) {
     return out;
   }
   if (f.kind === "office") {
+    /* S6b(D12):自绘表格图的**图片档** ⇒ 只发图、不发正文(与 PDF 图片档同形)。
+       少了这一支,office 的 mode="image" 会一路落到下面的 text 分支 ⇒ 图**根本发不出去**。 */
+    if (f.mode === "image" && f.images && f.images.length) {
+      var dmeta = attachMetaOf(f);
+      f.images.forEach(function (im, i) {
+        var dm = {};
+        for (var dk in dmeta) if (Object.prototype.hasOwnProperty.call(dmeta, dk)) dm[dk] = dmeta[dk];
+        dm.page = im.page || (i + 1);                 /* 表序号(1-based;与 externalizeFiles 的 -pN 对齐) */
+        if (im.label) dm.label = im.label;
+        if (im.ext) dm.blob = f.id + "-p" + (i + 1);
+        out.push(imagePartFor(proto, im.mime, im.ext ? "" : im.data, dm));
+      });
+      return out;
+    }
+    /* O5(S6):有锚的格式按锚交错(pptx = 页分隔行 / xlsx|.xls = `# <表名>` / docx = 只有真出现
+       `【图 k】` 时才 inlineMarker —— 位置锚由 S6c 生成)⇒ 与 PDF 复用同一个助手;
+       顺序改变是**有意**的(pptx/xlsx)⇒ 回归门用结构门(N5③④),docx 本批仍逐字节不变。
+       没锚(老格式 / 自检不通过 / 交错不成立)⇒ 退回既有"图在前、单 text 在后"形态。 */
+    var okind = attAnchorKindOf(f);
+    if (f.mode === "both" && f.images && f.images.length && okind !== "none" && f.text) {
+      var ometa0 = attachMetaOf(f);
+      var oseg = attInterleaveParts(f, proto, ometa0, okind);
+      if (oseg) {
+        var info0 = String(f.subtype || "").toUpperCase();
+        if (f.unit === "页" && f.pages) info0 += " · 共 " + f.pages + " 页";
+        else if (f.unit === "表" && f.pages) info0 += " · 共 " + f.pages + " 表";
+        else info0 += " · 文本 " + f.textChars + " 字";
+        if (f.imgCount) info0 += " · " + f.imgCount + " 图";
+        out.push({ type: "text", attach: ometa0, text: "文件:" + f.name + "(" + info0 + ")" });
+        for (var oq = 0; oq < oseg.length; oq++) out.push(oseg[oq]);
+        return out;
+      }
+    }
     /* 图像在前、文本在后(与「文件在前、问题在后」的既有约定一致);
        文本不加代码围栏,保证 unwrapFileText() 能还原正文 */
     if (f.mode === "both" && f.images && f.images.length) {
@@ -2201,6 +3359,8 @@ function attachmentParts(f, proto) {
       if (f.ocrImgs) info += " · " + f.ocrImgs + " 图已本机 OCR(非视觉模型,图片内容在正文里)";
       if (!f.imgCount && (f.subtype === "doc" || f.subtype === "ppt")) info += " · 仅文本";
       if (f.clipped) info += " · 已截断";
+      /* S5 + P2-①:**只在降级/OCR 场景**才把模式词接进请求体信息行(默认路径逐字节不变 —— N5③ 的逐字节门靠这一点成立) */
+      if (f.ocrImgs || f.degraded) info += " · " + attachModeLabel(f);
       out.push({
         type: "text",
         attach: attachMetaOf(f),
@@ -2233,7 +3393,7 @@ function externalizeFiles(files) {
       if (!f) return;
       if (f.kind === "image" && f.data) {
         jobs.push(blobPut(f.id, f.mime, f.data).then(function (ok) { if (ok) f.ext = true; }));
-      } else if (f.kind === "pdf" && f.mode === "image" && f.images) {
+      } else if (f.kind === "pdf" && (f.mode === "image" || f.mode === "both") && f.images) {
         f.images.forEach(function (im, i) {
           if (!im.data) return;
           var key = f.id + "-p" + (i + 1);
@@ -2265,9 +3425,12 @@ function buildUserContent(text, files) {
 }
 
 /* ---- 附件设置面板(设置 → 附件) ---- */
-var PDF_MODE_OPTIONS = [
-  { v: "text", label: "纯文本", desc: "用 pdf.js 抽出文字再发送(默认,省 token)" },
-  { v: "image", label: "图片", desc: "每页按设置的分辨率渲染成图片发送(需模型支持图像输入)" }
+/* 附件图片策略(三档;唯一选项源) —— 文案说明"哪些格式支持 + 默认是哪个"(D13-b:选择器恒显三档、
+   不支持该档的格式走降级并在气泡/预览里如实注记;能力表见 attachRenderCap) */
+var ATTACH_MODE_OPTIONS = [
+  { v: "text", label: "纯文本", desc: "只发抽出的文字(最省 token);PDF/办公文档都支持。图片附件本身仍按图片发送" },
+  { v: "image", label: "图片", desc: "整页/整表渲染成图片发送(需模型支持图像输入);PDF 与 docx=逐页渲染成页图(docx 基于浏览器排版,分页与 Word 可能不一致;页数为渲染结果),xlsx/xls=本机绘制表格图,其余格式会降级为混合并说明" },
+  { v: "both", label: "混合", desc: "默认:文字 + 文档内的图片一起发送(非视觉模型下图片自动改走本机 OCR)" }
 ];
 var OCR_LANG_OPTIONS = [
   { v: "chi_sim+eng", label: "中文 + 英文", desc: "默认,中英混排的图片都能认" },
@@ -2280,8 +3443,8 @@ var VISION_FORCE_OPTIONS = [
   { v: "no", label: "强制不支持", desc: "图片一律走 OCR,只发文字给模型" }
 ];
 function initAttachSelects() {
-  setupNsel("set-pdfmode", PDF_MODE_OPTIONS, function (v) {
-    state.settings.pdfMode = v === "image" ? "image" : "text";
+  setupNsel("set-attachmode", ATTACH_MODE_OPTIONS, function (v) {
+    state.settings.attachImgMode = (v === "text" || v === "image" || v === "both") ? v : "both";
     saveSoon();
     renderAttachPanel();
   });
@@ -2360,7 +3523,7 @@ function renderAttachPanel() {
   if (kvA) kvA.textContent = fmtBytes(attachMsgMaxBytes()) + "(本地存储与请求都算它)";
   var kvI = $("kv-img-max");
   if (kvI) kvI.textContent = imgMaxSide() + " px,超出自动下采样(" + (RESAMPLE_PRESETS[imgResampleMode()] || {}).label + ")";
-  setNselValue("set-pdfmode", pdfMode(), true);
+  setNselValue("set-attachmode", attachImgMode(), true);
   setNselValue("set-ocrlangs", ocrLangs(), true);
   setNselValue("set-visionforce", state.settings.visionForce || "auto", true);
   var pages = $("set-pdfpages");
@@ -2435,31 +3598,58 @@ async function cxAutoBetweenRounds(tf) {
   var r = await cxAutoBeforeSend(tf);
   return r || { ok: false, code: "", compacted: false, text: "" };
 }
-/* ---- 生成中的待发送缓冲区(内存 · 单槽 · 多项 · 按会话归属) ----
+/* ---- 生成中的待发送缓冲区(内存 · **按会话多槽** · 多项) ----
    用户原话:Agent 循环工作期间回车 → 文本进缓冲区(输入框上方浮窗),**下一个工具轮边界**
    (工具结果写入后、下一次模型请求前)即作为 user 消息插入会话,支持中途补充需求;最后一个工具轮
    之后到达的由回合结束的兜底 flush 发送。循环结束前可召回(编辑按钮 / ↑)或丢弃;普通 Esc 丢弃整槽
-   (仅当槽归属当前会话、浮窗可见时;中断已改为 Ctrl+X)。条目不持久化(刷新即失,与 Kimi 的内存队列对齐)。同一时刻只有一个在飞
-   send(模块级 generating 是全局单飞)⇒ 只留一个会话槽。
+   (仅当槽归属当前会话、浮窗可见时;中断已改为 Ctrl+X)。条目不持久化(刷新即失,与 Kimi 的内存队列对齐)。
+   并发后同一时刻可能有多条在飞 send ⇒ 槽按 convId 分开(每条会话一个队列,浮窗只显示当前会话的);
+   超过并发上限被挡下的发送也落进这里,由 genDrop 的唤醒扫描按"槽首项最旧"补发。
    item = { id, convId, text, at };convId = **入队时**那条会话 —— 生成期间允许切走会话,
    缓冲消息必须落回它入队时那一条(读侧见 sendMessage 的 opts.bufItem.convId)。 */
-var SQ = { convId: "", items: [] };
-var genConvId = "";        /* 在飞 send 的归属会话:sendMessage 同步段写;finally 里**先清再 flush** */
-function sqHasItems() { return !!(SQ && SQ.items && SQ.items.length); }
-function sqHasFor(convId) { return !!(convId && SQ.convId === convId && SQ.items.length); }
-/* 上下文用量环:把缓冲文本当成"待发送草稿"的一部分,文本从输入框移进缓冲时读数不跳变 */
+var SQ = {};                    /* convId → { items: [{ id, convId, text, at }] } */
+var SQ_RETRY_COOLDOWN_MS = 4000;   /* 自动补发失败后的冷却:防"补发 → 失败 → 再补发"的即时循环 */
+function sqSlot(convId, make) {
+  if (!convId) return null;
+  var s = SQ[convId];
+  if (!s && make) { s = SQ[convId] = { items: [] }; }
+  return s || null;
+}
+function sqAnyItems() {
+  var k;
+  for (k in SQ) {
+    if (!Object.prototype.hasOwnProperty.call(SQ, k)) continue;
+    if (SQ[k] && SQ[k].items && SQ[k].items.length) return true;
+  }
+  return false;
+}
+function sqHasFor(convId) {
+  var s = convId ? SQ[convId] : null;
+  return !!(s && s.items && s.items.length);
+}
+/* 上下文用量环:把**当前会话**的缓冲文本当成"待发送草稿"的一部分,文本从输入框移进缓冲时读数不跳变。
+   (旧实现无条件累加全局唯一槽 ⇒ 用户在 B 时会把 A 的缓冲文本算进 B 的环 —— 缺陷 I 的修法) */
 function sqDraftTokens(c) {
-  if (!c || !conv || c.id !== conv.id || !sqHasItems()) return 0;
+  if (!c || !conv || c.id !== conv.id) return 0;
+  var s = sqSlot(c.id);
+  if (!s) return 0;
   var n = 0, i;
-  for (i = 0; i < SQ.items.length; i++) n += estimateTokens(SQ.items[i].text || "");
+  for (i = 0; i < s.items.length; i++) n += estimateTokens(s.items[i].text || "");
   return n;
+}
+/* 入队原语(按会话;进队列尾部,保持"先入先发") */
+function sqPush(convId, text) {
+  var s = sqSlot(convId, true);
+  if (!s) return false;
+  s.items.push({ id: uid(), convId: convId, text: text, at: Date.now() });
+  return true;
 }
 /* 生成中回车 → 入队(唯一入口;空文本不动作,保持"空 Enter 无效果") */
 function sqEnqueueFromInput() {
   var text = elInput.value.trim();
   if (!text) return;
-  /* 只有"入队时那条会话"能入队:生成期间切走后回车不该悄悄塞进别人的队列 */
-  if (!conv || conv.id !== genConvId) {
+  /* 只有"当前会话自己在生成"才入队:生成期间切走后回车不该悄悄塞进别人的队列 */
+  if (!conv || !genOn(conv.id)) {
     toast("另一条会话正在生成中,本条消息未发送", "warn", 4200);
     return;
   }
@@ -2471,33 +3661,40 @@ function sqEnqueueFromInput() {
     toast("生成中:带附件的消息请等本轮结束后再发送(文字与附件都保留在输入框)", "warn", 4600);
     return;
   }
-  /* 槽与条目在同一个同步段写入,convId 用同一个值(I2 强化:每项 convId 恒 = SQ.convId) */
-  SQ.convId = genConvId;
-  SQ.items.push({ id: uid(), convId: genConvId, text: text, at: Date.now() });
+  sqPush(conv.id, text);
   elInput.value = "";
   autoResize();
   updateCtxMeter();
   sqRender();
   focusInput();
 }
-/* 早退回队(幂等):同一 item 重复调用只放回一次,防"交接期异常 → 重复发送" */
+/* 早退回队(幂等):同一 item 重复调用只放回一次,防"交接期异常 → 重复发送"。
+   item.convId 必填(槽就是按它定位的);retryAt = 自动补发的短冷却(手动 Enter 不受它限制) */
 function sqRestoreBuf(item) {
-  if (!item || !item.id) return;
-  for (var i = 0; i < SQ.items.length; i++) if (SQ.items[i].id === item.id) { sqRender(); return; }
-  if (!SQ.convId) SQ.convId = item.convId || "";
-  SQ.items.unshift(item);
+  if (!item || !item.id || !item.convId) return;
+  var s = sqSlot(item.convId, true);
+  if (!s) return;
+  for (var i = 0; i < s.items.length; i++) if (s.items[i].id === item.id) { sqRender(); return; }
+  item.retryAt = Date.now() + SQ_RETRY_COOLDOWN_MS;
+  s.items.unshift(item);
   sqRender();
 }
-/* 召回(编辑按钮 & ↑ 共用):严格镜像 Kimi 的"编辑器完全为空"判定(D4,不 trim) */
+/* 召回(编辑按钮 & ↑ 共用):严格镜像 Kimi 的"编辑器完全为空"判定(D4,不 trim)。
+   多槽后跨槽找这条 item(itemId 全局唯一;浮窗只显示当前槽) */
 function sqRecall(itemId) {
   if (elInput.value.length !== 0) {
     toast("输入框里还有内容,先清空再召回(避免覆盖草稿)", "warn", 3600);
     return;
   }
-  var i, it = null;
-  for (i = 0; i < SQ.items.length; i++) if (SQ.items[i].id === itemId) { it = SQ.items[i]; break; }
+  var it = null, i, k, s, arr;
+  for (k in SQ) {
+    if (!Object.prototype.hasOwnProperty.call(SQ, k)) continue;
+    s = SQ[k];
+    arr = s && s.items ? s.items : [];
+    for (i = 0; i < arr.length; i++) if (arr[i].id === itemId) { it = arr[i]; arr.splice(i, 1); break; }
+    if (it) break;
+  }
   if (!it) return;
-  SQ.items.splice(i, 1);
   elInput.value = it.text;
   autoResize();
   updateCtxMeter();
@@ -2505,40 +3702,51 @@ function sqRecall(itemId) {
   focusInput();
 }
 function sqDiscard(itemId) {
-  for (var i = 0; i < SQ.items.length; i++) {
-    if (SQ.items[i].id === itemId) { SQ.items.splice(i, 1); break; }
+  var i, k, s, arr;
+  for (k in SQ) {
+    if (!Object.prototype.hasOwnProperty.call(SQ, k)) continue;
+    s = SQ[k];
+    arr = s && s.items ? s.items : [];
+    for (i = 0; i < arr.length; i++) if (arr[i].id === itemId) { arr.splice(i, 1); break; }
   }
   updateCtxMeter();
   sqRender();
 }
-/* 丢弃整槽(普通 Esc 的收尾动作;无确认弹窗,与逐条丢弃一致) */
-function sqDiscardAll() {
-  SQ.items = [];
-  SQ.convId = "";
+/* 丢弃整槽(普通 Esc 的收尾动作;只丢**指定会话**的,别的会话队列原样保留) */
+function sqDiscardAllOf(convId) {
+  if (convId && SQ[convId]) {
+    SQ[convId].items = [];
+    delete SQ[convId];
+  }
   updateCtxMeter();
   sqRender();
 }
 /* 残留态(未生成但队列非空)的手动恢复路径:唯一入口 = 空 Enter(hint 明示) */
 function sqSendableIdle() {
-  return !generating && sqHasItems() && !!conv && conv.id === SQ.convId &&
+  return !!conv && !genOn(conv.id) && sqHasFor(conv.id) &&
     !elInput.value.trim() && !draftFiles.length;
 }
-function sqSendHead() {
-  if (generating || !sqSendableIdle()) return;
-  var it = SQ.items.shift();
+/* 补发 / 手动发送槽首项(按会话)。返回 = 是否真的发起了 send(唤醒扫描据此判断"已补发") */
+function sqSendHead(convId) {
+  if (!convId || genOn(convId) || !sqHasFor(convId)) return false;
+  var s = SQ[convId];
+  var it = s.items.shift();
   sqRender();
   sendMessage(it.text, { bufItem: it });
+  return true;
 }
 /* 回合结束后的兜底发送:取队首 1 条,**同步**调 sendMessage(不 await、不 catch —— 错误在
-   sendMessage 既有链路里 toast)。它的同步段会把 generating 置回 true ⇒ 紧随的 pvNotifyCheck()
-   命中 "if (generating) return" 自动让位(缓冲是用户内容,优先于 E12 自动续跑)。
-   主路径 = 工具轮边界的 sqInsertAtToolBoundary;这里兜住"最后一个工具轮之后 / 无工具轮"到达的条目 */
-function sqFlushAfterTurn(endedConvId) {
-  if (generating) return;
-  if (!sqHasItems()) return;
-  if (SQ.convId !== endedConvId) return;
-  if (!getConv(SQ.convId)) {                 /* 目标会话已删(或整库替换拿走):整槽丢弃 */
-    SQ.items = []; SQ.convId = "";
+   sendMessage 既有链路里 toast)。它的同步段会把该会话置回生成中 ⇒ 紧随的 pvNotifyCheck(convId)
+   命中 genOn(convId) 自动让位(缓冲是用户内容,优先于自动续跑)。
+   主路径 = 工具轮边界的 sqInsertAtToolBoundary;这里兜住"最后一个工具轮之后 / 无工具轮"到达的条目。
+   wakeSent = genDrop 的唤醒已补发过 ⇒ 本次让位(一次收尾至多补发一次,方案 §9-D1) */
+function sqFlushAfterTurn(endedConvId, wakeSent) {
+  if (wakeSent) return;
+  if (!endedConvId || genOn(endedConvId)) return;
+  if (!sqHasFor(endedConvId)) return;
+  if (genCount() >= genMaxNow()) return;     /* 空位不足:条目保留,等下一次唤醒 */
+  if (!getConv(endedConvId)) {               /* 目标会话已删(或整库替换拿走):整槽丢弃 */
+    delete SQ[endedConvId];
     sqRender();
     toast("该对话已被删除,待发送消息已丢弃", "warn", 5000);
     return;
@@ -2548,20 +3756,21 @@ function sqFlushAfterTurn(endedConvId) {
     toast("待发送消息已保留:配置好模型 / Base URL 后按 Enter 或召回发送", "warn", 5200);
     return;
   }
-  var it = SQ.items.shift();                 /* 交接即出队 */
+  var it = SQ[endedConvId].items.shift();    /* 交接即出队 */
   sqRender();
   sendMessage(it.text, { bufItem: it });
 }
 /* 工具轮边界插入(主路径):生成期间入队的缓冲消息在「工具结果写入后、下一次模型请求前」
    逐条作为 user 消息补进会话(下一轮请求自然带上 = 中途补充需求);持久化 + msgList 同步 + 渲染,
    交接即出队。未插到的(例如这是最后一轮)留在队里,由 finally 的 sqFlushAfterTurn 兜底发送。
-   目标会话已走 / 槽归属不对:整段不动,不丢文本 */
+   只动**该会话自己的槽**:目标会话已走 / 槽为空:整段不动,不丢文本 */
 function sqInsertAtToolBoundary(sendConvId, tf, msgList) {
-  if (!tf || !msgList || !sqHasItems() || SQ.convId !== sendConvId) return 0;
+  var s = sendConvId ? SQ[sendConvId] : null;
+  if (!tf || !msgList || !s || !s.items.length) return 0;
   if (!getConv(sendConvId)) return 0;
   var n = 0;
-  while (SQ.items.length) {
-    var it = SQ.items.shift();                 /* 交接即出队(与本函数共用主路径;flush 兜底仍保留) */
+  while (s.items.length) {
+    var it = s.items.shift();                  /* 交接即出队(主路径;flush 兜底仍保留) */
     var content = buildUserContent(it.text, null);
     tf.messages.push({ id: uid(), role: "user", content: content, createdAt: Date.now() });
     msgList.push({ role: "user", content: protocolContent(content, state.settings.protocol) });
@@ -2579,26 +3788,30 @@ function sqInsertAtToolBoundary(sendConvId, tf, msgList) {
   return n;
 }
 function sqHintText() {
-  if (!generating && sqHasItems()) return "按 Enter 立即发送";
-  if ((typeof ASK_WAITS !== "undefined" && ASK_WAITS && Object.keys(ASK_WAITS).length) ||
-      (typeof TOOL_WAITS !== "undefined" && TOOL_WAITS && Object.keys(TOOL_WAITS).length)) {
+  var cid = conv && conv.id;
+  /* 超限等位优先判:该会话不在生成、但全局已满 ⇒ 这里的条目由 genDrop 的唤醒补发(Enter 也发不出) */
+  if (!genOn(cid) && sqHasFor(cid) && genCount() >= genMaxNow()) return "待前序会话空出槽位后自动发送";
+  if (!genOn(cid) && sqHasFor(cid)) return "按 Enter 立即发送";
+  if (typeof ASK_WAITS !== "undefined" && waitsCountOf(cid, "ask") + waitsCountOf(cid, "approval")) {
     return "正在等你回答 / 放行,之后自动发送";
   }
-  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") return "压缩完成后自动发送";
+  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle" && CX_RUN.convId === cid) return "压缩完成后自动发送";
   return "下一轮工具结果后自动发送 · Esc 丢弃待发送 · ↑ 召回最后一条 · 可编辑 / 丢弃";
 }
-/* 浮窗渲染(清空重建;调用点 = 入队/召回/丢弃/交接 + renderChat 两个出口) */
+/* 浮窗渲染(清空重建;调用点 = 入队/召回/丢弃/交接 + renderChat 两个出口)。
+   只显示**当前会话**的槽:别的会话的队列不可见(切过去自然可见) */
 function sqRender() {
   var box = $("send-queue"), rows = $("send-queue-rows"), hint = $("send-queue-hint");
-  if (!box || !rows || !SQ || !SQ.items) return;
-  var show = SQ.items.length > 0 && !!conv && conv.id === SQ.convId;   /* I6:只在归属会话可见 */
+  var s = conv ? sqSlot(conv.id) : null;
+  if (!box || !rows) return;
+  var show = !!(s && s.items && s.items.length);
   while (rows.firstChild) rows.removeChild(rows.firstChild);           /* 先清空:隐藏时不留残留 DOM */
   if (!show) {
     box.classList.remove("open");
     box.setAttribute("hidden", "");
     return;
   }
-  SQ.items.forEach(function (it) {
+  s.items.forEach(function (it) {
     var row = document.createElement("div");
     row.className = "sq-row";
     row.setAttribute("role", "listitem");
@@ -2638,7 +3851,9 @@ function sqRender() {
   box.removeAttribute("hidden");
 }
 function doSend() {
-  if (generating) return;
+  /* 防御性早退:当前会话自己在生成 ⇒ 与 Enter 同口径走缓冲(按钮 / 快捷键 / 命令面板
+     三处调用点都已先行按会话判定,这里兜住竞态,不静默丢消息) */
+  if (genCur()) { sqEnqueueFromInput(); return; }
   /* 办公文档还在本机解析:这时候发出去要么把附件静默漏掉、要么按了没反应 —— 明确挡住并说明 */
   if (pendingOffice.length) {
     toast("办公文档还在本机解析中,完成后才能发送(点附件上的 ✕ 可取消)", "warn", 3600);
@@ -3296,43 +4511,95 @@ function createSSEParser(onEvent) {
   };
 }
 
-function updateSendButton(busy) {
-  elSend.classList.toggle("stop", busy);
-  elSend.innerHTML = icon(busy ? "stop" : "send");
-  elSend.title = busy ? "停止生成(Ctrl+X)" : "发送(Enter)";
-  elSend.setAttribute("aria-label", busy ? "停止生成" : "发送");
+/* 发送按钮(无参):一律由 genCur() 派生 —— 它作用的是「当前查看的会话」 */
+function updateSendButton() {
+  var g = genCur();
+  elSend.classList.toggle("stop", !!g);
+  elSend.innerHTML = icon(g ? "stop" : "send");
+  elSend.title = g ? "停止生成(Ctrl+X)"
+    : (genCount() > 0 ? "发送(Enter)(其他会话仍在生成)" : "发送(Enter)");
+  elSend.setAttribute("aria-label", g ? "停止生成" : "发送");
 }
+/* 停止生成:只作用于**当前查看的会话**(G5)。Ctrl+X / Ctrl+Esc / 发送按钮共用一个入口 */
 function stopGenerating() {
-  if (abortCtrl) { try { abortCtrl.abort(); } catch (e) {} }
-  /* 压缩独立持自己的 CX_RUN.ctrl(发送前自动压缩那段窗口里模块级 abortCtrl 还是 null):
-     不在这里一并中止的话,Ctrl+X 之后摘要请求还会继续跑完再改数据 */
-  if (typeof cxAbortActive === "function") { try { cxAbortActive("用户停止生成"); } catch (e) {} }
-  denyAllToolWaits();      // 正在等待放行的工具调用也要一起取消
-  killAllSandboxes("已中止:生成被停止");   // 正在跑的沙箱立即销毁
-  /* 用户刚按了停止 → 短时间内禁止空闲自动续跑(前台任务本就不参与回流,
-     这里再压一道,避免"刚停就被程序自己又发一次请求") */
-  if (typeof pvSuppressAutoLoop === "function") pvSuppressAutoLoop();
-  /* 后台 Python 任务默认**不受影响**;只有用户打开了
-     「停止生成时也终止后台任务」才一并停掉(设置里的开关,默认关) */
-  if (state.settings.pyTaskStopKills === true) {
-    var n = pyTaskStopAll("停止生成(Ctrl+X)");
-    if (n) toast("已按设置一并终止 " + n + " 个后台 Python 任务", "warn", 3600);
-  } else if (typeof pvRunningList === "function" && pvRunningList().length) {
-    toast("已停止本次生成;后台 Python 任务仍在运行(可在设置 → 工具与权限 里停止)", "info", 4200);
+  if (!conv || !genOn(conv.id)) return;
+  abortGen(conv.id, "用户停止生成");
+  /* D-5 裁决:停止生成**不杀**后台 Python 任务(任务继续跑、产物照常回写工作区);
+     任务的中止只有一条手动收口 = 任务弹窗(/tasks),这里只如实告知 */
+  if (typeof pvRunningList === "function" && pvRunningList().length) {
+    toast("已停止本次生成;后台 Python 任务仍在运行(可在任务弹窗 /tasks 里停止)", "info", 4200);
   }
 }
 
 async function sendMessage(text, opts) {
   opts = opts || {};
-  if (generating) { if (opts.bufItem) sqRestoreBuf(opts.bufItem); return; }   /* 防御性回队(见方案 §3.3-7) */
   /* 走到这里文字 / 附件已在调用方手上(编辑、重发、工具回填等),不能被清草稿动作清掉 */
   if (!conv && !newConversation({ keepDraft: true })) { if (opts.bufItem) sqRestoreBuf(opts.bufItem); return; }
   /* 这一轮的归宿:生成期间允许切走会话(selectConv 会改写模块级 conv),收尾一律落到
-     **发起这次生成时**那条会话上(见 finally 与 commit 的第二参数) */
-  /* 缓冲消息按**入队时**那条会话发送(生成期间用户可能已切走);缺失/会话已消失时回落到当前会话 */
-  var sendConvId = (opts.bufItem && opts.bufItem.convId && getConv(opts.bufItem.convId))
-    ? opts.bufItem.convId : conv.id;
+     **发起这次生成时**那条会话上(见 finally 与 commit 的第二参数)。
+     派生链 = 显式目标 > 缓冲条目归属 > 当前会话:自动续跑(pvNotifyCheck)必须走显式目标 ——
+     它在"用户已切走"之后才发起,只认当前会话会把 A 的完成回流发进 B(缺陷 D / I12)。
+     注:入口忙碌门必须在派生**之后**才成立(实现注记 S-6) */
+  var sendConvId = (opts.targetConvId && getConv(opts.targetConvId)) ? opts.targetConvId
+    : ((opts.bufItem && opts.bufItem.convId && getConv(opts.bufItem.convId)) ? opts.bufItem.convId : conv.id);
+  /* 防重入:按**发起会话**判 —— 别的会话在生成不挡这一条(超限/异常由 genNew 的 !g 分支兜底:
+     转缓冲或如实拒绝,不静默丢消息) */
+  if (genOn(sendConvId)) { if (opts.bufItem) sqRestoreBuf(opts.bufItem); return; }
   function sendTarget() { return getConv(sendConvId) || conv; }
+  /* commit / finishRoundStats 必须在**函数级作用域**里声明(整体 IIFE 是 "use strict" ⇒ 块内
+     函数声明只属于那个块):catch / finally 在 try 块之外也要调用它们(收尾链)。 */
+  /* target 缺省 = 当前会话;收尾按「发起这次生成时」那条会话传进来(用户可能在生成期间切走)。
+     返回值 = 是否真的写回目标:未命中(目标里已经没有这条消息)时调用方据此如实提示 */
+  function commit(msg, target) {
+    /* target / conv 为 null = 这条会话在生成期间被收敛/整库替换拿走了(见 finally 里的兜底说明):
+       这里再取一次空值兜底,免得 catch 分支的 commit 先抛、把真正的报错也顶掉 */
+    var c = target || conv;
+    if (!msg || !c) return false;
+    var i = -1;
+    for (var k = 0; k < c.messages.length; k++) if (c.messages[k].id === msg.id) { i = k; break; }
+    if (i < 0) return false;
+    c.messages[i] = msg;
+    return true;
+  }
+  /* 一轮结束:算时长、token、速度,并按实测反推估算系数 */
+  function finishRoundStats() {
+    asst.streaming = false;
+    var dur = (Date.now() - startedAt) / 1000;
+    asst.duration = dur;
+    /* token 数:只认服务端 usage;取不到才按文本长度估算并标 ≈ */
+    if (asst.tokens == null) {
+      var estTok = estimateTokens(contentToText(asst.content)) + estimateTokens(asst.reasoning || "");
+      if (estTok > 0) { asst.tokens = estTok; asst.exactTokens = false; }
+    }
+    /* 速度:用客户端实测的「首字 → 最后一帧」吞吐 —— 这才是用户真正感知到的输出速度。
+       不用服务端 timings.predicted_per_second:它只覆盖纯解码窗口,
+       不含首字延迟与 prompt 处理,数值会明显偏高(实测服务端自称 82,端到端只有 71)。 */
+    var decodeSec = (firstTokenAt && lastTokenAt > firstTokenAt)
+      ? (lastTokenAt - firstTokenAt) / 1000 : 0;
+    if (decodeSec < 0.3) decodeSec = dur;
+    if (asst.tokens != null && decodeSec > 0.05) {
+      asst.speed = asst.tokens / decodeSec;
+      asst.exactSpeed = !!asst.exactTokens;
+    } else if (!asst.speed) {
+      asst.speed = null;
+      asst.exactSpeed = false;
+    }
+    asst.thinkMs = firstTokenAt ? (firstTokenAt - startedAt) : asst.thinkMs;
+    /* 用这次服务端给的真实 token 数,反推「字符→token」的偏差倍数并按模型记住 */
+    if (asst.exactTokens && asst.tokens > 20 && (estCjk + estLatin + estDigit + estSym) > 0 && asst.model) {
+      var rawEst = estCjk * TOK_PER_CJK + estLatin * TOK_PER_LATIN +
+        estDigit * TOK_PER_DIGIT + estSym * TOK_PER_SYM;
+      if (rawEst > 10) {
+        var k = asst.tokens / rawEst;
+        if (k > 0.4 && k < 2.5) {
+          var prevK = tokCalibFor(asst.model) === 1 ? 0 : tokCalibFor(asst.model);
+          var newK = prevK ? (prevK * 0.5 + k * 0.5) : k;
+          if (!state.settings.tokCalib || typeof state.settings.tokCalib !== "object") state.settings.tokCalib = {};
+          state.settings.tokCalib[asst.model] = newK;
+        }
+      }
+    }
+  }
   var model = effectiveModel().trim();
   if (!model) {
     toast("请先选择或输入模型名称", "warn");
@@ -3348,48 +4615,71 @@ async function sendMessage(text, opts) {
   }
   var useStream = !!state.settings.stream && CAP.stream;
 
-  /* 先立刻进入「生成中」状态,再去做磁盘活 ——
-     否则等 IndexedDB 的那几十毫秒里,界面还是「可以再点一次发送」的样子 */
-  generating = true;
-  genConvId = sendConvId;         /* 在飞 send 的归属会话(同步段写入,与 generating 同一拍) */
-  updateSendButton(true);
-  syncParamInputs();
-
-  /* 附件 payload 可能外置在 IndexedDB 里:先把这轮要用到的读回内存,再组装请求。
-     这里传的是**发起时会话**的消息数组(此刻 conv 还等于它 —— 上面刚捕获 sendConvId,中间没有 await) */
-  await hydrateAttachments(conv.messages);
-  if (opts.files) await externalizeFiles(opts.files);
-
-  /* 这两次 await 也是"用户可能切走 / 删会话"的窗口(附件大时更长):按**发起这次生成时**的 id
-     重取目标 —— 下面所有写入(用户消息 / 助手占位 / updatedAt / 落盘)一律落它,落进"当前会话"
-     就是往另一条会话里塞内容。目标确已消失(被删 / 被整库替换拿走)时**收手**:这条消息根本
-     不发出去,如实告知,并把「生成中」状态解开(不然后续所有生成入口都被 generating 挡住) */
-  var tf = getConv(sendConvId);
-  if (!tf) {
-    generating = false;
-    updateSendButton(false);
-    toast("这条对话已被清空或删除,本条消息没有发送", "warn", 5000);
-    if (opts.bufItem) sqRestoreBuf(opts.bufItem);     /* 缓冲消息回队首:一定不丢文本 */
+  /* 先立刻进入「生成中」状态(注册表记录),再去做磁盘活 ——
+     否则等 IndexedDB 的那几十毫秒里,界面还是「可以再点一次发送」的样子。
+     ctrl 的创建点就在 genNew 这一拍(不再是首次请求前):压缩窗口内按 Ctrl+X 也必须可中止 */
+  var g = genNew(sendConvId);
+  if (!g) {
+    /* 并发已达上限(D-1=B):转入该会话的待发送缓冲,等任一会话收尾后由 genDrop 的唤醒补发。
+       带附件 / 重生成 / 自动续跑这类无法入缓冲的路径:如实拒绝并保全用户内容(不静默丢)。
+       注:doSend 恒传 `files`(可能为空数组)⇒ 判据看**实际长度**,不是字段存在性 */
+    var hadFiles = !!(opts.files && opts.files.length);
+    if (opts.bufItem) sqRestoreBuf(opts.bufItem);
+    else if (text && !hadFiles && !opts.skipUserMsg && !opts.intoMsg && !opts.history && sqPush(sendConvId, text)) {
+      sqRender();
+      toast("并发会话已达上限,本条消息已转入待发送,待空出槽位后自动发送", "info", 5200);
+    } else if (text && hadFiles && !opts.skipUserMsg && !opts.intoMsg && !opts.history) {
+      elInput.value = text;
+      draftFiles = opts.files.slice();
+      renderAttachBar();
+      autoResize();
+      updateCtxMeter();
+      toast("并发会话已达上限,本条消息未发送(草稿已还回输入框)", "warn", 5200);
+    } else {
+      toast(opts.skipUserMsg ? "并发会话已达上限,本次自动续跑已推迟(提醒会随下一次请求带上)"
+        : "并发会话已达上限,本条消息未发送", "warn", 5200);
+    }
+    updateSendButton();
     return;
   }
+  var roundStarted = false;       /* 消息已落库 / asst 已建 ⇒ 收尾走完整链(R10 结构保证) */
+  try {
+    updateSendButton();
+    syncParamInputs();
+
+    /* 附件 payload 可能外置在 IndexedDB 里:先把这轮要用到的读回内存,再组装请求。
+       这里传的是**发起时会话**的消息数组(此刻 conv 可能已被切走 —— 附件 hydrate 必须落回发起会话) */
+    await hydrateAttachments((getConv(sendConvId) || conv).messages);
+    if (opts.files) await externalizeFiles(opts.files);
+
+    /* 这两次 await 也是"用户可能切走 / 删会话"的窗口(附件大时更长):按**发起这次生成时**的 id
+       重取目标 —— 下面所有写入(用户消息 / 助手占位 / updatedAt / 落盘)一律落它,落进"当前会话"
+       就是往另一条会话里塞内容。目标确已消失(被删 / 被整库替换拿走)时**收手**:这条消息根本
+       不发出去,如实告知(finally 的 genDrop 会解开「生成中」,不留幽灵) */
+    var tf = getConv(sendConvId);
+    if (!tf) {
+      genDrop(sendConvId);                             /* 先复位再回队:放回时的 hint 依赖该顺序 */
+      if (opts.bufItem) sqRestoreBuf(opts.bufItem);    /* 缓冲消息回队首:一定不丢文本 */
+      toast("这条对话已被清空或删除,本条消息没有发送", "warn", 5000);
+      return;
+    }
 
   /* ---- 上下文压缩:本 turn 的自动压缩计数复位 + 发送前自动压缩 ----
-     这一段在 abortCtrl 创建(下面 1886 行附近)**之前**运行 ⇒ 压缩必须自持 CX_RUN.ctrl,
-     Ctrl+X 由 stopGenerating → cxAbortActive 停掉(见 §9.1 的时序陷阱)。
+     压缩自持 CX_RUN.ctrl(整段运行的运行级 ctrl);本轮请求的中断器已在 genNew 建好 ⇒
+     这个窗口里按 Ctrl+X 两条都会被中止(abortGen → ctrl.abort + cxAbortActiveOf,见 §7.6 V-1)。
      重生成 / 编辑重发路径(opts.history)按历史截取组装请求,不做自动压缩 */
-  CX_RUN.regen = !!opts.history;
+  g.regen = !!opts.history;
   if (!opts.history) {
     cxLedger(tf.id).round = 0;
     cxLedger(tf.id).ovfCount = 0;      /* U-4 借鉴-1:溢出恢复额度与 round 同一处按 turn 复位 */
     if (cxEnabled()) {
       var pre = await cxAutoBeforeSend(tf);
       if (pre && pre.code === "ECOMPACT_ABORT") {
-        /* 缓冲消息不经输入框:先复位 generating 再放回队首 —— sqRestoreBuf 内部 sqRender 的 hint
+        /* 缓冲消息不经输入框:先复位记录再放回队首 —— sqRestoreBuf 内部 sqRender 的 hint
            依赖该顺序(否则短暂显示"下一轮工具结果后自动发送"的残留态);非缓冲路径仍走下面"草稿还回输入框" */
         if (opts.bufItem) {
-          generating = false;
+          genDrop(sendConvId);
           sqRestoreBuf(opts.bufItem);
-          updateSendButton(false);
           toast("已取消:压缩被中止,本条消息未发送(已放回待发送队列)", "info", 4200);
           return;
         }
@@ -3397,9 +4687,8 @@ async function sendMessage(text, opts) {
            草稿必须还回去:doSend 在调 sendMessage 之前就清空了 elInput / draftFiles,而且不 await 它 ——
            不还就等于把用户的正文与附件吞掉。自动续跑路径(skipUserMsg)下 text === null,
            那条路径**不能**碰输入框/附件条(用户此刻可能正在打字) */
-        generating = false;
-        updateSendButton(false);
-        setConn("ok", "已连接");
+        genDrop(sendConvId);
+        setConnFor(sendConvId, "ok", "已连接");
         if (text) {
           elInput.value = text;
           draftFiles = opts.files || [];
@@ -3463,15 +4752,25 @@ async function sendMessage(text, opts) {
   trimConversation(tf);
   saveState(true);
   /* 视图只在"发起会话此刻就是当前会话"时才动:切走时只写数据,免得聊天区显示原会话、
-     侧栏却高亮另一条(后续每一帧的流式重绘都靠 msgEl —— 不在当前会话上就给 null,走安全空路径) */
+     侧栏却高亮另一条(后续每一帧的流式重绘都靠下面的 curMsgEl —— 不在当前会话上就给 null,走安全空路径) */
   if (tf === conv) {
     renderChat();
     scrollToBottom(true);
     updateCtxMeter();
   }
 
-  var msgEl = (tf === conv) ? elChatInner.querySelector('[data-id="' + cssEscape(asst.id) + '"]') : null;
-  abortCtrl = new AbortController();
+  /* 流式气泡元素**每帧重解**(不再是发起时的一次性快照 —— 切走再切回后旧快照已离开 DOM,
+     会造成"切回后气泡冻结";复用既有 msgElementFor,外面套"仅发起会话 = 当前视图"的守卫)。
+     仅在需要绘帧时解析,缓存只作同帧去重(元素被重绘替换后 contains 为假 ⇒ 自动重解) */
+  var msgElCache = null, msgElCacheId = "";
+  function curMsgEl() {
+    if (sendConvId !== conv.id) { msgElCache = null; msgElCacheId = ""; return null; }
+    if (msgElCache && msgElCacheId === asst.id && document.body.contains(msgElCache)) return msgElCache;
+    msgElCacheId = asst.id;
+    msgElCache = msgElementFor(asst.id);
+    return msgElCache;
+  }
+  var ctrl = g.ctrl;
   var startedAt = Date.now();
   var firstTokenAt = 0, lastTokenAt = 0;
   var estCjk = 0, estLatin = 0, estDigit = 0, estSym = 0, tokEst = 0;
@@ -3506,7 +4805,7 @@ async function sendMessage(text, opts) {
               estDigit * TOK_PER_DIGIT + estSym * TOK_PER_SYM) * calibK;
   }
 
-  setConn("busy", "请求中…");
+  setConnFor(sendConvId, "busy", "请求中…");
 
   function touch() {
     var now = Date.now();
@@ -3520,7 +4819,7 @@ async function sendMessage(text, opts) {
     while (speedWin.length > 4 && speedWin[0].t < cut) speedWin.shift();
     if (now - lastSpeedAt < 200) return;   // 限频:最多每 200ms 重算一次
     lastSpeedAt = now;
-    updateCtxMonitor();                    // 输入区用量环跟着流式输出实时刷新
+    if (sendConvId === conv.id) updateCtxMonitor();   // 输入区用量环:只服务当前视图(I4)
     var r = windowSpeed(now);
     if (r != null) {
       smoothSpeed = smoothSpeed > 0 ? (smoothSpeed * (1 - SPEED_EMA) + r * SPEED_EMA) : r;
@@ -3552,63 +4851,10 @@ async function sendMessage(text, opts) {
     if (sinceFirst < 1.5) return null;
     return tokEst / sinceFirst;
   }
-  /* target 缺省 = 当前会话;收尾按「发起这次生成时」那条会话传进来(用户可能在生成期间切走)。
-     返回值 = 是否真的写回目标:未命中(目标里已经没有这条消息)时调用方据此如实提示 */
-  function commit(msg, target) {
-    /* target / conv 为 null = 这条会话在生成期间被收敛/整库替换拿走了(见 finally 里的兜底说明):
-       这里再取一次空值兜底,免得 catch 分支的 commit 先抛、把真正的报错也顶掉 */
-    var c = target || conv;
-    if (!msg || !c) return false;
-    var i = -1;
-    for (var k = 0; k < c.messages.length; k++) if (c.messages[k].id === msg.id) { i = k; break; }
-    if (i < 0) return false;
-    c.messages[i] = msg;
-    return true;
-  }
-  /* 一轮结束:算时长、token、速度,并按实测反推估算系数 */
-  function finishRoundStats() {
-    asst.streaming = false;
-    var dur = (Date.now() - startedAt) / 1000;
-    asst.duration = dur;
-    /* token 数:只认服务端 usage;取不到才按文本长度估算并标 ≈ */
-    if (asst.tokens == null) {
-      var estTok = estimateTokens(contentToText(asst.content)) + estimateTokens(asst.reasoning || "");
-      if (estTok > 0) { asst.tokens = estTok; asst.exactTokens = false; }
-    }
-    /* 速度:用客户端实测的「首字 → 最后一帧」吞吐 —— 这才是用户真正感知到的输出速度。
-       不用服务端 timings.predicted_per_second:它只覆盖纯解码窗口,
-       不含首字延迟与 prompt 处理,数值会明显偏高(实测服务端自称 82,端到端只有 71)。 */
-    var decodeSec = (firstTokenAt && lastTokenAt > firstTokenAt)
-      ? (lastTokenAt - firstTokenAt) / 1000 : 0;
-    if (decodeSec < 0.3) decodeSec = dur;
-    if (asst.tokens != null && decodeSec > 0.05) {
-      asst.speed = asst.tokens / decodeSec;
-      asst.exactSpeed = !!asst.exactTokens;
-    } else if (!asst.speed) {
-      asst.speed = null;
-      asst.exactSpeed = false;
-    }
-    asst.thinkMs = firstTokenAt ? (firstTokenAt - startedAt) : asst.thinkMs;
-    /* 用这次服务端给的真实 token 数,反推「字符→token」的偏差倍数并按模型记住 */
-    if (asst.exactTokens && asst.tokens > 20 && (estCjk + estLatin + estDigit + estSym) > 0 && asst.model) {
-      var rawEst = estCjk * TOK_PER_CJK + estLatin * TOK_PER_LATIN +
-        estDigit * TOK_PER_DIGIT + estSym * TOK_PER_SYM;
-      if (rawEst > 10) {
-        var k = asst.tokens / rawEst;
-        if (k > 0.4 && k < 2.5) {
-          var prevK = tokCalibFor(asst.model) === 1 ? 0 : tokCalibFor(asst.model);
-          var newK = prevK ? (prevK * 0.5 + k * 0.5) : k;
-          if (!state.settings.tokCalib || typeof state.settings.tokCalib !== "object") state.settings.tokCalib = {};
-          state.settings.tokCalib[asst.model] = newK;
-        }
-      }
-    }
-  }
-
   /* 个别服务端不认 stream_options / tools;被拒时去掉相应字段重试一次 */
   async function doFetch(b) {
     var r = await fetch(endpointFor(), {
-      method: "POST", headers: headersFor(), body: JSON.stringify(b), signal: abortCtrl.signal
+      method: "POST", headers: headersFor(), body: JSON.stringify(b), signal: ctrl.signal
     });
     function strip(srcBody, keys) {
       var o = {};
@@ -3621,7 +4867,7 @@ async function sendMessage(text, opts) {
       try { await r.text(); } catch (e) {}
       r = await fetch(endpointFor(), {
         method: "POST", headers: headersFor(),
-        body: JSON.stringify(strip(b, ["stream_options"])), signal: abortCtrl.signal
+        body: JSON.stringify(strip(b, ["stream_options"])), signal: ctrl.signal
       });
     }
     if (!r.ok && b && b.tools && b.tools.length
@@ -3629,7 +4875,7 @@ async function sendMessage(text, opts) {
       try { await r.text(); } catch (e) {}
       var b2 = strip(b, ["tools", "tool_choice"]);
       var r2 = await fetch(endpointFor(), {
-        method: "POST", headers: headersFor(), body: JSON.stringify(b2), signal: abortCtrl.signal
+        method: "POST", headers: headersFor(), body: JSON.stringify(b2), signal: ctrl.signal
       });
       if (r2.ok) {
         toast("服务端不支持工具调用(tools 被拒),本次已去掉工具重试", "warn", 5000);
@@ -3716,7 +4962,7 @@ async function sendMessage(text, opts) {
       asst.model = jr.model || model;
       asst.streaming = false;
       commit(asst, sendTarget());     /* 写回发起这次生成的那条会话(生成期间可能已切走) */
-      paintMsg(msgEl);
+      paintMsg(curMsgEl());
     } else {
       var acc = "", accReason = "";
       var reader = res.body.getReader();
@@ -3786,7 +5032,7 @@ async function sendMessage(text, opts) {
         asst.content = acc;
         asst.reasoning = accReason;
         commit(asst, sendTarget());     /* 每帧都按发起会话写回,切走后也落在原会话上 */
-        scheduleRender(msgEl);
+        scheduleRender(curMsgEl());     /* 每帧重解元素:切回当前会话后气泡继续增长(缺陷 A 的修法) */
       });
 
       while (true) {
@@ -3802,18 +5048,18 @@ async function sendMessage(text, opts) {
       else if (roundFinish && roundFinish !== "stop" && roundFinish !== "end_turn" && roundFinish !== "tool_calls"
         && roundFinish !== "tool_use") asst.finishReason = roundFinish;
       commit(asst, sendTarget());     /* 写回发起这次生成的那条会话(生成期间可能已切走) */
-      paintMsg(msgEl);
+      paintMsg(curMsgEl());
     }
 
     if (!contentToText(asst.content).trim() && !asst.reasoning && !turnCalls.length) {
       throw new Error("服务端返回了空内容。可能是模型不支持当前请求格式,或上下文被截断。");
     }
     asst.error = null;
-    setConn("ok", "已连接");
+    setConnFor(sendConvId, "ok", "已连接");
     finishRoundStats();
     /* 本轮解析成功(流正常收尾 / 非流式 JSON 解析 + 内容检查都过了)⇒ 请求体里登记的后台任务
        完成通知才算"模型确实收到过"。失败/中止/流内报错都会走到外层 catch 的 pvNotifyRollback */
-    pvNotifyCommit();
+    pvNotifyCommit(sendConvId);
     return { calls: turnCalls };
   }
   /* OpenAI 的 tool_calls 是按 index 分片下发的,按片拼接 */
@@ -3834,18 +5080,19 @@ async function sendMessage(text, opts) {
     turnCalls = turnCalls.filter(function (c) { return c && c.name; });
   }
 
-  try {
-    /* 请求体的消息历史也按**发起时会话**取:这两个 await 之后用户可能已经切走,
-       payloadMessages() 缺省读的是模块级 conv(= 当前会话)—— 那会把另一条会话的历史发出去。
-       工具轮之后的续答走 msgList(本地累积),不受这里影响 */
-    var payload = payloadMessages(opts.history || tf.messages);
-    var msgList = payload.list.slice();
-    asst.truncated = payload.truncated;
+  /* 消息已落库、asst 占位已建:从这里起收尾走完整链(R10 结构保证:genDrop 必被覆盖) */
+  roundStarted = true;
+  /* 请求体的消息历史也按**发起时会话**取:这两个 await 之后用户可能已经切走,
+     payloadMessages() 缺省读的是模块级 conv(= 当前会话)—— 那会把另一条会话的历史发出去。
+     工具轮之后的续答走 msgList(本地累积),不受这里影响 */
+  var payload = payloadMessages(opts.history || tf.messages);
+  var msgList = payload.list.slice();
+  asst.truncated = payload.truncated;
     /* 结构类 4xx 降级开关(§3.4):本次 send 内生效,不落盘 —— 置 true 后本轮的请求体不再带工具媒体 */
     var mediaOff = false;
-    toolBeginTurn();
+    toolBeginTurn(sendConvId);
     while (true) {
-      toolBeginTurn();                 // 「每轮最多调用次数」按轮计
+      toolBeginTurn(sendConvId);       // 「每轮最多调用次数」按轮计(记在**该会话**的 GEN 记录上)
       /* 轮次之间:上下文已经接近窗口上限就自动压缩一次(关着就整段跳过) */
       if (!opts.history && !opts.intoMsg) {
         var btw = await cxAutoBetweenRounds(getConv(sendConvId) || tf);
@@ -3894,6 +5141,7 @@ async function sendMessage(text, opts) {
         return { id: c.id, name: c.name, argsText: c.argsText, args: parseToolArgs(c.argsText) };
       });
       commit(asst, sendTarget());
+      genSetPhase(sendConvId, "tools");      /* 徽标:工具执行中(进入工具执行那一刻) */
       syncVariant(asst);
       msgList.push({ role: "assistant", content: asst.content, tool_calls: apiToolCalls(asst.toolCalls) });
       /* 工具轮里的每一次写入都落到**发起这次生成时**那条会话上(用户可能在生成期间切走:
@@ -3941,7 +5189,7 @@ async function sendMessage(text, opts) {
         asst.truncated = pmA.truncated;
       }
       if (lostTarget) break;
-      if (abortCtrl && abortCtrl.signal && abortCtrl.signal.aborted) break;
+      if (ctrl.signal.aborted) break;
       /* ★ 工具轮边界插入:生成期间入队的缓冲消息在「工具结果写入后、下一次模型请求前」
          逐条作为 user 消息补进会话 —— 下一轮请求立刻带上(中途补充需求)。
          没插到的(例如这是最后一轮)留在队里,由 finally 的 sqFlushAfterTurn 兜底发送 */
@@ -3959,44 +5207,50 @@ async function sendMessage(text, opts) {
       if (tf === conv) {
         renderChat();
         scrollToBottom(true);
-        msgEl = elChatInner.querySelector('[data-id="' + cssEscape(asst.id) + '"]');
-      } else {
-        msgEl = null;                       /* 视图不在发起会话上:后续流式重绘一律走安全空路径 */
       }
-      setConn("busy", "已回填工具结果,继续生成…");
+      /* 视图不在发起会话上时不动聊天区:后续流式重绘由 curMsgEl 每帧按当前视图重解(或给 null 走空路径) */
+      setConnFor(sendConvId, "busy", "已回填工具结果,继续生成…");
     }
   } catch (err) {
     /* 走到这里说明这一轮请求没有成功(中止 / 网络错误 / 4xx):
        把在途的后台任务完成通知回滚成"未通知",下次请求会重新带上 ——
        否则一次失败(或请求还没发出去就被 Ctrl+X)就把完成回流信息永久吞掉。
        已经 2xx 过的那次提交是空集,这里重复调用无副作用 */
-    pvNotifyRollback();
-    if (err && err.name === "AbortError") {
+    pvNotifyRollback(sendConvId);
+    if (!roundStarted) {
+      /* 前置段(附件 hydrate / 压缩窗口)的意外异常:如实提示并回队,不留半截状态(R10 结构保证的后半) */
+      if (opts.bufItem) sqRestoreBuf(opts.bufItem);
+      toast("发送未能完成:" + friendlyError(err, endpointFor()), "error", 5200);
+    } else if (err && err.name === "AbortError") {
       asst.stopped = true;
       commit(asst, sendTarget());
-      setConn("ok", "已连接");
+      setConnFor(sendConvId, "ok", "已连接");
       toast("已停止生成", "info", 1500);
     } else {
       asst.error = friendlyError(err, endpointFor()) +
         (mediaOff ? "\n可在 设置→模型 把该模型的图像能力设为\"不支持\"(或删除/压缩含图片的工具消息)后重试" : "");
       asst.streaming = false;
       commit(asst, sendTarget());
-      setConn("err", "请求失败");
+      setConnFor(sendConvId, "err", "请求失败");
       toast("请求失败:" + String(asst.error).split("\n")[0], "error", 4200);
     }
   } finally {
+    /* 收尾唯一出口,必须是**第一句**:记录先消失,后面的 UI 刷新才能读到"不在生成"
+       (I11 结构保证:进入 try 即已有记录;genDrop 会一并触发缓冲唤醒,返回是否已补发) */
+    var wakeSent = genDrop(sendConvId);
+    if (!roundStarted) {
+      /* 前置段早退(目标会话消失 / 压缩被中止 / 意外异常):只复位按钮,不碰未建出的回合状态 */
+      updateSendButton();
+    } else {
     /* 兜底:正常路径已在 runTurn 里算过,这里只处理出错/中断的情形,重复调用无副作用 */
     finishRoundStats();
-    CX_RUN.regen = false;               /* 本轮结束:重生成标记复位 */
     var dur = asst.duration || ((Date.now() - startedAt) / 1000);
     syncVariant(asst);   // 本轮结果写回当前分支
-    /* 用服务端真实 usage 记录上下文水位(输入/输出/缓存),供输入区用量环显示 */
-    recordUsage(asst.model || model, promptTokens, asst.exactTokens ? asst.tokens : null, cachedTokens, asst.id);
-    generating = false;
-    abortCtrl = null;
-    toolBeginTurn();
-    denyAllToolWaits();
-    updateSendButton(false);
+    /* 用服务端真实 usage 记录上下文水位(输入/输出/缓存),供输入区用量环显示。
+       目标会话显式传 sendConvId:读模块级 conv 会把读数记进"当前视图"(缺陷 B) */
+    recordUsage(sendConvId, asst.model || model, promptTokens, asst.exactTokens ? asst.tokens : null, cachedTokens, asst.id);
+    denyToolWaitsOf(sendConvId);       // 只拒**该会话**的等待项;别会话的放行卡不受影响(缺陷 C)
+    updateSendButton();
     /* 这一轮的写回与落盘按**发起这次生成时**那条会话来(见 sendTarget):
        · 会话可能在生成期间被合并/整库替换拿了去(对侧删除 / 清空 → 见 mergeConvsByIdb);
        · 用户也可能在生成期间切走(selectConv 会改写模块级 conv)。
@@ -4013,24 +5267,26 @@ async function sendMessage(text, opts) {
        以及本轮学到的东西(例如 tokCalib 校准值);不落反而把这些一起丢了 */
     saveState(true);
     if (!saved) toast("这条对话已被清空或删除,本次回答没有保存", "warn", 5000);
-    cancelRender();
-    renderChat();
-    renderConvList();
-    updateTopbar();
-    updateCtxMeter();
+    if (sendConvId === conv.id) cancelRender();   /* F:只清"当前视图"的待绘帧(别的会话收尾不得掐帧) */
+    if (sendConvId === conv.id) renderChat();     /* I4:聊天区只重绘当前会话 */
+    renderConvList();                             /* 徽标是全局重绘,任何时刻都要跟着记录同拍 */
     updateStorageMeter();
-    lastStats = { tokens: asst.tokens, speed: asst.speed, duration: dur, model: asst.model,
+    LASTSTATS[sendConvId] = { tokens: asst.tokens, speed: asst.speed, duration: dur, model: asst.model,
                   exactTokens: asst.exactTokens, exactSpeed: asst.exactSpeed, promptTokens: promptTokens,
                   srvSpeed: srvPredSpeed, srvTokens: srvPredictedN };
-    updateStatusBar();
+    if (sendConvId === conv.id) {
+      updateTopbar();        /* 顶栏 / 状态栏 / 用量环都是"当前视图"的读数(别的会话端不刷新) */
+      updateCtxMeter();
+      updateStatusBar();
+    }
     if (asst.error) focusInput();
-    /* 本轮归属结束:**先清 genConvId,再 flush** —— flush 内新 sendMessage 的同步段会把它
-       重写为新回合的会话;清零点若排在 flush 之后会把新回合的归属抹掉(链式回合入队全废) */
-    genConvId = "";
-    sqFlushAfterTurn(sendConvId);
-    /* 本轮生成已结束。若期间有后台任务跑完(且这一轮没机会注入),空闲时自动续跑一次。
-       注意:上面若真发出了缓冲消息,此刻 generating 已回到 true ⇒ 这里自然让位(不抢发) */
-    try { pvNotifyCheck(); } catch (e2) {}
+    /* 本轮归属结束:先 flush 本会话的缓冲(genDrop 的唤醒若已补发过 ⇒ 本次让位,一次收尾至多补一发);
+       flush 内新 sendMessage 的同步段会按它自己的目标会话建记录,不受此处顺序影响 */
+    sqFlushAfterTurn(sendConvId, wakeSent);
+    /* 本轮生成已结束。若期间有后台任务跑完(且这一轮没机会注入),空闲时自动续跑一次(按**本会话**)。
+       注意:上面若真发出了缓冲消息,此刻该会话已回到生成中 ⇒ 这里自然让位(不抢发) */
+    try { pvNotifyCheck(sendConvId); } catch (e2) {}
+    }
   }
 }
 /* ---- 分支(alternates):同一条助手消息可以有多个生成结果 ---- */
@@ -4058,7 +5314,7 @@ function syncVariant(msg) {
   msg.alternates[i] = snapshotVariant(msg);
 }
 function switchAlt(msg, dir) {
-  if (generating) { toast("生成进行中,暂时无法切换分支", "warn"); return; }
+  if (genOn(conv && conv.id)) { toast("生成进行中,暂时无法切换分支", "warn"); return; }
   var n = Array.isArray(msg.alternates) ? msg.alternates.length : 0;
   if (n < 2) return;
   syncVariant(msg);
@@ -4067,7 +5323,7 @@ function switchAlt(msg, dir) {
   redrawMessage(msg);
   if (conv) conv.updatedAt = Date.now();
   renderConvList(); updateTopbar(); updateCtxMeter(); updateStorageMeter(); saveSoon();
-  lastStats = { tokens: msg.tokens, speed: msg.speed, duration: msg.duration, model: msg.model,
+  if (conv) LASTSTATS[conv.id] = { tokens: msg.tokens, speed: msg.speed, duration: msg.duration, model: msg.model,
                 exactTokens: msg.exactTokens, exactSpeed: msg.exactSpeed };
   updateStatusBar();
   toast("分支 " + (msg.altIndex + 1) + " / " + n, "info", 1200);
@@ -4119,13 +5375,13 @@ function canSend() {
   return true;
 }
 async function retryFromError(msg) {
-  if (generating || !conv || !canSend()) return;
+  if (genOn(conv && conv.id) || !conv || !canSend()) return;
   var history = historyBefore(msg);
   if (!history) { toast("上下文不足,请重新发送问题", "warn"); return; }
   await sendMessage("", { skipUserMsg: true, intoMsg: msg, history: history });
 }
 async function regenerate(msg) {
-  if (generating || !conv || !canSend()) return;
+  if (genOn(conv && conv.id) || !conv || !canSend()) return;
   var history = historyBefore(msg);
   if (!history) { toast("没有可重新生成的问题", "warn"); return; }
   /* 把当前结果存成一个分支,再就地新开一个空分支重新生成;
@@ -4139,7 +5395,7 @@ async function regenerate(msg) {
   await sendMessage("", { skipUserMsg: true, intoMsg: msg, history: history });
 }
 function startEdit(msgEl, msg) {
-  if (generating) { toast("生成进行中,暂时无法编辑", "warn"); return; }
+  if (genOn(conv && conv.id)) { toast("生成进行中,暂时无法编辑", "warn"); return; }
   var contentEl = msgEl.querySelector(".msg-body > .msg-content");
   if (!contentEl) return;
   /* 带附件的消息:文件 / 图片只能增删,内容不能改;文字部分照常编辑 */
@@ -4374,7 +5630,7 @@ elChatInner.addEventListener("click", function (e) {
   } else if (act === "alt-next") {
     switchAlt(msg, 1);
   } else if (act === "cut") {
-    if (generating) { toast("生成进行中,请稍后再试", "warn"); return; }
+    if (genOn(conv && conv.id)) { toast("生成进行中,请稍后再试", "warn"); return; }
     var cutIds = {};
     (ctx2.group || [msg]).forEach(function (m) { cutIds[m.id] = 1; });
     var idx = -1;
@@ -4396,7 +5652,7 @@ elChatInner.addEventListener("click", function (e) {
       toast("已删除 " + cutN + " 条消息", "success");
     });
   } else if (act === "delete") {
-    if (generating) { toast("生成进行中,请稍后再试", "warn"); return; }
+    if (genOn(conv && conv.id)) { toast("生成进行中,请稍后再试", "warn"); return; }
     var delIds = {};
     (ctx2.group || [msg]).forEach(function (m) { delIds[m.id] = 1; });
     conv.messages = conv.messages.filter(function (m) { return !delIds[m.id]; });
@@ -4914,7 +6170,7 @@ function openFilePreview(name, text, f) {
     meta.push("无法预览:" + f.failed);
   } else if (f.kind === "pdf") {
     meta.push("PDF · 共 " + (f.pages || 1) + " 页");
-    if (!f.wsPreview) meta.push(f.mode === "image" ? "图片模式(" + pdfDpi() + " DPI,已按图片发给模型)" : "纯文本模式(已抽取文字发给模型)");
+    if (!f.wsPreview) meta.push(attachModeLabel(f));
     if (f.pdfPages) meta.push("预览渲染前 " + f.pdfPages + " 页");
     /* 非视觉模型下的图文融合注记(含「N 图已本机 OCR」与预算/失败注记;视觉路径没有这个字段) */
     if (f.degraded) meta.push(f.degraded);
@@ -4922,7 +6178,7 @@ function openFilePreview(name, text, f) {
     meta.push("图片" + (f.dim ? " · " + f.dim : "") + " · " + fmtBytes(f.size || 0));
   } else if (f.kind === "office") {
     meta.push(officeBrief(f));
-    if (!f.wsPreview) meta.push(f.mode === "both" ? "文本 + 图片都会发给模型" : "只把文字发给模型");
+    if (!f.wsPreview) meta.push(attachModeLabel(f));
     if (f.degraded) meta.push(f.degraded);
     /* README 承诺过「跳过 N 张」:chip 上只显示收下的张数,被跳过(图表 / EMF / 超限)的数量在这里露出 */
     if (Number(f.skippedImgs) > 0) meta.push("跳过 " + num(Number(f.skippedImgs)) + " 张图(图表 / 不支持的格式或超限)");
@@ -5029,8 +6285,10 @@ function previewAttachmentPayload(meta, payload, depth) {
     else toast("这张图片的数据不在本机了", "warn", 3200);
     return;
   }
-  openFilePreview(meta.name, unwrapFileText((payload.texts && payload.texts[0]) || ""), {
+  openFilePreview(meta.name, unwrapFileText((payload.texts || []).join("\n\n")), {
     kind: meta.kind, size: meta.size, pages: meta.pages, mode: meta.mode,
+    /* P3-3:预览面也必须带上档位/图源 ⇒ attachModeLabel 的取词(页图/表格图/降级)不会退化 */
+    srcMode: meta.srcMode, renderSrc: meta.renderSrc,
     clipped: meta.clipped, images: imgs, ocr: !!meta.ocrOnly,
     subtype: meta.subtype, unit: meta.unit, imgCount: meta.imgCount,
     skippedImgs: meta.skippedImgs, textChars: meta.textChars, degraded: meta.degraded,
@@ -5708,7 +6966,7 @@ async function fetchCtxFromProps(silent, modelName) {
 async function fetchModels(showToast, silent) {
   var url = apiUrl("models");
   if (!url) { if (!silent) toast("请先填写 Base URL", "warn"); return; }
-  if (!silent) setConn("busy", "拉取模型中…");
+  if (!silent) setConnFor(null, "busy", "拉取模型中…");
   var to = timeoutSignal(12000);
   try {
     var res = await fetch(url, { headers: headersFor(false), signal: to.signal });
@@ -5754,13 +7012,13 @@ async function fetchModels(showToast, silent) {
     saveState(true);
     renderModelsInline();
     if ($("model-modal").classList.contains("open")) renderModelOptions($("model-search").value);
-    setConn("ok", "已连接");
+    setConnFor(null, "ok", "已连接");
     if (!silent) toast("已获取 " + list.length + " 个模型", "success");
     /* 列表没带上下文长度时,再问一次 /props(非 llama.cpp 服务会 404,静默忽略) */
     if (!ctxMetaFor(effectiveModel())) await fetchCtxFromProps(true);
     ensureModelVision(effectiveModel());   // 清单没写视觉能力时自动探一次
   } catch (e) {
-    setConn("err", "拉取模型失败");
+    setConnFor(null, "err", "拉取模型失败");
     if (showToast) toast("获取模型列表失败:" + friendlyError(e, url).split("\n")[0], "error", 4200);
   } finally {
     to.abort();
@@ -5775,7 +7033,7 @@ async function testConnection() {
   var box = $("test-result");
   box.className = "note show";
   box.textContent = "正在测试连接…";
-  setConn("busy", "测试中…");
+  setConnFor(null, "busy", "测试中…");
   var url = state.settings.protocol === "openai" ? apiUrl("models") : apiUrl("messages");
   var t0 = Date.now();
   var to = timeoutSignal(20000);
@@ -5807,11 +7065,11 @@ async function testConnection() {
     }
     box.className = "note show ok";
     box.textContent = detail;
-    setConn("ok", "已连接");
+    setConnFor(null, "ok", "已连接");
   } catch (e) {
     box.className = "note show err";
     box.textContent = "❌ " + friendlyError(e, url);
-    setConn("err", "连接失败");
+    setConnFor(null, "err", "连接失败");
   } finally {
     to.abort();
   }
@@ -6360,7 +7618,9 @@ function pdfEngineLine() {
   return "· PDF 引擎:pdf.js " + (d.version || K.version || "?") + " · " + modeTxt
     + " · 取文本:" + (d.textStrategy || "?") + " · 流迭代:" + iterTxt
     + " · 取图:" + (d.regionRender ? "可用" : "不可用")
-    + " · 图文融合:" + fuseStateText();
+    + " · 图文融合:" + fuseStateText()
+    + " · 附件图片策略:" + (attachImgMode() === 'text' ? '纯文本' : (attachImgMode() === 'image' ? '图片' : '混合'))
+    + " · 文档渲染器:" + (docxRenderReady() ? ("docx-preview " + window.RenderKit.libs.docxPreview) : "未内嵌");
 }
 /* 「图文融合」当前是否真的会启用(见上;取图能力/OCR 引擎/模型视觉能力三个条件)。
    视觉能力**三态**:true / false / null(= auto 且还没有该模型的探测记录,能力未知)——
@@ -6375,7 +7635,7 @@ function fuseStateText() {
     return ocrReady() ? "已启用(当前模型不支持图像输入)" : "不可用(本机 OCR 引擎不可用)";
   }
   if (v.vision === true) return "未启用(当前模型支持图像输入)";
-  return "未启用(图像能力未知,还没探测到该模型;可在 设置 → 模型 把该模型的图像能力设为「不支持」后启用 OCR 融合)";
+  return "未启用(图像能力未知,还没探测到该模型 ⇒ 一律按「可发图」处理;可在 设置 → 模型 把该模型的图像能力设为「不支持」后启用 OCR 融合)";
 }
 /* 仅提示、不拦的环境备注(PDFKit.notes;正常宿主为空数组) */
 function pdfEngineNotes() {
@@ -7039,6 +8299,9 @@ function wipeAllNow(n, wss) {
     markConvsGone(prevIds);
     convRevState.wiped = Date.now();
     conv = null;
+    stopAllGen("已清空全部数据");     /* 页面级硬收尾:所有在飞生成当场中止(记录随 genDrop 落) */
+    SQ = {}; GEN_TOASTED = {};       /* 会话全清 ⇒ 待发送槽与提示去重表一并清零 */
+    connStatsPurge();                /* alive 集为空 ⇒ CONN / LASTSTATS 全清 */
     if (typeof pvAutoLoopPurge === "function") pvAutoLoopPurge();   /* 会话全清 ⇒ 自动续跑计数也清 */
     /* 压缩账本与待应用的压缩一并作废:会话都不存在了,留着的条目只会是幽灵 */
     for (var cxk in CX_LEDGER) {
@@ -7147,9 +8410,10 @@ function setModelCtx(model, ctx, src) {
   state.settings.modelCtx[model] = { ctx: Math.round(Number(ctx)), src: src || "server", at: Date.now() };
   return true;
 }
-/* 一次请求结束后,用服务端真实 usage 记录上下文水位 */
-function recordUsage(model, prompt, completion, cached, msgId) {
-  var u = ctxUsageOf(conv);
+/* 一次请求结束后,用服务端真实 usage 记录上下文水位。
+   convId = **该轮请求的归属会话**(显式首参):读模块级 conv 会把读数记进"当前视图"(缺陷 B) */
+function recordUsage(convId, model, prompt, completion, cached, msgId) {
+  var u = ctxUsageOf(convId ? getConv(convId) : conv);
   if (!u) return;
   if (prompt == null) return;
   u.prompt = Math.round(Number(prompt) || 0);
@@ -7459,10 +8723,11 @@ function paletteActions() {
     out.push({ group: group, name: name, desc: desc, icon: iconName, key: key, fn: fn, kw: kw || "" });
   }
   add("会话", "新建对话", "开一条新对话", "plus", "Ctrl N", function () { newConversationUI(); });
-  add("内容", generating ? "停止生成" : "发送当前输入",
-    generating ? "中止本轮生成与工具等待" : "把输入框内容发给模型",
-    generating ? "stop" : "send", generating ? "Ctrl X" : "Enter",
-    function () { if (generating) stopGenerating(); else doSend(); });
+  var gCur = genCur();      /* 面板描述的是**当前视图**的会话(不再描述"全局在飞的那条") */
+  add("内容", gCur ? "停止生成" : "发送当前输入",
+    gCur ? "中止本轮生成与工具等待" : "把输入框内容发给模型",
+    gCur ? "stop" : "send", gCur ? "Ctrl X" : "Enter",
+    function () { if (genCur()) stopGenerating(); else doSend(); });
   add("内容", "复制最后一条回答", "复制到剪贴板", "copy", "Ctrl Alt C", function () {
     var last = lastAssistantMsg();
     if (!last) { toast("还没有 AI 回答", "warn"); return; }
@@ -7818,8 +9083,10 @@ function slashMove(dir) {
 function slashBusy(name) {
   var c = slashCommand(name);
   if (!c || !c.idle) return null;
-  if (generating) return "正在生成中,请先按 Ctrl+X 停止再执行 /" + c.name;
-  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle") return "正在压缩中,请稍候";
+  /* 命令作用于**当前会话**:别的会话在生成 / 压缩与它无关(压缩的单实例保护只落在压缩目标那条上) */
+  var cid = conv && conv.id;
+  if (genOn(cid)) return "正在生成中,请先按 Ctrl+X 停止再执行 /" + c.name;
+  if (typeof CX_RUN !== "undefined" && CX_RUN && CX_RUN.phase !== "idle" && CX_RUN.convId === cid) return "正在压缩中,请稍候";
   return null;
 }
 /* 执行命令:命令不落消息 —— 先清掉输入框(带附件时附件保留并提示,命令不接附件),
@@ -8373,8 +9640,8 @@ function bindUI() {
     }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
       e.preventDefault();
-      if (generating) { sqEnqueueFromInput(); return; }          /* 本批:生成中进缓冲 */
-      if (!elInput.value.trim() && !draftFiles.length && sqSendableIdle()) { sqSendHead(); return; }
+      if (genCur()) { sqEnqueueFromInput(); return; }             /* 当前会话生成中 → 进它自己的缓冲 */
+      if (!elInput.value.trim() && !draftFiles.length && sqSendableIdle()) { sqSendHead(conv && conv.id); return; }
       doSend();
     }
     /* ↑ 召回最后一条(严格:输入框完全为空 + 无修饰键 + 非组合 + 斜杠浮窗未开时才有意义;
@@ -8382,11 +9649,12 @@ function bindUI() {
     if (e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing
         && elInput.value.length === 0 && sqHasFor(conv && conv.id)) {
       e.preventDefault();
-      sqRecall(SQ.items[SQ.items.length - 1].id);
+      var sqArr = SQ[conv.id].items;              /* 多槽:召回**当前会话槽**的最后一条 */
+      sqRecall(sqArr[sqArr.length - 1].id);
       return;
     }
   });
-  elSend.addEventListener("click", function () { if (generating) stopGenerating(); else doSend(); });
+  elSend.addEventListener("click", function () { if (genCur()) stopGenerating(); else doSend(); });
   $("btn-attach").addEventListener("click", function () { $("attach-file").click(); });
   $("attach-file").addEventListener("change", function (e) {
     addFiles(e.target.files);
@@ -8726,7 +9994,7 @@ function bindUI() {
     syncSidebarBackdrop();
   });
   window.addEventListener("beforeunload", function (e) {
-    if (!generating && !sqHasItems()) return;     /* 缓冲残留时同样给留页提示 */
+    if (!genAny() && !sqAnyItems()) return;       /* 任一会话在生成 / 任一会话有缓冲 ⇒ 都给留页提示 */
     e.preventDefault();
     e.returnValue = "";
   });
@@ -8759,11 +10027,11 @@ function onKeyDown(e) {
        它只按「关浮层 → 关弹层 → 丢弃待发送缓冲」做事(用户 2026-09-15 指令) */
     if (mod) {
       e.preventDefault();          /* 拦掉浏览器对 Esc 的默认行为(如停止页面加载);中断是纯应用层动作 */
-      if (generating) { stopGenerating(); return; }
-      /* 手动压缩(generating=false)期间的中断:中止压缩运行(请求与退避 sleep 都会断)。
-         **不**调 stopGenerating —— 它会 denyAllToolWaits / killAllSandboxes / pvSuppressAutoLoop,
+      if (genCur()) { stopGenerating(); return; }
+      /* 手动压缩(该会话空闲但压缩在跑)期间的中断:中止**当前会话**的压缩运行(请求与退避 sleep 都会断)。
+         **不**调 stopGenerating —— 它会 denyToolWaitsOf / killSandboxesOf / pvSuppressAutoLoop,
          对手动取消过重且误伤(cxCompactNow 的 finally 会把状态行恢复为「已连接」) */
-      if (typeof cxRunActive === "function" && cxRunActive()) { cxAbortActive("用户取消压缩"); return; }
+      if (typeof cxRunActive === "function" && cxRunActive() && conv) { cxAbortActiveOf(conv.id, "用户取消压缩"); return; }
       return;
     }
     if (nselOpenId) { closeNsel(); return; }
@@ -8796,7 +10064,7 @@ function onKeyDown(e) {
     /* 普通 Esc 的最后一步:丢弃待发送缓冲(不再停止生成 —— 中断已改为 Ctrl+X)。
        判据用可见性/归属(I6,同 sqRender 的 show):缓冲属于别的会话时浮窗不可见,
        别丢用户看不见的东西;缓冲为空则不再有其它动作 */
-    if (sqHasFor(conv && conv.id)) { sqDiscardAll(); toast("已丢弃待发送内容", "info", 2400); return; }
+    if (sqHasFor(conv && conv.id)) { sqDiscardAllOf(conv && conv.id); toast("已丢弃待发送内容", "info", 2400); return; }
     return;
   }
   /* 命令面板开着时再按 Ctrl+K = 收起:谓词收紧到「面板是唯一打开的弹层」,与设置/确认弹窗
@@ -8811,8 +10079,9 @@ function onKeyDown(e) {
      才把它当快捷键用。放在「弹窗独占快捷键」早退门之前:弹窗开着时也要能中断 */
   if (key === "x" && mod && !e.altKey && !e.shiftKey && !hasNonEmptySelection()) {
     e.preventDefault();
-    if (generating) { stopGenerating(); return; }
-    if (typeof cxRunActive === "function" && cxRunActive()) { cxAbortActive("用户取消压缩"); return; }
+    if (genCur()) { stopGenerating(); return; }        /* 只停**当前查看的会话**(G5;其它会话不受影响) */
+    /* 当前会话不在生成、但它的压缩在跑:按会话中止(停 B 不得中止 A 的压缩) */
+    if (typeof cxRunActive === "function" && cxRunActive() && conv) { cxAbortActiveOf(conv.id, "用户取消压缩"); return; }
     return;
   }
   /* 有弹窗(任何 .modal-mask.open,含动态确认弹窗 #ask-modal-dyn)开着时,其余全局快捷键
@@ -8919,9 +10188,11 @@ function finishStorageSync() {
   rebuildModelDatalist();
   renderChat(); renderConvList(); updateTopbar();
   updateCtxMeter(); updateStorageMeter();
+  connStatsPurge();          /* 整库替换可能带走会话:CONN / LASTSTATS / 提示去重表按 alive 集收敛 */
+  updateSendButton();        /* 当前会话换了(或没了):按钮状态跟着派生 */
   /* 「调节」浮层也随对侧改动回填:浮层开着时覆盖选择/计数就地更新,不必关掉重开 */
   syncParamTools();
-  setConn(state.settings.baseUrl ? "ok" : "err", state.settings.baseUrl ? "已就绪" : "未配置地址");
+  setConnFor(null, state.settings.baseUrl ? "ok" : "err", state.settings.baseUrl ? "已就绪" : "未配置地址");
   toast("已同步其他标签页的数据变更", "info", 2000);
 }
 

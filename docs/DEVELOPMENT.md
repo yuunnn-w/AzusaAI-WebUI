@@ -21,6 +21,7 @@ katex.min.js    ├─────────────────┘       
 pdfjs.part      │   (按固定顺序拼装,统一 LF 归一)
 tesseract.part  │
 office.part     │
+render.part     │
 pyodide*.part   │
 jupyterlite.part│
 appA–appE.part ─┘  (appJ.part 插在 appD 与 appE 之间)
@@ -35,6 +36,7 @@ head.part        先替换 /*__KATEX_CSS__*/ 占位符为 src/katex-embedded.css
 + pdfjs.part     缺文件 → 控制台警告，PDF 功能自动降级
 + tesseract.part 缺文件 → 同上，OCR 自动降级
 + office.part    缺文件 → 同上，办公附件自动降级
++ render.part    缺文件 → 同上，docx 图片档自动降级（window.RenderKit 缺失 ⇒ 能力表 false）
 + pyodide 载荷   按档取 src/pyodide.part（full）或 src/pyodide-{normal,minimal}.part；
                  显式档位缺载荷即 exit 1；默认档缺载荷时整族 Python 工具降级
 + jupyterlite.part  缺文件 → 打印警告并注入 JL_AVAILABLE=false 的极小占位段（不 exit 1），Jupyter 标签页不可用
@@ -72,9 +74,9 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 | 档位 | 预置包 | 产物体积（实测） | 载荷来源 |
 | --- | --- | --- | --- |
-| `full`（默认） | 151 个 wheel | **227,449,375 B**（2026-09-18 取件时刻；终编以构建打印值为准） | `src/pyodide.part`（入库） |
-| `normal` | 99 个 wheel | **155,400,621 B**（同上口径） | `src/pyodide-normal.part`（本地生成） |
-| `minimal` | 33 个 wheel | **73,903,686 B**（同上口径） | `src/pyodide-minimal.part`（本地生成） |
+| `full`（默认） | 151 个 wheel | **228,036,277 B**（2026-09-19 终编现取，md5 `9700988b…`） | `src/pyodide.part`（入库） |
+| `normal` | 99 个 wheel | **155,987,523 B**（同上口径，md5 `f5794ebc…`） | `src/pyodide-normal.part`（本地生成） |
+| `minimal` | 33 个 wheel | **74,490,588 B**（同上口径，md5 `de0143ff…`） | `src/pyodide-minimal.part`（本地生成） |
 
 档位名单 / 分组 / 落盘路径 / 体积对账值的**唯一权威** = `scripts/pyodide-profiles.json`；生成期与构建期断言（C1–C9）保证「名单不许漂移、轻档不缺依赖、被裁包的理由不许撒谎」，未知档位直接 `exit 1`。轻档载荷里带一段 `pyodide-profile.json`，运行时据此显示真实档位与包数（缺段 = 完整版）。
 
@@ -99,9 +101,9 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - 键名 `localStorage["chatgpt-webui-v1"]`；`schema: 4` 控制一次性迁移（`mergeSettings`）。
 - 只存 `settings` + `activeId` + `promptLib` + `fetchedModels`；会话本体在 IndexedDB。
 - 特殊值约定：`temperature` / `topP` 为 `-1` 表示「不发送」（滑块拉到最左）；`reasoningEffort: ""` 表示不发送；`maxTokens: 0` 表示不发送（Anthropic 协议必须带 `max_tokens`，未设置按 256K 发送）。
-- `mergeSettings` 的迁移动作（只执行一次）：旧强调色名 → 马卡龙色名、旧硬编码采样参数 → 不发送、`codeWrap` 默认改真；历史版本还做过 `delete ctxBudget`（按 token 截断历史整体移除，只留「最多携带条数」`ctxMsgs`）、删除旧的「对外暴露工具服务」配置、`toolLimits` 改新默认、`run_js` → `ExecuteJavaScript` 的权限键搬迁等。
+- `mergeSettings` 的迁移动作（只执行一次）：旧强调色名 → 马卡龙色名、旧硬编码采样参数 → 不发送、`codeWrap` 默认改真；历史版本还做过 `delete ctxBudget`（按 token 截断历史整体移除，只留「最多携带条数」`ctxMsgs`）、删除旧的「对外暴露工具服务」配置、`toolLimits` 改新默认、`run_js` → `ExecuteJavaScript` 的权限键搬迁等；**0.2.1 起**多了一条条件式迁移 —— `pdfMode` → `attachImgMode`（三档附件图片策略）：显式 `"image"` ⇒ `"image"`、其余（含旧 `"text"` / 缺键 / 非法值）⇒ `"both"`，**旧键不删**（单向兼容：老用户盘上的 `pdfMode` 原样保留，旧版本回退仍能读到；新版本只写新键）。
 - **Base URL 不做自动迁移**：旧默认曾是内网地址，现不保留其字面量（`DEFAULT_BASE` = 本机回环 `http://127.0.0.1:8080/v1`）；任何已存值（老默认、自定义值）都原样保留，只有「缺 `baseUrl` 字段」的设置才会被合并上默认值。
-- `schema` 未升但后来新增的字段（`pdfMode` / `pdfDpi` / `pdfMaxPages` / `ocrLangs` / `visionForce` / `modelVision` / `pyTaskTimeoutMs` / `pyTaskStopKills` 等）都有默认值，旧库不需要额外动作。
+- `schema` 未升但后来新增的字段（`attachImgMode` / `pdfDpi` / `pdfMaxPages` / `ocrLangs` / `visionForce` / `modelVision` / `pyTaskTimeoutMs` / `genMax` 等）都有默认值，旧库不需要额外动作；`attachImgMode` 是唯一例外 —— 它有一条条件式迁移（见上一条），旧 `pdfMode` 只作读入来源、新版本不再写出。**0.2.1 起** `pyTaskStopKills` 被显式丢弃（D-5 裁决作废该设置项：`delete out.pyTaskStopKills`，旧库载入 / 导入备份都不复活，幂等）。
 - 迁移完成后写入当前 `schema`，之后用户手动修改不会被改回。
 
 ### 2.2 IndexedDB（会话与附件，v3 五个存储区）
@@ -123,12 +125,15 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 | highlight.js | 11.9.0 | 代码高亮 | `src/libs.part` |
 | KaTeX | 0.16.11 | 数学公式（20 个 woff2 字体 base64 内联） | `src/katex.min.js` + `src/katex-embedded.css` |
 | pdf.js（pdfjs-dist legacy） | 6.3.289 | PDF 文字抽取 + 页面渲染（已修 CVE-2024-4367） | `src/pdfjs.part` ≈ 1.80 MiB（1,882,880 B，2026-09-18 现取） |
-| Tesseract.js（+ core） | 7.0.0 | 图片 OCR（eng + chi_sim，tessdata_fast） | `src/tesseract.part` ≈ 6.37 MB |
+| Tesseract.js（+ core） | 7.0.0 | 图片 OCR（eng + chi_sim，tessdata_fast） | `src/tesseract.part` ≈ 6.37 MiB |
 | mammoth | 1.12.3 | docx 文字 + 正文图片 | `src/office.part` |
 | SheetJS CE | 0.20.3 | xlsx / xls → CSV | `src/office.part` |
 | @jose.espana/docstream | 0.1.3 | pptx / doc / ppt 文字 + 图像 | `src/office.part` |
-| fflate | 0.8.3 | ZIP 结构预扫描（ZIP 炸弹防线） | `src/office.part` ≈ 3.08 MiB 合计（3,225,317 B，2026-09-18 现取） |
-| pyodide（+ CPython 3.14.2 标准库） | 314.0.6 | Python 运行时 | `src/pyodide.part` ≈ 186.7 MB |
+| fflate | 0.8.3 | ZIP 结构预扫描（ZIP 炸弹防线） | `src/office.part` ≈ 3.27 MiB 合计（**3,428,845 B** = 7 块合计 / **3,429,087 B** = 文件字节，2026-09-19 现取） |
+| docx-preview | 0.4.0 | docx 逐页渲染成页图（图片档） | `src/render.part` |
+| jszip | 3.10.2 | docx-preview 的 ZIP 依赖（采 MIT 支） | `src/render.part` |
+| modern-screenshot | 4.7.0 | DOM → canvas 光栅化（页图） | `src/render.part` ≈ 203,364 B 合计（2026-09-19 现取） |
+| pyodide（+ CPython 3.14.2 标准库） | 314.0.6 | Python 运行时 | `src/pyodide.part` ≈ 186.7 MiB |
 | JupyterLite（jupyterlite-core + lab 站点） | 0.8.3 | JupyterLab 站点（独立标签页、工作区为根） | `src/jupyterlite.part` ≈ 16.3 MiB（17,099,161 B，2026-09-18 现取） |
 | JupyterLab（含 lumino / CodeMirror 等运行期依赖） | 4.6.3 | lab 站点构建 | 同上 |
 | jupyterlite-pyodide-kernel | 0.8.6 | Jupyter 内核（复用 `src/pyodide.part` 的核心集，不重复打包） | 同上 |
@@ -262,7 +267,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **弹出 async 函数别忘 `await`**：测试助手改成 async 后漏了 `await`，断言拿到 Promise 直接变成 `{}`，看起来像断言失败。改造助手时一起检查调用点。
 - **写含反斜杠的 JS 字符串要用文件工具**：批量替换脚本经过多层工具会吃掉一层反斜杠，把脚本写坏。要么用文件写入工具直接落盘，要么别在字符串里写反斜杠。
 - **非视觉模型的「图文按序融合」有三条不能破的线**：① `o.ocr`（「没有文本层才 OCR」）的语义**不得扩展**——ReadOffice 侧用独立标志 `o.fuseImgs`，入口条件唯一 = 非视觉 **且** 有候选图；② 视觉路径一字不变（不探页图、不做 OCR）；③ 无图 / 纯文本文档的输出逐字节不变（融合入口一律在「有图」判定之后）。三批改动都靠负例断言守着（请求体既不含「本机 OCR」也不含夹具暗号）。
-- **附件侧 PDF 的融合条件是「非视觉**且有图**」，不是「文本为空」**：`PDFKit.extractText` 对任何 ≥1 页 PDF 都会写页分隔标记（`----- 第 N 页 -----`）⇒ `text.trim()` 永不为空，「有没有文字层」必须用 `realText`（剥掉页分隔标记）判定。ReadOffice 侧早已按 `realText` 修过；附件侧本轮**只加融合、没顺带重构**那条分支——它对 ≥1 页 PDF 本就不可达（批前实测：`scan.pdf` 交付的正文只有 `----- 第 1 页 -----`，**不是**拒收），扫描件于是由融合兜住：页图 OCR 进正文。
+- **附件侧 PDF 的融合条件是「非视觉**且有图**」，不是「文本为空」**：`PDFKit.extractText` 对任何 ≥1 页 PDF 都会写页分隔标记（`----- 第 N 页 -----`）⇒ `text.trim()` 永不为空，「有没有文字层」必须用 `realText`（剥掉页分隔标记）判定。ReadOffice 侧早已按 `realText` 修过；附件侧本轮**只加融合、没顺带重构**那条分支——它对 ≥1 页 PDF 本就不可达（批前实测：`scan.pdf` 交付的正文只有 `----- 第 1 页 -----`，**不是**拒收），扫描件于是由融合兜住：页图 OCR 进正文。**0.2.1 起再加一条档位前提**：显式选「纯文本」档时**不做融合**（只发文字）；混合档与「无文字层自动升档」才融合 —— 口径见上「附件三档与图片策略（0.2.1 起）」。
 - **图片从「丢弃」改成「OCR 融合」时三处必须同步**：`att.text`（融合后正文）、`att.textChars`（chip 的「文本 N 字」）、`att.ocrImgs`（新计数；旧数据无此键 = 0，不做迁移）。`imgCount` 保持原义（作为图片发出去的张数）——非视觉下融合的图不进 `att.images`，所以它仍是 0；把融合的图算进 `skippedImgs` 同样错（`skippedImgs` 只数解析层跳过的不支持格式 / 超限图）。
 - **附件侧 OCR 的时长预算是「整次解析共享」，而且只覆盖 OCR 阶段**：`ATT_OCR_TIMEOUT_MS`(60s) 不是每图预算，达到张数 / 时长 / 字符任一预算**立即停**并如实注记（与 Read 侧 `READ_OCR_TIMEOUT_MS` 同口径）；它**不是整条解析链的墙钟上限** —— 取图调用 `pageImages` / `renderCrops` / `renderPages` 各另带一次 60 s 超时（同一常量），取图极慢时整条解析会超过 60 s。`OCRKit.recognize` 单次调用不可中断（只能 `terminate`）⇒ 中止 / 超时的生效点只在两张之间。
 - **CORS 的失败在页面侧一律同形**：预检（OPTIONS）被拒、实际响应缺 `Access-Control-Allow-Origin`、网络不可达，浏览器都只给一条 `TypeError: Failed to fetch` —— 只报「无法连接到服务器」等于让用户猜。要分三层报：① 四条探针（`corsProbe()`：简单 GET / 带应用头 GET / 简单 POST / 真实 POST）只判「浏览器读不读得到响应」（4xx/5xx 也算读到），再用一条 `mode:"no-cors"` 辅助探针把「读不到」分成断网与跨域拦截；② 族文案（`CORS_FAMILY_TEXT`：预检被拒 / 实际响应无 ACAO / 网络不可达 / 服务端不解析 `text/plain` / 服务端未在超时内回话）按族给可执行下一步（这份文案有三条消费路径 —— 诊断面板的结论行、开关**被拒时**的红字 note、开关**开启成功**时的绿字 note（`setCorsBypass` 成功分支）；`friendlyError` / `connectHint` 的族参数分支在产线不可达，见代码注释）；③ 探针只能推出「哪一层被拦」，分不出 OPTIONS 是 500 还是 200-但缺 `Allow-*` 头（两者同形）⇒ 文案不写死单一诊断，细节让用户看 DevTools 的 OPTIONS 状态码。
@@ -270,7 +275,25 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **「预检规避兼容模式」只能救一种病**（设置 → 模型 → 高级(兼容性)，默认关、带前置探针）：它把请求改成「简单请求」（`Content-Type: text/plain;charset=UTF-8` + 不带任何自定义头）⇒ 浏览器不发 OPTIONS。**三条死路线写在界面上**：① 有自定义头（`Authorization` / `x-api-key` / `anthropic-version` / `application/json`）就必预检；② 服务端实际响应没有 ACAO 时，简单请求同样被拦；③ Anthropic 协议必带 `anthropic-version` 等头 ⇒ 一律禁用。门控 = **协议 × 是否有 Key 双条件**（`corsBypassGate()`），开启前跑四探针、只有「简单 POST 能读到响应」才允许打开（`setCorsBypass()`），否则拒绝并给族文案；开关关闭时请求头 / 体**逐字节不变**（`headersFor()` 首行短路）。
 - **外部 MCP 的请求自建头、不走 `headersFor()`**：`mcpPost()`（`src/appE.part`）自己拼 `Content-Type: application/json` + `Accept` +（有则）`Authorization` / `Mcp-Session-Id` / `MCP-Protocol-Version` ⇒ 它恒是非简单请求、必过 OPTIONS 预检 —— 因此**既不被「预检规避兼容模式」覆盖，也不受它保护**（开不开该模式，这一路都一样）。外部 MCP 服务器要么自己放行预检（补齐 `Access-Control-Allow-*`），要么走同源反向代理。
 
-### `file://` 与浏览器环境
+### 附件三档与图片策略（0.2.1 起）
+
+- **三档 = 单键三值**：`attachImgMode ∈ {text,image,both}`、默认 `both`（混合）；读取入口 `attachImgMode()`（缺键 / 非法 ⇒ `both`）。旧 `pdfMode` **单向迁移**（显式 `"image"` ⇒ `image`，其余含旧 `"text"` / 缺键 / 非法 ⇒ `both`；旧键不删）。判定唯一来源 = `decideAttachPlan`（纯函数、FIRST-MATCH，`appD`），渲染能力表 = `attachRenderCap`（`pdf:"pages"` / `xlsx|xls:"drawn"` / `docx`：`ATT_DOCX_RENDER_READY`（唯一开关，S7 起 = `true`）∧ `docxRenderReady()`（`window.RenderKit.available`，render.part 在位）/ 其余 `false`）—— **别处不许重推档位语义**；五处展示面（chip / 气泡卡片 / 预览 meta / 办公预览 / 请求体信息行）共用 `attachModeLabel` 取词。
+- **硬不变量：图不进消息 ⇒ `send` 只能是 `text`**（`images==="ocr"` ⇒ `send==="text"`）。自动升档 / 改档（无文字层升混合、图片档 + 非视觉改混合）**不新增选项、不改写用户设置**；降级必须可见（一次性 toast + `degraded` 注记），且**对外不暴露内部档位**（请求体不含 `attach` 元数据 —— 发送前整块剥掉，已断言）。
+- **附件图片上限 `ATT_IMG_MAX_IMAGES`(10) 是取图计划与 OCR 融合的同一上限**（批前 `ATT_OCR_MAX_IMAGES`(6) 已并入，旧名**源码全库**归零 —— 别再引用旧名）；PDF 侧三处取图调用点统一传 `attPdfOpts()`（`{maxScan: pdfMaxPages(), maxImages: ATT_IMG_MAX_IMAGES}`），自绘图张数上限同源（`maxSheets`）。
+- **交错件的 `attach.blob` 键必须与 `externalizeFiles` 同源（数组下标：`id + "-p" + (下标 + 1)`）**，而 `page` 保留**真页号 / 表序号** —— 两者不是一回事。用「下标数组去找对象」会恒 `-1` ⇒ 键退化成 `-p0` ⇒ 发送期 `blobMemo` 未命中 ⇒ 请求体落「图片数据不在本机」占位（批-2 的真实缺陷）；查找一律走 `attImgIndexOf`（找不到返回 -1 ⇒ 该图退化为内联 data，绝不写无效键）。
+- **请求体信息行只在 `f.ocrImgs || f.degraded` 时追加模式词**（`attachmentParts`）—— 默认路径的信息行逐字节不变，别改成恒显。
+- **自绘表格图（xlsx / xls 图片档，D12）的交付闸门**：每张过 `attCanvasFitForModel` —— 按 `imgMaxSide()` 下采样 + 单张 `READ_IMG_HARD_MAX`(1 MiB) 硬顶，**可读性优先**（先降质量后降边长；压不进硬顶的那张只跳过该表 + 注记，绝不发半张坏图）；生产参数含 `scale: 2`。
+- **docx 页图（图片档，S7 起）的三条硬约束**：① **资源守卫必须 wrap 三方法**（`loadDocumentImage` / `loadNumberingImage` / `loadFont`）—— 缺失部件时 docx-preview 拿到 `null`，而 `null` 在被赋给 `img.src` / 拼进 CSS `url()` 的**瞬间**就发起加载尝试（晚挂载 / 拆 parse+render / 事后属性守卫都拦不住）⇒ 只有"换掉那个值"能阻断；**少包一个 ⇒ 非主文档请求 ≠ 0**（批内实测：漏 `loadFont` ⇒ 2 次）；② **`OPTIONS` 必须钉 `renderAltChunks:false`**（altChunk 的 `<iframe srcdoc>` 会真发请求）与 `useBase64URL:true`（全链 `data:`，免 `blob:` 路径）；③ **挂载必须双容器**（`host` + `styleHost` 两个 `div` 都 `appendChild`）—— `<style>` 未挂 ⇒ `<style>` 不生效 ⇒ 页盒 794×1123 变 1034×1315、页图全变。另：渲染失败的两支回退注记必须落在 **O6 块之后的共同出口**（cap=`pages` 时内嵌图在 O6 复查**之前**就已落进 `images` ⇒ `!images.length` 恒假 ⇒ O6 块不进，注记依赖 O6 会静默 —— 批内实测出来的缺陷）。
+- **docx 页图的清洗层是"两层 + 两个计数"**（防御纵深，`cleanNodes`）：**属性面**（`src`/`srcset`/`poster`/`data`/`xlink:href` + 非 `<a>/<area>` 的 `href` 中和；`<a href>` 豁免 = 超链接不发起请求）与**样式文本面**（`<style>` 里的 `url(http(s)://…)` → `url(about:blocked#)`）。两类计数随结果返回（`res.clean = {attr, styleUrl}`），**正常输入下应为 0，非 0 必须进 `notes`**。**该面当前不可由真实 docx 触达**（三库的 CSS `url()` 发射点只有 `@font-face` 与 numbering 变量两处，均已被 wrap 在值级截住）⇒ 实测靠**合成节点实验**：往渲染树塞一条会命中的 `<style>url(http…)` 规则 —— 不中和 ⇒ 请求真的发起（nonDoc=1）；中和 ⇒ 0 请求 + `clean.styleUrl=1`（修正轮 `styleurl`/`styleurln` 两变体）。两条同族健壮性约束：**超时路径的宿主清理由 `work.then(cleanup, cleanup)` 兜底**（超时先于挂载时 race 侧 cleanup 是空刀，work 之后仍会 appendChild ⇒ 必须在自己结算处再清一次；cleanup 幂等）；**逐页处理的 `attCanvasFitForModel`/取样段也必须包在单页 try/catch 内**（同步抛 ⇒ 只跳该页 + 注记，不冒泡成整轮失败）。
+
+### 办公文档写路径（xlsx / xls / docx / pptx，0.2.1 起）
+
+- **手写 sheet XML 的两处机械量 = `r` 属性位移 + `<dimension>` 更新**（`insert_rows` / `delete_rows` 的由来）：单元格与行的地址写在 `<c r="B4">` / `<row r="4">` 的 `r` 属性上，改结构要**逐元素**位移（只改 `<row>` 不改 `<c>` 就是"值搬家一半"）；行属性（`ht` / `customHeight` / `s` / `spans`）随元素一起走。`<dimension ref>` 的口径：**insert 只扩不缩**（与原 ref 取并集）、**delete 允许收缩**、整表无格时落 `"A1"`。判据必须打到原始 XML —— 值级回读对"漏改 `<c@r>`"和"忘改 dimension"都可能是绿的。**同族教训：表序号也是 index** —— `localSheetId` / `activeTab` 是"第几张表"，`move_sheet` 不按同一置换重映射就会把命名区域**静默挂到别的表**。
+- **办公产物不能拿整包 md5 当可复现判据**：`fflate.zipSync` 未指定 `mtime` 时用当前时间写 DOS 时间戳（实测同一输入两次为 `3f0a` / `3f0b`），`docProps/core.xml` 还带**秒级**时间戳 ⇒ "同输入同输出"类断言会假红（W-docx / W-pptx 的 R1 / R5 各实测过一次跨秒假红）。统一口径 = **逐条目内容比较**（解包后逐条 md5 / sha256；"预期被改部件集"**每用例运行期现算**，不写死），严格逐字节仍是主判据，只在严格不等时给"仅 `core.xml` 时间戳不同（其余 N−1 件逐字节相同）"的**等价分支**，并配**双向自检**（只改 1 秒 ⇒ 等价接受；给任一部件加一段注释 ⇒ 等价拒绝），防等价分支恒真。
+- **pptx 的两套号源（P1-1）：读侧页码 ≠ 写侧索引**：`ReadOffice` 的 `----- 第 N 页 -----` 号 = `slideN.xml` 的**文件名序号**（docstream 显式按 `slide(\d+)` 文件名排序），`Office` 的 `slide_index` = 幻灯在 `p:sldIdLst` 里的**位次**。实测形态：**删第 2 张后读侧跳号 `1 / 3 / 4`**；**`add_slide@k` 的新页文件名号最大（读侧落在最末）**；`move_slide` 只重排 `p:sldIdLst` ⇒ 读侧顺序不变。⇒ 写坐标一律以 `outline` 的 `i` 为准（`items[i].part` 提供「读侧页码 ↔ `i` ↔ 实际部件」三向对齐）；"按页码 − 1 当索引"在 delete 与 add_slide 两臂都必错（T-W3 的负例实测咬住）。改读侧编号属判据变更，不在本批。
+- **`set_paragraph` 的两条硬约束**：① docx 侧**必须保住 `w:pPr`**（标题级别 / 编号 / 对齐都在这里），且判据要打到物理面（`w:pPr` 首子元素 + `pStyle` 值）—— 只看"文本被换了"抓不住（丢 `pPr` 的负例里文本类断言仍是绿，红的是"`pPr` 保留面"那 5 条）；清旧 `w:r` 前先取**静态快照**（`getElementsByTagNameNS` 是活动 NodeList，边删边遍历会漏）。② pptx 侧新 run 必须插在 `a:endParaRPr` **之前**：CT_TextParagraph 的次序是 `a:pPr?, EG_TextRun*, a:endParaRPr?`，空段直接 `appendChild` 会产出 `[pPr, endParaRPr, r]` 这种**违 CT 次序**的产物（真 PowerPoint 严格；本机 PowerPoint COM 不可用 ⇒ 由次序判据 + 单点负例守着）。
+- **上层"新造 spec"会静默漏掉写侧字段**：xlsx 的 `number_format` 就这样丢过一回 —— 接线层只把 `{sheet: …}` 传给写入内核 ⇒ 显式格式**不报错、不生效**（值级回读天然看不见）。修法 = 让上层把调用方 spec **原样带上**再只覆盖目标表（`xlsxSpecWithSheet` 一类收口），凡"内核字段被上层漏掉"都用这条根治。
+
 
 - **`file://` 下不是所有 blob 手段都能用**：`new Worker(blob:…)` 能构造成功，但 worker 里 `importScripts(blob:)` 与 `fetch(blob:)` 都会被拒（`eval` / `new Function` 反而可用）。两个内嵌库都按这个约束选了各自的加载路径（见 `docs/PDFJS-NOTES.md` / `docs/TESS-NOTES.md`），改库版本前先读它们。
 - **Tesseract 的 `cacheMethod:'none'` 必须开**：它跑在 blob worker 里，而 `file://` 下 worker 内 IndexedDB 的 open 请求不触发任何事件，默认的「读缓存」会永久挂住。注意区分：`file://` 的**主文档**里 IndexedDB 是正常的，所以附件库在 `file://` 下也能用。
@@ -291,7 +314,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **新增分段不得提前闭合 IIFE**：只有 `appE.part` 结尾收 IIFE 与 `</html>`。
 - **`jupyterlite.part` 的读取口径与 pyodide 载荷逐字同款、无捷径**：按字节读 + **含 CR 即 `exit 1`**（该载荷按**字符数**记长，CRLF→LF 归一会让段长整体错位——不要"顺手统一行尾"）；**缺 `src/jupyterlite.part` 不是错误**：`build.js` 打印警告 + 注入 `JL_AVAILABLE=false` 的**极小占位段**（不 `exit 1`，只让 Jupyter 入口整体不可用）。`appJ.part` 插在 `appD` 与 `appE` 之间，`appE` 仍必须是最后一段。
 - **`make-jupyterlite-part.js` 的载荷不含 pyodide core**：`pyodide.asm.mjs` / `pyodide.asm.wasm` / `python_stdlib.zip` / `pyodide.js` 由主页面 `#pyodide-assets` 在运行期复用（有强断言守着，重复打包会让三档体积白涨）；一次生成三件交付物（站点段 + Jupyter 专用锁 + 合并后的 `all.json`）；站点 5 处程序化改写的**唯一权威表** = `scripts/jupyterlite-patches.json`（要改站点行为改它，不在 `vendor/` 上手改——`vendor/` 是只读取件区）。
-- **`src/*.part` 有超长行：Bash `grep`/`cat` 直扫会把工具层打崩**：`src/*.part` 最长行 **18,426,328 字符**（`pyodide.part`，`pyodide-normal.part` 同值），`≥100 KB` 的行共 **175 条**。⇒ **禁止** Bash `grep`/`cat`/`sed -n p` 直扫 `src/*.part`；**一律**用 `Grep` 工具（"全库"语义**须 `include_ignored=true`**：它默认遵守 `.gitignore`，会静默跳过 `src/pyodide-{normal,minimal}.part` 与 `AzusaAI-WebUI-*.html`）或 `grep -c`；必须在 Bash 里扫时，输出**必须 `| head -c N` 字节封顶** —— **`head -20` 只封行数、不封字节**（实测 `grep -n … src/*.part | head -20` 命中 3 行、输出 **15,122,637 B**，`head -20` 一行都没滤掉）。**由来**：同一类缺陷（grep 判据的**作用域 / 形状 / 期望值**）在本项目**第三次复发** —— `desktop-icon` 方案 §3 S0 ① 的 `# 期望：空` 实测 **3 行 / 15,122,637 B** ⇒ **连崩三任 Worker**（工具层 `RangeError: Maximum call stack size exceeded`；`grep` 自身退出码正常 ⇒ 报错不指向凶手）；取证报告 = `shared/progress/desktop-icon-s0-crash-rca.md`；方案审查口径见 `shared/decisions/plans-decision-gates.md`「常设审查项 · grep 判据三查（E-10）」。
+- **`src/*.part` 有超长行：Bash `grep`/`cat` 直扫会把工具层打崩**：`src/*.part` 最长行 **18,426,328 字符**（`pyodide.part`，`pyodide-normal.part` 同值），`≥128 KiB`（131,072 B）的行共 **175 条**。⇒ **禁止** Bash `grep`/`cat`/`sed -n p` 直扫 `src/*.part`；**一律**用 `Grep` 工具（"全库"语义**须 `include_ignored=true`**：它默认遵守 `.gitignore`，会静默跳过 `src/pyodide-{normal,minimal}.part` 与 `AzusaAI-WebUI-*.html`）或 `grep -c`；必须在 Bash 里扫时，输出**必须 `| head -c N` 字节封顶** —— **`head -20` 只封行数、不封字节**（实测 `grep -n … src/*.part | head -20` 命中 3 行、输出 **15,122,637 B**，`head -20` 一行都没滤掉）。**由来**：同一类缺陷（grep 判据的**作用域 / 形状 / 期望值**）在本项目**第三次复发** —— `desktop-icon` 方案 §3 S0 ① 的 `# 期望：空` 实测 **3 行 / 15,122,637 B** ⇒ **连崩三任 Worker**（工具层 `RangeError: Maximum call stack size exceeded`；`grep` 自身退出码正常 ⇒ 报错不指向凶手）；取证报告 = `shared/progress/desktop-icon-s0-crash-rca.md`；方案审查口径见 `shared/decisions/plans-decision-gates.md`「常设审查项 · grep 判据三查（E-10）」。
 
 ### 验证取证纪律（0.2.0 起固化）
 
@@ -339,7 +362,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 ### 4.3 性能基线（换库或大改之前先看这些数字）
 
-- 完整版产物 ≈ 199.4 MiB（三档见 §1.3）；三个内嵌库都是**惰性初始化**（第一次调用 API 或第一次识别才建 worker / 解码 wasm；pyodide 载荷同样懒解码，首屏不碰载荷正文）。
+- 完整版产物 ≈ **217.5 MiB**（228,036,277 B，2026-09-19 现取；三档见 §1.3）；三个内嵌库都是**惰性初始化**（第一次调用 API 或第一次识别才建 worker / 解码 wasm；pyodide 载荷同样懒解码，首屏不碰载荷正文）。
 - 真实 Chrome（热缓存）：DOMContentLoaded ≈ 280ms、load ≈ 400ms（pdf.js + Tesseract 时期的实测；内嵌 pyodide 后首屏仍几乎不受影响，`file://` 下 `data-boot=done` 实测 ≈ 2.0s）。
 - PDF：2 页 A4 文本模式 ≈ 70–110ms；150 DPI 渲染 ≈ 70–140ms。
 - OCR：首次（含解码 wasm + 训练数据）≈ 0.2–1.9s；热调用 30–150ms。
@@ -423,7 +446,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 **非视觉 → OCR**：`wsOcrTextOf` 是唯一出口；输入是**按上表缩放后的画布 dataURL**（与附件 `maybeOcrImage` 同形）；超时 = **整次读取的总预算** `min(READ_OCR_TIMEOUT_MS(120 s), toolLimit("timeoutMs"))`（`Read` 读图片与 `ReadOffice` 读文档图片共用同一常量），多页共享、页间查 `ctx.signal.aborted`、文本累加到工具结果预算即停；引擎不可用 / 超时 / 无文字各有独立可读文案（**不写"请重试"**）。
 
-**图文按序融合（非视觉模型的 PDF / 办公文档，批 B；落地记录 `shared/progress/netdocs-B2b-done.md`）**：ReadOffice 侧与附件侧共用 `appD.part` 的三个助手——`ocrSeqCands`（逐张 `wsImgFitForModel` → `wsOcrTextOf` + 预算 / 中止 + 计数，**不做任何文案**）、`ocrBlockText`（块头唯一来源，空 / 纯空白 ⇒ `""`）、`docFusePages`（按页插块；无块 ⇒ 原样返回）。块格式（唯一口径）：`【第 N 页 · 图 k · 本机 OCR】`；没有页 / 表标记的 office 段内不分区 ⇒ `【图 k · 本机 OCR】`（label 由 OfficeKit 给）；整页兜底 ⇒ `【第 N 页 · 整页图像 OCR(含文字层重复,可能有误差)】`（这条**不带**「· 本机 OCR」）。**插入位置（P2 的 S15 起）**：`wsDocumentPack` 的融合分支按 `kind` 选布局 —— `kind === "pdfPage"`（PDF，以及 **pptx**——它的正文自带 `----- 第 N 页 -----` 幻灯标记）⇒ `layout:"pages"`，块插到**对应页 / 幻灯段之后**（`docFusePages`；未匹配到页号的块追加文末并注明 `(原页未在文本中找到)`）；其余 office（docx / xlsx）⇒ `layout:"flat"`（正文之后按序接）。**附件侧（`attOcrFuse`）不受 S15 影响**：office 三格式仍一律 `flat`，只有 PDF 用 `pages`。预算：ReadOffice 侧 `READ_DOC_OCR_MAX_IMAGES`(12) / `READ_DOC_OCR_MAX_PAGES`(8) / `READ_OCR_TIMEOUT_MS`(120 s)；附件侧 `ATT_OCR_MAX_IMAGES`(6) / `ATT_OCR_TIMEOUT_MS`(60 s，**整次解析共享、只覆盖 OCR 阶段**；取图调用各另带 60 s 超时)/ 扫描页数 = `min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES)`；字符预算两边都 = `max(512, toolLimit("maxOut") - 512)`，附件侧另受 `ATTACH_TEXT_MAX` 截断。取图 = `PDFKit.pageImages`（**只有 `mode:"rect"` 的页用 rect**，`mode:"full"` 走整页护栏）→ `renderCrops`，失败单调降级到整页 `renderPages` 并注记。落点：ReadOffice 侧进工具结果 + 状态行；附件侧进 `att.text` / `att.ocrImgs` / `att.degraded`（视觉路径与无图文档逐字节不变）。
+**图文按序融合（非视觉模型的 PDF / 办公文档，批 B；落地记录 `shared/progress/netdocs-B2b-done.md`）**：ReadOffice 侧与附件侧共用 `appD.part` 的三个助手——`ocrSeqCands`（逐张 `wsImgFitForModel` → `wsOcrTextOf` + 预算 / 中止 + 计数，**不做任何文案**）、`ocrBlockText`（块头唯一来源，空 / 纯空白 ⇒ `""`）、`docFusePages`（按页插块；无块 ⇒ 原样返回）。块格式（唯一口径）：`【第 N 页 · 图 k · 本机 OCR】`；没有页 / 表标记的 office 段内不分区 ⇒ `【图 k · 本机 OCR】`（label 由 OfficeKit 给）；整页兜底 ⇒ `【第 N 页 · 整页图像 OCR(含文字层重复,可能有误差)】`（这条**不带**「· 本机 OCR」）。**插入位置（P2 的 S15 起）**：`wsDocumentPack` 的融合分支按 `kind` 选布局 —— `kind === "pdfPage"`（PDF，以及 **pptx**——它的正文自带 `----- 第 N 页 -----` 幻灯标记）⇒ `layout:"pages"`，块插到**对应页 / 幻灯段之后**（`docFusePages`；未匹配到页号的块追加文末并注明 `(原页未在文本中找到)`）；其余 office（docx / xlsx）⇒ `layout:"flat"`（正文之后按序接）。**附件侧（`attOcrFuse`）不受 S15 影响**：office 三格式仍一律 `flat`，只有 PDF 用 `pages`。预算：ReadOffice 侧 `READ_DOC_OCR_MAX_IMAGES`(12) / `READ_DOC_OCR_MAX_PAGES`(8) / `READ_OCR_TIMEOUT_MS`(120 s)；附件侧 `ATT_IMG_MAX_IMAGES`(10) / `ATT_OCR_TIMEOUT_MS`(60 s，**整次解析共享、只覆盖 OCR 阶段**；取图调用各另带 60 s 超时)/ 扫描页数 = `min(pdfMaxPages(), READ_DOC_OCR_MAX_PAGES)`；字符预算两边都 = `max(512, toolLimit("maxOut") - 512)`，附件侧另受 `ATTACH_TEXT_MAX` 截断。取图 = `PDFKit.pageImages`（**只有 `mode:"rect"` 的页用 rect**，`mode:"full"` 走整页护栏）→ `renderCrops`，失败单调降级到整页 `renderPages` 并注记。落点：ReadOffice 侧进工具结果 + 状态行；附件侧进 `att.text` / `att.ocrImgs` / `att.degraded`（视觉路径与无图文档逐字节不变）。
 
 **媒体怎么进模型（`m.media` 内联 + 协议双形态）**：消息上唯一新字段 `m.media[]`（`kind/mime/data/w/h/bytes/path/label/from/srcW/srcH/scaled`；`resultText` 只写文本 + 「已附带 N 张」）。payload 项内部字段 `media` 由 `payloadMessages` 带出：**Anthropic** 走 `tool_result.content` 内容块数组（文本 + image）；**OpenAI 兼容**走"tool 文本 + **按工具轮分组**的一条合成 user 消息"（连续 `role==="tool"` 段 = 同一工具轮，组内 media 合并、插在段末最后一条 tool 之后，跨段不合并 ⇒ 不产生 `tool→user→tool` 交错）；合成消息**只存在于请求体**，不落盘、不进界面。工具轮内还有一个 `msgList.push({role:"tool"})`（续答轮），**必须带上同一个 media**，漏了就是"本轮模型看不到刚读的图"。
 
@@ -433,7 +456,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 
 **存储代价（如实）**：媒体内联在消息里（不新增 blob 键 ⇒ 不触碰释放链），单条消息最大 ≈1.4 MB base64；三条放大面 = 每次 `saveState(true)` 整条会话写、导出备份整份 `JSON.stringify`、历史图片逐轮重发（软护栏封顶）。**「优化存储」可回收**（`stripAttachmentData` 在 `m.content` 早退之前删 `m.media`，`keepIds` 保护口径不变）。**计量口径**：`storageBytes()` 量的是 localStorage 设置串，**不是会话存量** —— 报告占用请用 `navigator.storage.estimate()` / IDB 实测，不要拿它宣称"媒体存储已计量"。
 
-**ReadOffice 复用办公 / PDF 引擎的边界**：复用引擎（`OfficeKit.parse` / `PDFKit.extractText|renderPages` / `OCRKit.recognize`）与数值（`ATTACH_TEXT_MAX`、`officeSizeCap()`、`pdfDpi()`、`pdfMaxPages()`、`ocrLangs()`、`SAFE_IMG_MIME`、`IMAGE_EXT/OFFICE_EXT/MACRO_EXT`），**不复用** `resolveOffice/resolvePdf/resolveImage` 的 File+vision+toast 包装（ReadOffice 的入参是 Blob + 目标会话，包装会引入"生成期间切走会话"的判定错会话问题）；PDF 走文本优先、不吃 `pdfMode()` 设置。文档状态的"文件:…"信息一律并入**末尾状态行**（不占行号，`line_offset` 语义与文本读一致），`clipped` 在状态行标注。
+**ReadOffice 复用办公 / PDF 引擎的边界**：复用引擎（`OfficeKit.parse` / `PDFKit.extractText|renderPages` / `OCRKit.recognize`）与数值（`ATTACH_TEXT_MAX`、`officeSizeCap()`、`pdfDpi()`、`pdfMaxPages()`、`ocrLangs()`、`SAFE_IMG_MIME`、`IMAGE_EXT/OFFICE_EXT/MACRO_EXT`），**不复用** `resolveOffice/resolvePdf/resolveImage` 的 File+vision+toast 包装（ReadOffice 的入参是 Blob + 目标会话，包装会引入"生成期间切走会话"的判定错会话问题）；PDF 走文本优先、不吃附件图片策略（`attachImgMode()`）设置。文档状态的"文件:…"信息一律并入**末尾状态行**（不占行号，`line_offset` 语义与文本读一致），`clipped` 在状态行标注。
 
 **ReadOffice 的两级偏移坐标（页 / 表 / 幻灯 + 图片序号；本节为正式口径）**
 
@@ -463,15 +486,38 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - **双面文案（S12）**：同一字符串既进模型又进用户面（工具卡片 / toast）时用**中性措辞** —— 不出现只对用户说的话，也不出现只给模型的语法（`next_step:`）；用户去处（改哪个开关）改为**事实括注**（非祈使、无第二人称）。
 - 落地记录：`shared/progress/b27-impl-done.md`（含 S0.5 三段合并表、逐行映射、五维差分与字符量读数）。
 
-### 4.8 生成中的待发送缓冲区（b28）
+### 4.8 生成中的待发送缓冲区（b28；b30 起**按会话多槽**）
 
-- **状态**：`SQ = { convId, items }`（`appD`，**内存态、不持久化**；`items[i] = { id, convId, text, at }`）+ `genConvId`（在飞 send 的归属会话）。
-- **归属**：`item.convId` 恒 = 入队时的会话 = `SQ.convId`；flush 目标取 `opts.bufItem.convId`（生成期间允许切走，消息必须落回原会话）；浮窗只在 `conv.id === SQ.convId` 时可见。
-- **顺序面（三处写死，动它们等于重写本机制）**：① `sendMessage` 的 finally 里 **`genConvId = ""` 在 `sqFlushAfterTurn(sendConvId)` 之前**；② flush **同步**调 `sendMessage`（不 await、不 catch），插在 `pvNotifyCheck()` 之前 ⇒ 缓冲消息优先于 E12 自动续跑；③ 出队点唯一（`SQ.items.shift()`），交接期不可召回/丢弃，`sendMessage` 在 push 用户消息之前的所有早退分支统一 `sqRestoreBuf`（幂等）。
-- **入队门**：仅 `generating === true` 且 `conv.id === genConvId` 时入队；附件 `draftFiles` / `office` 解析中一律拒绝 + toast（v1 不支持附件入队）。
-- **UI**：`#send-queue`（`head.part`，贴输入框正上方，`#slash-menu` 的 z-70 之下）；行文本一律 `textContent`；按钮走 `#send-queue-rows` 上的**事件委托**（先例 = `ctx-pop`）；hint 四态（默认 / 等待 / 压缩 / 残留）；`↑`（输入框**完全为空**时）召回最后一条 —— **有意偏离 Kimi 的 busy 门**（空闲也允许召回，否则 `ECOMPACT_ABORT` 残留态无法用 ↑ 恢复）。
+- **状态**：`SQ = {}`（convId → `{ items: [{ id, convId, text, at }] }`，`appD` 的 `var SQ`，**内存态、不持久化**）。b30 之前是单槽 `{ convId, items }` + 模块级 `genConvId`；"同一时刻只有一条在飞 send"的前提作废 ⇒ 槽按会话分开。
+- **归属**：每条会话一个队列（`sqSlot(convId, make)`）；浮窗只显示当前会话的槽；`sqInsertAtToolBoundary` / `sqFlushAfterTurn` 只动目标会话的槽；`item.convId` 必填（`sqRestoreBuf` 按它定位）。
+- **顺序面（写死，动它们等于重写本机制）**：① `sendMessage` 的 finally 里 **`genDrop(sendConvId)` 是第一句**（记录先消失、缓冲唤醒在其末尾触发）；② `sqFlushAfterTurn(endedConvId, wakeSent)` 在 `pvNotifyCheck(sendConvId)` 之前，且 `wakeSent` 为真时**让位**（一次收尾至多补发一条）；③ 出队点唯一（`shift()`），交接期不可召回/丢弃，`sendMessage` 在写用户消息之前的所有早退分支统一 `sqRestoreBuf`（幂等；`retryAt = now + 4s` 冷却防"补发 → 失败 → 再补发"即时循环）。
+- **入队门**：`genOn(conv.id)` 为真才可入队（当前会话自己的生成）；附件 `draftFiles` / `office` 解析中一律拒绝 + toast（v1 不支持附件入队）。**超限转缓冲**：并发已达上限的发送（`genNew` 返回 `null`）转入该会话的槽并提示；任一会话 `genDrop` 后按"槽首项最旧"补发 1 条。
+- **UI**：`#send-queue`（`head.part`，贴输入框正上方，`#slash-menu` 的 z-70 之下）；行文本一律 `textContent`；按钮走 `#send-queue-rows` 上的**事件委托**；hint 五态（默认 / 超限「待前序会话空出槽位后自动发送」/ 等放行提问 / 压缩中 / 残留「按 Enter 立即发送」）；`↑`（输入框**完全为空**时）召回**当前会话槽**的最后一条 —— **有意偏离 Kimi 的 busy 门**（空闲也允许召回，否则 `ECOMPACT_ABORT` 残留态无法用 ↑ 恢复）。
 - **可见性重算**：`sqRender()` 挂在 `renderChat()`（`appC`）的两个出口 ⇒ 会话切换 / 删除 / 新建 / 整库替换 / 分支切换自动跟随。
-- **已知缺口（登记）**：`generating = true` 之后、`try` 之前的两处 `await`（`hydrateAttachments` / `cxAutoBeforeSend`）若 reject，条目不回队且 `generating` 卡 true（现码全路径 resolve；加固属 L3 状态机面，另批）。
+- **结构保证（b30 补齐，替代旧「已知缺口」）**：`try` 起点已上移到 `genNew` 之后、`genDrop` 是 `finally` 第一句 ⇒ 记录不会永久残留；前置段（附件 hydrate / 压缩窗口）的早退与异常统一"回队 + 如实提示"。
+
+### 4.9 附件三档与图片上限（0.2.1）
+
+**常量（唯一来源）**：`ATT_IMG_MAX_IMAGES` = 10（`appD`；取图计划与 OCR 融合**共用**；批前 `ATT_OCR_MAX_IMAGES` = 6，已改名并抬值）。自绘表格图另有：每表 ≤ 60 行 × 12 列、一次 ≤ 10 表（= `ATT_IMG_MAX_IMAGES`）、每表一张图。
+
+**token 估算（`draftAttachTokens`；草稿环 / 预览 / 上下文用量浮层同一口径）**：文本走四桶估算；**一张图 ≈ 900**（图片档 = 900 × 张数；混合档 = 正文 + 900 × 张数；`drawn` 自绘图同口径；图片附件 900）。
+
+**自绘表格图的交付数值（`attCanvasFitForModel`，R11）**：单张硬顶 = `READ_IMG_HARD_MAX`(1 MiB)；最长边 ≤ `imgMaxSide()`（默认 4096）；质量梯 `0.86 → 0.6 → 0.4`；边长梯 `1400 / 1000 / 768 / 512`（首个进硬顶者胜）。实测咬合：原始 5,357,103 B ⇒ 交付 265,182 B；`imgMaxSide=1024` ⇒ 1024×406 / 215,694 B。
+
+**可读性旋钮（生产参数）**：自绘 `scale: 2` —— 1× 时单元格字高约 13 px，真机 OCR 置信度 57 且暗号读花；2× ⇒ 82 且逐字可读（交付尺寸 = 2× 读数）。
+
+**PDF 侧取图参数（三处调用点统一）**：`attPdfOpts()` = `{maxScan: pdfMaxPages(), maxImages: ATT_IMG_MAX_IMAGES}`。
+
+### 4.10 多会话并发（b30）
+
+- **唯一权威 = `GEN`**（`appA`「2.5 生成上下文注册表」）：`convId → { convId, seq, ctrl, startedAt, phase, turn, regen, inflight }`。模块级 `generating / abortCtrl / genConvId / lastStats` 已**整体删除**，读点一律走 `genOf / genOn / genAny / genCur / genCount`（机械闸 = 词边界计数脚本；`lint.js` 对裸变量读写**不工作**，只兜函数类）。记录随 `genNew` 建立、随 `genDrop` 销毁；`ctrl` 创建点 = `genNew`（压缩窗口内按 Ctrl+X 也可中止）。
+- **不变量（摘要）**：I1 每会话至多一条记录；I2 一切写入按 `sendConvId`（`commit` 的第二参数是唯一入口）；I3 "停止"只影响目标会话（工具等待 / 沙箱 / 续跑静默窗全按 convId；**不含**后台 Python 任务，见下）；I5 渲染调度槽只服务当前会话；I8 `genCount() <= genMax`（超限转缓冲，不静默丢弃）；I9 删会话当场中止其生成、不留幽灵；I11 记录必被同一 `finally` 覆盖（`try` 起点在 `genNew` 之后、`genDrop` 是 finally 第一句）；I12 自动续跑必须显式 `opts.targetConvId`。
+- **并发上限**：设置项 `genMax`（1~6，默认 3）；`genDrop` 末尾 `genWakeBuffers()` 按"槽首项最旧"补发 1 条（`retryAt` 冷却 4 s 防"补发→失败→再补发"即时循环）。
+- **压缩仍单实例**：并发下第二条会话的自动压缩遇 `ECOMPACT_BUSY` **让位**（本轮不压、照常发送 —— 有意取舍）；`CX_RUN.regen` 已下沉为 `GEN[id].regen`（读点 `genOf(c.id)`；**不得**用 `CX_RUN.convId` —— 那在该处是已复位的旧值/别的会话）。停止静默窗 `PV_STOP_AT[convId]` 是**独立 per-conv 表**（不能放进 GEN 记录：`genDrop` 会删记录，而静默窗必须在收尾之后仍有效）。
+- **Python 池（上限 2）与并发的关系**：池是全局资源，跨会话共用；并发条数 > 2 时第三条进 Python 会 `EBUSY`（既有语义）—— 设置项 hint 已写明。
+- **流式渲染**：气泡元素**每帧重解**（复用 `msgElementFor` + "仅发起会话 = 当前视图"守卫），不再持有一次性 `msgEl` 快照 —— 历史踩坑 =「切走再切回后气泡冻结」；`cancelRender` 也只由当前会话的收尾调用。
+- **`window.__GEN_STAT`（对外面登记）**：只读诊断钩子（无参数 / 无副作用 / 只回 `{max,count,cur,list[]}` 结构与计数，不含正文 / 设置 / API Key；不新增任何通信面）；先例 = 主页面 `window.__mcpRefresh`。
+- **D-5（0.2.1 裁决）**：**停止生成不杀后台 Python 任务**；`pyTaskStopKills` 设置项与 `pyTaskStopAll` 已整体作废 / 删除；任务中止的唯一手动收口 = `pvStopTaskFromUI`（`/tasks` 弹窗 / 卡片行「停止」/ `TaskStop` 工具）。
 
 ## 5. 未来方向
 

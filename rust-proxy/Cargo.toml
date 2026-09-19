@@ -1,0 +1,76 @@
+[package]
+name = "azusa-local-proxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["小阳uni - yuunnn_w"]
+description = "AzusaAI 本地反向代理（Win7 兼容 · 便携单文件）"
+license = "GPL-3.0"
+repository = "https://github.com/yuunnn-w/AzusaAI-WebUI"
+publish = false
+
+[dependencies]
+# 反代内核 —— 版本线 = 方案 §5.1 的 [审查实测] 锁定值（2026-09-18）
+# features 细目（Phase 1 需要）：`signal` = Ctrl-C 优雅停机（FR-34）；`time` = 首字节 watchdog
+# 与停机兜底计时（FR-21/FR-34）；`sync` = 停止信号广播（watch）。
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+axum = "0.8"
+# default-features = false 会一并关掉 http2 —— 有意选择：上游 HTTP/1.1 + 不缓冲口径（方案 §5.1）
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+# `Stream` trait（首字节 watchdog 的 poll_next、响应体桥接类型、客户端断开探测）。
+# 体量 = 纯 trait 定义（无 std 依赖）；本就在 Cargo.lock 里（reqwest/hyper 的传递依赖）⇒ 不新增下载面。
+futures-core = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# FR-32 单实例：`CreateMutexW`（Win32_System_Threading）+ `SECURITY_ATTRIBUTES`（**Win32_Security**，
+# v3 审查 P1-2 明确该 API 由它 gate）+ `GetLastError`（Win32_Foundation）。
+#
+# Phase 2（UI + 托盘）按方案 §5.3 的起步集增补 feature；纪律（写死）：**每次增补 feature 面后必须
+# 重跑 §5.6 四道验证**（新增 feature 可能带出新导入面，RK16 同源）—— 本批已在报告里登记：
+#   · Win32_UI_WindowsAndMessaging —— 窗口/消息/控件/菜单/定时器/DrawIconEx
+#   · Win32_UI_Shell               —— Shell_NotifyIconW + ShellExecuteW（打开日志目录）
+#   · Win32_UI_Controls            —— InitCommonControlsEx（comctl32 v6 清单生效的前提）
+#   · Win32_Graphics_Gdi           —— 字体/位图/双缓冲绘制（DrawTextW、CreateDIBSection…）
+#   · Win32_Graphics_GdiPlus       —— 圆角卡片/状态点抗锯齿（flat API，XP 起就在 gdiplus.dll）
+#   · Win32_System_LibraryLoader   —— GetModuleHandleW + GetProcAddress（RtlGetVersion / DWM 动态取）
+#   · Win32_System_SystemInformation —— OSVERSIONINFOW（RtlGetVersion 的入参）
+#   ⚠ K13：原 `Win32_System_Registry`（FR-33 开机自启）已随自启功能整体移除 ——
+#     去掉该 feature 让"本程序无任何注册表能力"在**编译期**成立（不只是"没调用"）。
+#   · Win32_System_DataExchange    —— 剪贴板（复制 Base URL）
+#   · Win32_System_Memory          —— GlobalAlloc/GlobalLock（剪贴板内存）
+#   · Win32_System_Console         —— 【P6-S1 新增】AttachConsole / GetStdHandle（三输出通道）
+#   · Win32_Storage_FileSystem     —— 【P6-S1 新增】CreateFileW("CONOUT$"/"CONERR$") / GetFileType /
+#                                     WriteFile（全部经 `src/output.rs` 的 K9 白名单函数；非"文件 I/O"）
+# ⚠ 刻意**不**引入 Win32_System_Com / WinRT / Media / Graphics_Dwm：DWM 深色标题栏走
+#   GetProcAddress 动态取（无静态导入 ⇒ 老系统零风险），见 `src/osver.rs` 与 `src/ui/mod.rs`。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[build-dependencies]
+# 资源嵌入（.ico + comctl32 v6 / DPI 清单 + 版本信息）：与工作区先例 Rust-MCP-Server/build.rs 同族
+winresource = "0.1"
+
+[profile.release]
+# Win7 目标要求 panic = "abort"（指南 §1.4；方案 §5.4）：去掉 C++ 异常 ⇒ 去掉 __CxxFrameHandler3 的 CRT 依赖
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

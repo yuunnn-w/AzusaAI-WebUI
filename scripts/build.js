@@ -155,6 +155,11 @@ const tessPart = readIf('tesseract.part');
 /* 内嵌办公文件解析分段(mammoth / SheetJS / docstream / fflate + OfficeKit 包装层)
    由 make-office-part.js 生成,自带 </script> 转义与自检;缺失时同款语义:跳过 + 警告 */
 const officePart = readIf('office.part');
+/* 内嵌渲染库分段(docx-preview 0.4.0 + jszip 3.10.2 + modern-screenshot 4.7.0;b31-S7)
+   由 make-render-part.js 生成,自带 </script> 转义与自检;缺失时同款语义:跳过 + 警告。
+   本段无档位维度(三档共用同一份,与 office.part 同款);缺件 ⇒ 运行期 window.RenderKit
+   为 undefined ⇒ 能力表 docx 图片档 false ⇒ 走既有降级文案 */
+const renderPart = readIf('render.part');
 /* 内嵌 JupyterLite 分段(lab 站点 + pyodide 依赖闭包 + Jupyter 专用锁 + 合并后的 piplite 索引)
    由 make-jupyterlite-part.js 生成。读取口径与 pyodide 载荷**逐字同款**:按字节读 + **含 CR 即 exit 1**
    (载荷段头按字符数记长,CRLF→LF 归一会让段长错位)⇒ **禁止**走做归一的 readIf。
@@ -242,7 +247,7 @@ function stageProfile(profile) {
     : ('<!-- AzusaAI WebUI · ' + profile.label + ' edition (profile=' + profile.id + ', '
       + (wheelCount === null ? '?' : wheelCount) + ' 个预置包) · 由 node scripts/build.js --profile='
       + profile.id + ' 生成 · 完整版 = AzusaAI-WebUI-full.html -->\n');
-  const out = (profileBanner + head + libs + katexJs + pdfjsPart + tessPart + officePart + pyPart + jlPart + app).replace(/\r\n/g, '\n');
+  const out = (profileBanner + head + libs + katexJs + pdfjsPart + tessPart + officePart + renderPart + pyPart + jlPart + app).replace(/\r\n/g, '\n');
   fs.mkdirSync(path.dirname(OUT), { recursive: true });
   stagedTmps.push(TMP);          /* 先登记后写:写到一半失败也能被 cleanup 掉 */
   fs.writeFileSync(TMP, out);
@@ -255,9 +260,9 @@ function stageProfile(profile) {
     + '  [profile ' + profile.id + ' · pyodide ' + pyBytes + ' B · '
     + (pyBytes ? ('预置包 ' + (wheelCount === null ? '?' : wheelCount) + ' 个') : '载荷缺失(Python 工具族不可用)')
     + ']');
-  logs.push('  pdfjs ' + pdfjsPart.length + ' B / tesseract ' + tessPart.length + ' B / office '
-    + Buffer.byteLength(officePart) + ' B / jupyterlite ' + Buffer.byteLength(jlPart) + ' B'
-    + (jlDegraded ? '(降级占位段:载荷缺失)' : ''));
+  logs.push('  pdfjs ' + Buffer.byteLength(pdfjsPart) + ' B / tesseract ' + Buffer.byteLength(tessPart) + ' B / office '
+    + Buffer.byteLength(officePart) + ' B / render ' + Buffer.byteLength(renderPart) + ' B / jupyterlite '
+    + Buffer.byteLength(jlPart) + ' B' + (jlDegraded ? '(降级占位段:载荷缺失)' : ''));
 
   /* 附加核对:打印 pyodide 分段体积并与档位期望值核对(±5%)
      期望总量 = 档位 expect.partBytes(实测写回) + 本产物实测的非 pyodide 部分(不再写死 203,600,000) */

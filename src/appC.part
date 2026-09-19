@@ -274,11 +274,11 @@ function fileCardEl(meta, payload) {
   btn.setAttribute("tabindex", "0");
   var sub;
   if (meta.kind === "pdf") {
-    sub = "PDF · " + (meta.pages || 1) + " 页 · " + (meta.mode === "image" ? "图片模式" : "文本模式") +
+    sub = "PDF · " + (meta.pages || 1) + " 页 · " + attachModeLabel(meta) +
       (meta.ocrImgs ? " · " + meta.ocrImgs + " 图已 OCR" : "") +
       (meta.clipped ? " · 已截断" : "");
   } else if (meta.kind === "office") {
-    sub = officeBrief(meta) + (meta.degraded ? " · " + meta.degraded : "");
+    sub = officeBrief(meta) + " · " + attachModeLabel(meta) + (meta.degraded ? " · " + meta.degraded : "");
   } else {
     sub = "纯文本 · " + fmtBytes(meta.size || 0) +
       (meta.enc ? " · " + wsEncName(meta.enc) + "(已转码显示)" : "") +
@@ -1319,7 +1319,7 @@ function renderChat() {
   applyCodeWrap();
   elChat.scrollTop = keepTop;
   if (!conv.messages.length) scrollToBottom(true);
-  if (typeof findState !== "undefined" && findState && findState.kw && !generating) runFind(findState.kw, true);
+  if (typeof findState !== "undefined" && findState && findState.kw && !genOn(conv.id)) runFind(findState.kw, true);
   sqRender();     /* 会话切换/删除/新建/整库替换等都会走 renderChat ⇒ 缓冲浮窗随之重算可见性 */
 }
 function welcomeEnvChips() {

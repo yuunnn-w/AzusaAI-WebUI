@@ -14,6 +14,9 @@
      调用方可选地用 opts.textMax 按次抬高(P2-a / S12),缺省仍是 TEXT_MAX ⇒ 输出与批前逐字节一致。
    · pptx 输出按幻灯插入页标记行 `----- 第 N 页 -----`(与 PDF 同一字面量;P2-a / S11),
      并把图片归属到真实幻灯号(page;P2-a / S11b)——两者都带**自检**,不成立就整篇回退原输出。
+   · S6c(docx 位置锚):opts.docxAnchor = true 时多产 docxHtml + 文档序槽位 + `data-att-skip` 属性
+     (与 src/appD.part 的 attachDocxAnchorText 配对的一个跨文件契约;maker 检测 14 锁两处同现);
+     不传 ⇒ 输出与批前逐字节一致。
    ============================================================ */
 (function () {
   "use strict";
@@ -36,6 +39,15 @@
   /* ---------------- 常量 ---------------- */
   var TEXT_MAX = 131072;                     /* == appD 的 ATTACH_TEXT_MAX;也是未传 opts.textMax 时的默认值 */
   var FORMATS = ["docx", "xlsx", "xls", "pptx", "doc", "ppt"];
+  /* xlsx / xls 的读视图(方案 b32-office-excel-plan §4.3 / D3):
+       csv  = 现状(整表 CSV,快速通读)  grid = 一格一行「地址<TAB>值」(地址可精确回写)
+     **默认值由工具面(appE)决定并显式传入**;这里只认这两个值,其余/缺省一律 csv
+     ⇒ 直接调 Kit/胶水且不带 sheetView 时的行为与 X1-c 之前**逐字节相同**(T-A4 的"默认路径不变式") */
+  var SHEET_VIEWS = { csv: 1, grid: 1 };
+  function sheetViewOf(opts) {
+    var v = String((opts && opts.sheetView) == null ? "" : opts.sheetView).toLowerCase();
+    return SHEET_VIEWS[v] ? v : "csv";
+  }
   var LIMITS = {
     /* 本文件只管"结构安全"这一层:ZIP 预扫描 + 图像字节账(zip-bomb / 图像超限的判定点)。
        文件体积上限(20MB 主线程降级 / 50MB worker)与解析超时(60s)是**主线程职责**,
@@ -202,7 +214,9 @@
 
   /* ---------------- 图像收集 ---------------- */
   function ImageSink() { this.images = []; this.bytes = 0; this.skipped = 0; }
-  ImageSink.prototype.add = function (mime, data, label, page) {
+  /* sheet = 归属表名(S6c;xlsx/xls 由 docstream AST 的 sheetName 映射而来;**其余格式不传 ⇒ ""**)。
+     appD 的 attachSheetImgPages 按它把图归到 `# <表名>` 段 —— page 仍是整篇序号,映射在应用层做。 */
+  ImageSink.prototype.add = function (mime, data, label, page, sheet) {
     var ab = toAB(data);
     var n = ab ? ab.byteLength : 0;
     if (!IMG_MIME[mime] || !n || this.images.length >= LIMITS.maxImages
@@ -217,7 +231,8 @@
       data: ab,
       bytes: n,
       label: label || ("图 " + idx),
-      page: numOf(page) || idx
+      page: numOf(page) || idx,
+      sheet: sheet || ""
     };
     this.images.push(item);
     return item;
@@ -226,15 +241,16 @@
   /* ---------------- 结果归一 ---------------- */
   /* textMax = 本次生效的单文档正文上限(S12);未传 = TEXT_MAX ⇒ 截断行为与批前一致。
      超限时**只置 clipped 标志 + 保留原文长度 textChars**,文案(如实注记)由应用层出
-     —— 胶水不改口径、不静默丢信息。 */
-  function finish(subtype, rawText, sink, pages, unit, t0, textMax) {
+     —— 胶水不改口径、不静默丢信息。
+     extra = 可选附加字段(S6c 起:docx 的 docxHtml);不传 ⇒ 返回键与批前**逐字相同**。 */
+  function finish(subtype, rawText, sink, pages, unit, t0, textMax, extra) {
     var raw = (rawText == null) ? "" : String(rawText);
     var limit = numOf(textMax) || TEXT_MAX;
     var textChars = raw.length;
     var clipped = false;
     var text = raw;
     if (textChars > limit) { text = raw.slice(0, limit); clipped = true; }
-    return {
+    var res = {
       subtype: subtype,
       text: text,
       textChars: textChars,
@@ -246,15 +262,32 @@
       unit: unit || "",
       ms: Math.round(now() - t0)
     };
+    if (extra) {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) { res[k] = extra[k]; }
+      }
+    }
+    return res;
   }
 
-  /* ---------------- docx:mammoth 双 pass(文本 + 正文引用的图像) ---------------- */
+  /* ---------------- docx:mammoth 双 pass(文本 + 正文引用的图像) ----------------
+     S6c(位置锚):opts.docxAnchor = true 时多产三样供 appD 的 `【图 k】` 锚使用 ——
+     · 每张图**同步取号**(文档序;convertImage 回调被调用的那一拍),convertToHtml 完成后按槽位
+       重排 sink.images 并把 page/label 重排为 1..N(= 标记号)⇒ 图数组序 == 文档序
+       (契约级加固:不依赖异步 readAsArrayBuffer 的完成顺序);
+     · 对**一切不可交付的图**在 HTML 上打 data-att-skip="1"(mime 早退 / sink.add 返回 null /
+       read 失败 —— 三处**全部**要打;漏一处该图就留下"无对应图的标记" ⇒ appD 的计数守卫整篇回退);
+     · 结果多带 docxHtml = convertToHtml 的 value(仅 docxAnchor 时;无图 = "",不白搬)。
+     不传 docxAnchor ⇒ 三样一律不出现,输出与批前**逐字节相同**(含不打属性、不带字段)。 */
   function parseDocx(u8, opts, t0, textMax) {
     if (!G.mammoth || typeof G.mammoth.extractRawText !== "function") {
       return Promise.reject(officeError("worker", "解析库未就绪(mammoth)"));
     }
     var ab = toAB(u8);
     var sink = new ImageSink();
+    var wantAnchor = !!(opts && opts.docxAnchor === true);
+    var seq = 0, slots = [];                 /* 文档序槽位:slots[文档序号] = sink 收下的图项 */
+    function skipImg() { return wantAnchor ? { src: "", "data-att-skip": "1" } : { src: "" }; }
     progress(opts, "extracting");
     return G.mammoth.extractRawText({ arrayBuffer: ab }).then(function (res) {
       var text = (res && res.value) || "";
@@ -262,21 +295,119 @@
       return G.mammoth.convertToHtml({ arrayBuffer: ab }, {
         convertImage: G.mammoth.images.imgElement(function (img) {
           var mime = img.contentType || "";
-          if (!IMG_MIME[mime]) { sink.skipped++; return { src: "" }; }
+          var no = wantAnchor ? (++seq) : 0;               /* 同步取号 = 文档序(不等 promise 解析顺序) */
+          if (!IMG_MIME[mime]) { sink.skipped++; return skipImg(); }
           return img.readAsArrayBuffer().then(function (data) {
-            sink.add(mime, data, null, null);
+            var item = sink.add(mime, data, null, null);
+            if (wantAnchor && !item) { return skipImg(); } /* 张数/字节闸拒绝 ⇒ 也要打属性 */
+            if (wantAnchor) { slots[no] = item; }
             return { src: "" };
-          }, function () { sink.skipped++; return { src: "" }; });
+          }, function () { sink.skipped++; return skipImg(); });
         })
-      }).then(function () {
+      }).then(function (htmlRes) {
+        if (wantAnchor && slots.length) {
+          var ordered = [], i;
+          for (i = 1; i < slots.length; i++) { if (slots[i]) { ordered.push(slots[i]); } }
+          for (i = 0; i < ordered.length; i++) {
+            ordered[i].page = i + 1;                        /* 重排为 1..N = 【图 k】同号 */
+            ordered[i].label = "图 " + (i + 1);
+          }
+          sink.images = ordered;
+        }
         progress(opts, "done");
-        return finish("docx", text, sink, 0, "", t0, textMax);
+        return finish("docx", text, sink, 0, "", t0, textMax,
+          wantAnchor ? { docxHtml: (sink.images.length && htmlRes && htmlRes.value) ? String(htmlRes.value) : "" } : null);
       });
     });
   }
 
+  /* ---------------- xlsx / xls 的 grid 视图(方案 §4.3;X1-c) ----------------
+     逐表输出:段头 `# 表名  (范围 A1:C3 · 3 行 x 3 列 · 单元格 7 · 合并 A1:B1)`,随后一格一行
+     `地址<TAB>值`(带非 General 数字格式时追加第三段 `{z=…, v=…}`;公式格显示 `=公式原文`)。
+     段头保持 `# <表名>` 开头 ⇒ appE 的章节索引(docSectionIndex 认 `"# "` 行)与 page_offset 不变。
+     值里的制表符 / 换行 / 反斜杠转义成 `\t` `\n` `\\`(**行 ↔ 单元格映射恒成立**;现状 CSV 的映射
+     会被单元格内的逗号/换行破坏 —— 审查 R-5 已机械复现)。
+     读选项 = 方案 §4.3 的 {type:'array', cellNF:true}(**禁 cellDates**:它会把 v 变成 ISO 串,
+     "机器值可回写"的前提就没了)+ **sheetStubs:true**:
+       · SheetJS 会**丢掉"只有 <f> 没有缓存 <v>"的格**(B1,probe2 三态读数在案);
+       · 加 sheetStubs 后这类格以 t:"z" 出现(带 f),**格集与载荷内 xlsxSheetModelOf 逐地址一致**
+         (真值件 11/11,probe2 读数在案);
+       · 代价只随 XML 里 `<c>` 元素个数(不是 dimension 面积):稀疏件(2 个 `<c>`)两种选项下
+         都是 2 格、耗时同级(probe2 读数在案)⇒ 不会因 sheetStubs 造出"整片空格"。
+     ⇒ B1 的处置:靠 sheetStubs 达成"公式格在读视图里看得见",**不需要跨 realm 合并读模型**
+       (两读者格集已机械证明等价)。 */
+  function gridEsc(s) {
+    return String(s == null ? "" : s)
+      .replace(/\\/g, "\\\\").replace(/\t/g, "\\t").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+  }
+  /* 单元格的值文本:公式 ⇒ `=原文`;否则取 SheetJS 的显示值 w(缺则 v) */
+  function gridCellText(c) {
+    if (c && c.f) { return "=" + String(c.f); }
+    if (c && c.w != null) { return String(c.w); }
+    if (!c || c.v == null) { return ""; }
+    return String(c.v);
+  }
+  /* 地址排序(行优先):SheetJS 的键是 "A1"/"AA10" 这类串,字典序会把 AA10 排到 B2 前面 */
+  function gridAddrCmp(a, b) {
+    var x, y;
+    try { x = G.XLSX.utils.decode_cell(a); y = G.XLSX.utils.decode_cell(b); } catch (e) { return a < b ? -1 : 1; }
+    if (x.r !== y.r) { return x.r - y.r; }
+    return x.c - y.c;
+  }
+  function gridOfSheet(name, ws) {
+    var ref = String((ws && ws["!ref"]) || "");
+    var box = null, rows = 0, cols = 0;
+    try { box = ref ? G.XLSX.utils.decode_range(ref) : null; } catch (e) { box = null; }
+    if (box) { rows = box.e.r - box.s.r + 1; cols = box.e.c - box.s.c + 1; }
+    var keys = [], k;
+    for (k in ws) {
+      if (!Object.prototype.hasOwnProperty.call(ws, k) || k.charAt(0) === "!") { continue; }
+      keys.push(k);
+    }
+    keys.sort(gridAddrCmp);
+    var lines = [], i, c, txt, n = 0;
+    for (i = 0; i < keys.length; i++) {
+      c = ws[keys[i]];
+      if (!c) { continue; }
+      /* 纯桩(t:"z" 且无 f)与真正的空格不出行 —— 与 csv 视图"空格不出现"一致,
+         且**不跳过 0 / false / 空串以外的真值**(0 与 false 都要出) */
+      if (!c.f && (c.t === "z" || c.v == null || c.v === "")) { continue; }
+      txt = gridEsc(gridCellText(c));
+      if (c.z && c.z !== "General") {
+        txt += "\t{z=" + String(c.z) + ", v=" + (c.v == null ? "" : String(c.v)) + "}";
+      }
+      lines.push(keys[i] + "\t" + txt);
+      n++;
+    }
+    var mg = (ws && ws["!merges"]) || [], ms = [];
+    for (i = 0; i < mg.length; i++) {
+      try { ms.push(G.XLSX.utils.encode_range(mg[i])); } catch (e) { /* 非法 merge 直接跳过 */ }
+    }
+    var head = "# " + name + "  (范围 " + (ref || "-") + " · " + rows + " 行 x " + cols + " 列 · 单元格 " + n
+      + (ms.length ? " · 合并 " + ms.join(", ") : "") + ")";
+    return lines.length ? (head + "\n" + lines.join("\n")) : head;
+  }
+  function parseSheetGrid(u8, ext, opts, t0, textMax) {
+    if (!G.XLSX || typeof G.XLSX.read !== "function") {
+      return Promise.reject(officeError("worker", "解析库未就绪(SheetJS)"));
+    }
+    progress(opts, "parsing");
+    var wb = G.XLSX.read(u8, { type: "array", cellNF: true, sheetStubs: true });
+    var names = (wb && wb.SheetNames) || [];
+    var parts = [];
+    for (var i = 0; i < names.length; i++) { parts.push(gridOfSheet(names[i], wb.Sheets[names[i]])); }
+    var text = parts.join("\n\n");
+    if (!names.length || !text.replace(/\s/g, "")) { text = "(空工作簿)"; }
+    progress(opts, "extracting");
+    return collectOfficeImages(u8, ext).then(function (sink) {
+      progress(opts, "done");
+      return finish(ext, text, sink, names.length, "表", t0, textMax);
+    });
+  }
+
   /* ---------------- xlsx / xls:SheetJS 转 CSV(全工作表) ---------------- */
-  function parseSheet(u8, ext, opts, t0, textMax) {
+  function parseSheet(u8, ext, opts, t0, textMax, view) {
+    if (view === "grid") { return parseSheetGrid(u8, ext, opts, t0, textMax); }
     if (!G.XLSX || typeof G.XLSX.read !== "function") {
       return Promise.reject(officeError("worker", "解析库未就绪(SheetJS)"));
     }
@@ -298,17 +429,44 @@
     });
   }
 
-  /* 走 docstream 的附件通道收图(xlsx/xls);失败不当成解析失败 —— 图像只是辅助信息 */
+  /* 走 docstream 的附件通道收图(xlsx/xls);失败不当成解析失败 —— 图像只是辅助信息。
+     S6c:附件名 → 表名(docstream AST;仅 xlsx/xls)写进 item.sheet,供 appD 的「图→表」映射读 */
   function collectOfficeImages(u8, ext) {
     var sink = new ImageSink();
     if (!G.officeParser || typeof G.officeParser.parseOffice !== "function") {
       return Promise.resolve(sink);
     }
+    var sheetOf = null;                       /* pptx 不走这里;老格式(doc/xls/ppt)的 attachments 恒空 */
     return G.officeParser.parseOffice(toAB(u8), { extractAttachments: true }).then(function (ast) {
+      if (ext === "xlsx" || ext === "xls") { sheetOf = sheetOfAttachments(ast); }
       var atts = (ast && ast.attachments) || [];
-      for (var i = 0; i < atts.length; i++) { addOfficeAttachment(sink, atts[i]); }
+      for (var i = 0; i < atts.length; i++) {
+        var nm = (atts[i] && atts[i].name) ? String(atts[i].name) : "";
+        addOfficeAttachment(sink, atts[i], null, null, (sheetOf && nm && sheetOf[nm]) ? sheetOf[nm] : "");
+      }
       return sink;
     }, function () { return sink; });
+  }
+
+  /* 附件名 → 表名(xlsx/xls;与 pptxSlideOfAttachments 同法:docstream AST 的
+     `metadata.attachmentName` ↔ `attachments[].name` **精确相等**,不做模糊匹配;
+     同名附件取**首次**出现的工作表,文档顺序)。只有 sheet 节点带表名,子节点继承;
+     认不出 ⇒ 该附件无键 ⇒ 调用方写 "" ⇒ appD 落 page=0(文末 + 如实注记,不猜) */
+  function sheetOfAttachments(ast) {
+    var map = {}, sheets = (ast && ast.content) || [], i;
+    function walk(node, sheetName) {
+      if (!node) { return; }
+      var md = node.metadata;
+      var nm = md ? md.attachmentName : null;
+      if (typeof nm === "string" && nm && !map[nm]) { map[nm] = sheetName; }
+      var kids = node.children;
+      if (kids) { for (var j = 0; j < kids.length; j++) { walk(kids[j], sheetName); } }
+    }
+    for (i = 0; i < sheets.length; i++) {
+      var s = sheets[i];
+      walk(s, (s && s.metadata && s.metadata.sheetName) || "");
+    }
+    return map;
   }
 
   function attachmentBytes(data) {
@@ -319,12 +477,13 @@
     if (data.buffer) { return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength); }
     return null;
   }
-  function addOfficeAttachment(sink, a, label, page) {
+  /* sheet(S6c)= 归属表名(xlsx/xls 由 collectOfficeImages 传;其余调用方不传 ⇒ "") */
+  function addOfficeAttachment(sink, a, label, page, sheet) {
     var mime = (a && (a.mimeType || a.mime)) || "";
     if (!a || a.type !== "image" || !IMG_MIME[mime]) { sink.skipped++; return; }
     var u8 = attachmentBytes(a.data);
     if (!u8 || !u8.length) { sink.skipped++; return; }
-    var item = sink.add(mime, u8, label, page);
+    var item = sink.add(mime, u8, label, page, sheet);
     /* S11b:调用方显式给了页号(含 0 = pptx 认不出归属)时按**调用方的语义**落定 ——
        sink 的 `numOf(page) || idx` 兜底会把 0 改写成整篇序号,这里覆盖回来;
        没给页号(docx/xlsx,page === undefined)时保持 sink 的兜底(整篇序号),行为与批前一致。 */
@@ -487,7 +646,7 @@
       var run;
       try {
         if (e === "docx") { run = parseDocx(u8, opts, t0, textMax); }
-        else if (e === "xlsx" || e === "xls") { run = parseSheet(u8, e, opts, t0, textMax); }
+        else if (e === "xlsx" || e === "xls") { run = parseSheet(u8, e, opts, t0, textMax, sheetViewOf(opts)); }
         else { run = parseByDocstream(u8, e, opts, t0, textMax); }
       } catch (err2) { reject(classify(err2)); return; }
       run.then(function (r) { resolve(r); }, function (err3) {
@@ -516,7 +675,9 @@
       var id = m.id;
       core.parse(m.buf, m.ext, {
         onProgress: function (phase) { postToMain({ type: "progress", id: id, phase: phase }); },
-        textMax: m.textMax
+        textMax: m.textMax,
+        sheetView: m.sheetView,
+        docxAnchor: m.docxAnchor
       }).then(function (result) {
         var transfer = [];
         for (var i = 0; i < result.images.length; i++) {
