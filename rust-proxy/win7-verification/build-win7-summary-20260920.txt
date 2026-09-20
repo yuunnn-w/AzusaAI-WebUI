@@ -1,12 +1,12 @@
 build-win7 一键构建汇总（方案 §9 Phase 4W / P6-K11 双产物）
-时间：2026-09-20 21:18:54
+时间：2026-09-20 21:57:36
 变体：开源（默认上游来源：缺省回退（脚本显式关闭注入））
 本次默认上游：http://127.0.0.1:8080
 目标：x86_64-win7-windows-msvc（工具链 nightly-2026-06-03）
 exe：C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe
 exe 字节：1477120
-exe md5：4d02938d4e2ffa1a985a19d6afc153fa
-exe sha256：e4c656737fe826b42e3b7bede2170bb42715686d3947773638d52bed8619cef7
+exe md5：6208f86a579f6fca3ec4b9212de65dde
+exe sha256：192b9336aec4b3ccc672b306be83ef9e284ea31bbda5479421060c6b6cf5fc89
 FileVersion：0.1.0（Cargo.toml = 0.1.0）
 四道验证退出码：0
 dist 产物：azusa-local-proxy-win7-x64.exe（若失败项 > 0 则不写 dist）

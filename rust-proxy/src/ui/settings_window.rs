@@ -20,6 +20,9 @@
 //! 4. **日志级别 = 窗口内覆盖层下拉**（P8-UI2）：字段是自绘 `BUTTON`（井 + chevron），列表是
 //!    **子窗口覆盖层**（`STATIC`+`SS_OWNERDRAW`，展开时 `HWND_TOP`）—— 不新开 `WS_POPUP` 顶层窗、
 //!    不抢焦点；点项即选中并收起、点其它处 / `Esc` / 失焦收起；hover 走 60 ms 节拍器（见 [`DROPDOWN_HOVER_MS`]）；
+//!    ⚠ **命中测试**（P8-UI3 真机缺陷修复）：`STATIC` 默认 `WM_NCHITTEST = HTTRANSPARENT` ⇒ 鼠标
+//!    消息会下探到下方兄弟控件；覆盖层必须自己返回 `HTCLIENT`（见 [`list_subclass`]），
+//!    `WS_CLIPSIBLINGS` / `WindowFromPoint` 都照不到这条；
 //! 5. **结果行三态 + 失败提示条**归 A 组行为面：文本来自 `Status.apply_message`，墨色读
 //!    `Status.apply_stage`（`Failed` ⇒ `✗` + 红 + 3 DIP 竖条与顶部提示条）。
 
@@ -43,13 +46,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetDlgItem, GetParent, GetSystemMetrics, GetWindowLongPtrW, KillTimer,
     SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     ShowWindow, SystemParametersInfoW, BS_OWNERDRAW, CREATESTRUCTW, CW_USEDEFAULT, ES_AUTOHSCROLL,
-    ES_NUMBER, GWLP_USERDATA, HMENU, HWND_TOP, SM_CYCAPTION, SM_CYSIZEFRAME, SPI_GETWORKAREA,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    ES_NUMBER, GWLP_USERDATA, HMENU, HTCLIENT, HWND_TOP, SM_CYCAPTION, SM_CYSIZEFRAME,
+    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 use azusa_local_proxy::logging::{Logger, LOG_RING_CAPACITY};
@@ -1776,6 +1779,9 @@ fn update_dropdown_hover(ui: &mut UiState) {
 /// 为什么是子窗口而不是 `WS_POPUP`：子窗口天然盖住同级控件（覆盖层语义）、跟着父窗一起移动/销毁、
 /// 不抢焦点、不进任务栏、不需要第二条消息循环；`WS_POPUP` 还要处理"点外面 ⇒ 收起"的全局键鼠钩子
 /// （本仓**不引入**钩子类 API，见 README「不挂钩」）。
+///
+/// ⚠ 子窗口的**命中测试**要自己收口：`STATIC` 默认 `WM_NCHITTEST` 返回 `HTTRANSPARENT`，
+/// 鼠标消息会下探到下方兄弟控件（`WS_CLIPSIBLINGS` 挡不住）—— 见 [`list_subclass`] 的 P8-UI3 说明。
 fn create_overlay(hinst: HINSTANCE, parent: HWND) -> HWND {
     let class = wide("STATIC");
     let empty = wide("");
@@ -1808,7 +1814,7 @@ fn point_y(lparam: LPARAM) -> i32 {
     ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32
 }
 
-/// 列表覆盖层的子类过程：左键 ⇒ 命中项（坐标在**列表客户区**坐标系里）。
+/// 列表覆盖层的子类过程：命中测试 ⇒ `HTCLIENT`；左键 ⇒ 命中项（坐标在**列表客户区**坐标系里）。
 unsafe extern "system" fn list_subclass(
     hwnd: HWND,
     message: u32,
@@ -1817,6 +1823,20 @@ unsafe extern "system" fn list_subclass(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if message == WM_NCHITTEST {
+        // **P8-UI3 真机缺陷（用户报障：点开下拉后闪烁、选不中）**：`STATIC` 的默认命中测试返回
+        // `HTTRANSPARENT`（真机读数 = -1）⇒ 系统把鼠标消息在**同线程内继续下探**给下方的兄弟控件
+        // （覆盖层正下方就是 Allow-Origin 段的 `BUTTON`）—— 覆盖层**永远收不到** `WM_LBUTTONDOWN`：
+        // 点为"选中列表项"实际点到段按钮（段被选中 + 拿到焦点 ⇒ 字段 `WM_KILLFOCUS` ⇒ 列表被收起），
+        // 日志级别一次都改不动，面板随点击一闪一闪。
+        //
+        // 机制要点：`WS_CLIPSIBLINGS` 只管**绘制裁剪**（它让下方控件不画到覆盖层上，ui2 的遮挡修复靠它），
+        // 对**命中测试**毫无作用；而 `WindowFromPoint` 不看 `WM_NCHITTEST` ⇒ 上一轮用
+        // `PostMessage(WM_COMMAND)` + `WindowFromPoint` 探针都照不到这条（真鼠标路径才暴露）。
+        // 这里把命中面收回覆盖层自己的矩形：展开期列表优先，收起期覆盖层 `SW_HIDE`（不可见 ⇒ 不参与命中）。
+        // 判据：`dropdown_overlay_owns_hit_test_while_open_and_steps_aside_when_closed`。
+        return LRESULT(HTCLIENT as isize);
+    }
     if message == WM_LBUTTONDOWN {
         let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
         let y = point_y(lparam);
@@ -2893,6 +2913,11 @@ mod tests {
     use azusa_local_proxy::config::Config;
     use azusa_local_proxy::service::{APPLY_DRAIN_TEXT, STOPPED_TEXT, STOP_TEXT};
     use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetDlgCtrlID, GetWindow, GetWindowRect, IsWindowVisible, GW_CHILD,
+        GW_HWNDNEXT, HTTRANSPARENT, SW_HIDE, WS_EX_NOACTIVATE, WS_POPUP,
+    };
 
     fn visible_items(settings: &SettingsPlan) -> Vec<&PlanItem> {
         settings.items.iter().filter(|item| item.visible).collect()
@@ -3614,6 +3639,197 @@ mod tests {
             assert!(width + theme.px(DROPDOWN_TEXT_PAD) * 3 <= field.w);
         }
         unsafe { ReleaseDC(None, hdc) };
+    }
+
+    /// 测试父窗的窗口过程：只走 `DefWindowProcW`（本测只发 `WM_NCHITTEST`，不需要 `UiState`）。
+    unsafe extern "system" fn hit_test_parent_wndproc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    /// 窗口速记（断言失败消息里点名"解析落到了谁身上"）。
+    fn window_tag(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 64];
+        let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
+        let class = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+        format!("{class}#{}", unsafe { GetDlgCtrlID(hwnd) })
+    }
+
+    /// **命中解析**（复刻系统对同线程子窗的规则）：z 序**自前往后**，第一个
+    /// "可见 ∧ 含该点 ∧ `WM_NCHITTEST ≠ HTTRANSPARENT`"的子窗；都不满足 ⇒ 父窗自己。
+    ///
+    /// `x/y` = **屏幕坐标**（`WM_NCHITTEST` 的 lparam 就是屏幕坐标）。
+    /// 这条规则正是真机现象的成因：覆盖层（`STATIC`）答 `HTTRANSPARENT` ⇒ 消息继续下探，
+    /// 被下方的兄弟控件接走。
+    fn hit_test_child(parent: HWND, x: i32, y: i32) -> HWND {
+        let lparam = (((y & 0xFFFF) << 16) | (x & 0xFFFF)) as isize;
+        let mut child = unsafe { GetWindow(parent, GW_CHILD) }.unwrap_or_default();
+        while !child.is_invalid() {
+            let mut rect = RECT::default();
+            let contains = unsafe { GetWindowRect(child, &mut rect) }.is_ok()
+                && x >= rect.left
+                && x < rect.right
+                && y >= rect.top
+                && y < rect.bottom;
+            if contains && unsafe { IsWindowVisible(child).as_bool() } {
+                let answer =
+                    unsafe { SendMessageW(child, WM_NCHITTEST, None, Some(LPARAM(lparam))) };
+                if answer.0 as i32 != HTTRANSPARENT {
+                    return child;
+                }
+            }
+            child = unsafe { GetWindow(child, GW_HWNDNEXT) }.unwrap_or_default();
+        }
+        parent
+    }
+
+    /// **P8-UI3 回归（真缺陷面）**：下拉覆盖层的**鼠标命中顺序** —— 展开时列表吃鼠标、
+    /// 收起时不拦截下方控件。
+    ///
+    /// 装置 = **真窗口**（无消息泵，纯 `WM_NCHITTEST` 面）：屏幕外的父窗（测试类 + `DefWindowProcW`）
+    /// 加一个**压在覆盖层正下方**的同级 `BUTTON`（模拟真机那一排：Allow-Origin 段 / 日志按钮 /
+    /// 关闭行为段），再加真 [`create_overlay`]。采样点 = 4 个列表项中心（与 [`select_dropdown_item`]
+    /// 的命中算法同源常量）。
+    ///
+    /// 能咬的负例（把"列表优先"改回"控件优先"必须 FAIL）：
+    /// ① 删掉 [`list_subclass`] 的 `WM_NCHITTEST` 分支 ⇒ `STATIC` 默认 `HTTRANSPARENT` ⇒
+    ///    展开态解析落到下方按钮（真机读数：按钮拿到焦点 + 段被选中，日志级别改不了）；
+    /// ② 收起时不隐藏覆盖层（`close_dropdown` 少一行 `SW_HIDE`）⇒ 收起态判据 FAIL。
+    #[test]
+    fn dropdown_overlay_owns_hit_test_while_open_and_steps_aside_when_closed() {
+        let theme = Theme::new(192);
+        let hinst: HINSTANCE = unsafe { GetModuleHandleW(None) }.unwrap_or_default().into();
+        let class_name = wide("AzusaP8Ui3HitTestParent");
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(hit_test_parent_wndproc),
+            hInstance: hinst,
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        // 同类只注册一次（重复注册报 ERROR_CLASS_ALREADY_EXISTS，无害）
+        let _ = unsafe { register_class_w_checked(&window_class) };
+        let empty = wide("");
+        let parent = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(empty.as_ptr()),
+                WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0),
+                -4000,
+                -4000,
+                320,
+                480,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+        }
+        .unwrap_or_default();
+        assert!(!parent.is_invalid(), "测试父窗创建失败");
+        // 覆盖层矩形 = 4 项 + 面板内边距 + 投影余量（与 `dropdown_list_rect` 同源常量）
+        let pad = theme.px(DROPDOWN_SHADOW_MARGIN + DROPDOWN_PANEL_PAD);
+        let item_h = theme.px(DROPDOWN_ITEM_H).max(1);
+        let list_w = theme.px(96.0);
+        let list_h = item_h * LOG_LEVELS.len() as i32 + pad * 2;
+        let sibling_class = wide("BUTTON");
+        let sibling_text = wide("下方控件");
+        // 下方同级控件：与覆盖层**同矩形**（真机上覆盖的就是这一排控件）
+        let sibling = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(sibling_class.as_ptr()),
+                PCWSTR(sibling_text.as_ptr()),
+                WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS).0 | BS_OWNERDRAW as u32),
+                20,
+                100,
+                list_w,
+                list_h,
+                Some(parent),
+                Some(HMENU(IDC_SEG_CORS[0] as *mut core::ffi::c_void)),
+                Some(hinst),
+                None,
+            )
+        }
+        .unwrap_or_default();
+        let overlay = create_overlay(hinst, parent);
+        assert!(
+            !sibling.is_invalid() && !overlay.is_invalid(),
+            "覆盖层/下方控件创建失败"
+        );
+        // 判据 ⓪：**创建即隐藏**（`create_overlay` 不带 `WS_VISIBLE`；展开由 `open_dropdown` 显式给）
+        // —— 收起期的覆盖层不参与命中。负例：给 `create_overlay` 的样式补 `WS_VISIBLE` 必 FAIL。
+        assert!(
+            !unsafe { IsWindowVisible(overlay).as_bool() },
+            "覆盖层创建时必须是隐藏的（否则收起期它会挡住下方控件）"
+        );
+        // 展开：与 `open_dropdown` 同口径（`HWND_TOP` + 显示 + 同矩形）
+        unsafe {
+            let _ = SetWindowPos(
+                overlay,
+                Some(HWND_TOP),
+                20,
+                100,
+                list_w,
+                list_h,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+        }
+        // 判据 ①：覆盖层必须排在 z 序最前（否则命中会被上方兄弟抢走）
+        let top_child = unsafe { GetWindow(parent, GW_CHILD) }.unwrap_or_default();
+        assert_eq!(
+            top_child.0,
+            overlay.0,
+            "覆盖层不在 z 序最前（最前 = {}）",
+            window_tag(top_child)
+        );
+        // 判据 ②：展开态 —— 4 个列表项中心的命中解析都必须落在覆盖层
+        let mut overlay_rect = RECT::default();
+        assert!(unsafe { GetWindowRect(overlay, &mut overlay_rect) }.is_ok());
+        for index in 0..LOG_LEVELS.len() {
+            let x = (overlay_rect.left + overlay_rect.right) / 2;
+            let y = overlay_rect.top + pad + item_h * index as i32 + item_h / 2;
+            let lparam = (((y & 0xFFFF) << 16) | (x & 0xFFFF)) as isize;
+            let answer = unsafe { SendMessageW(overlay, WM_NCHITTEST, None, Some(LPARAM(lparam))) };
+            assert_ne!(
+                answer.0 as i32, HTTRANSPARENT,
+                "覆盖层的 WM_NCHITTEST = HTTRANSPARENT（第 {index} 项采样点 {x},{y}）\
+                 ⇒ 鼠标消息会下探给下方兄弟控件：列表永远收不到 WM_LBUTTONDOWN"
+            );
+            let resolved = hit_test_child(parent, x, y);
+            assert_eq!(
+                resolved.0,
+                overlay.0,
+                "展开态：第 {index} 项中心 ({x},{y}) 的命中解析不是覆盖层，而是 {}",
+                window_tag(resolved)
+            );
+        }
+        // 判据 ③：收起态（`close_dropdown` 的口径 = `SW_HIDE`）—— 覆盖层不得再拦截
+        unsafe {
+            let _ = ShowWindow(overlay, SW_HIDE);
+        }
+        assert!(
+            !unsafe { IsWindowVisible(overlay).as_bool() },
+            "收起后覆盖层仍可见（收起路径没落下 SW_HIDE）"
+        );
+        for index in 0..LOG_LEVELS.len() {
+            let x = (overlay_rect.left + overlay_rect.right) / 2;
+            let y = overlay_rect.top + pad + item_h * index as i32 + item_h / 2;
+            let resolved = hit_test_child(parent, x, y);
+            assert_eq!(
+                resolved.0,
+                sibling.0,
+                "收起态：第 {index} 项中心 ({x},{y}) 仍被覆盖层拦截（解析 = {}）",
+                window_tag(resolved)
+            );
+        }
+        unsafe {
+            let _ = DestroyWindow(parent);
+        }
     }
 
     /// **P8-UI2 下拉（映射面）**：索引 ↔ 配置字符串的往返（`fill_fields` / `apply_fields` 共用）。
