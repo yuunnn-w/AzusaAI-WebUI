@@ -48,6 +48,11 @@ const LOG_PANEL_LINES: usize = 100;
 pub const LOG_PANEL_LINE_BYTES: usize = 200;
 
 /// A-16 曲线成本诊断行的周期（秒）—— 每周期结算一次"帧数 / 单帧最大调用数 / 单帧最大耗时"。
+///
+/// **P8-UI4 读数口径补充**：自 100 ms 亚秒滚动节拍（`main_window::TIMER_ANIM`）起，**可见**窗口
+/// 的 `帧=` 从 ≈60/周期 抬到 ≈600/周期（10 Hz），**单帧调用数不变**（恒 ≤16，与数据形态无关）。
+/// 判据仍是"**调用数/帧** 与 **绘制路径零分配**"两条结构判据；`帧=` 变大**不是**回归，而是滚动的
+/// 代价旋钮（`ANIM_MS`）在读数上的显形；隐藏/最小化时仍为 **0**。
 const CURVE_DIAG_PERIOD_SECS: u64 = 60;
 
 /// FR-39 提示条文案（**写死**，与方案 §6.3 一致：必须同时说清"探针属预期"与"真实对话要改设置"）。
@@ -79,6 +84,10 @@ pub struct UiState {
     /// 曲线几何缓冲（§2.5.2：`CurveGeometry` **无状态**，缓冲归调用方持有 ⇒ 每帧 `clear()` 复用，
     /// 绘制路径 **0 次 `Vec` 分配** —— A-16②）。
     pub curve_geometry: curve::CurveGeometry,
+    /// **亚秒滚动相位**（P8-UI4）：当前秒内已过的比例 `[0,1)`（真源 = `Window::subsecond_fraction()`）。
+    /// 由 1 s 的 `refresh()` 与 **100 ms** 的 `main_window::TIMER_ANIM` 共同刷新；`paint` 只读它 ⇒
+    /// 绘制路径**零统计调用**（A-13b② 的静态面不受影响）。
+    pub second_frac: f32,
     /// 卡片数值的 19/17/15 档字体（21 档 = `theme.font_number`；§2.4.3 的阶梯）。
     pub number_fonts: theme::NumberFonts,
     /// A-16 诊断：本报告周期内的重绘帧数（结算后归零；隐藏到托盘时为 0 = 不重绘的证据）。
@@ -146,6 +155,7 @@ impl UiState {
             window,
             window_series,
             curve_geometry: curve::CurveGeometry::new(),
+            second_frac: 0.0,
             number_fonts,
             curve_frames: 0,
             curve_calls: 0,
@@ -185,6 +195,8 @@ impl UiState {
         // 几何**不在这里算**：绘图区尺寸随窗口变（`layout()`）⇒ 由 `paint()` 每帧按当前布局投影，
         // 否则拖窗口后曲线会停在旧比例上（最坏 1 s）。
         self.window_series = stats.window().series(WINDOW_SECS);
+        // P8-UI4：**亚秒滚动相位**（与序列同帧取一次；100 ms 节拍另有 `tick_anim` 独立刷新）
+        self.second_frac = stats.window().subsecond_fraction();
         self.close_action = self.status.config.ui.close_action.clone();
 
         // 按钮：启停热切换的就地文字 + "去设置改端口"只在绑定失败态出现
@@ -282,6 +294,51 @@ impl UiState {
         emit_curve_diag(self);
 
         main_window::invalidate(self);
+    }
+
+    /// **亚秒滚动节拍**（P8-UI4；`main_window::TIMER_ANIM`）：只刷新"当前秒内已过比例"并请求一次重绘。
+    ///
+    /// 三条纪律：
+    /// ① **不跑 `refresh()`** —— 快照 / 托盘 / 文档窗仍归 1 s 节拍（本函数是**纯相位**更新）；
+    /// ② **不可见 / 最小化 ⇒ 直接返回**；
+    /// ③ **"最近还有流量"才动**（`curve_has_recent_traffic`）—— 曲线静止时不为它烧 5 倍重绘。
+    ///    真机读数（A-16④ 对照臂）：整帧重绘 ≈ **16 ms**，10 Hz 无闸 ⇒ **15.95 % 单核**（不可接受）；
+    ///    加闸 + 200 ms 后空闲回到 ≈ 基线（0.2 % 单核档），有流量时才付这份代价 ——
+    ///    读数与口径见 `shared/progress/rust-proxy-p8-ui4-done.md`。
+    ///
+    /// 绘制路径仍**零统计调用**（相位存在 `UiState` 字段里，`paint` 只读字段 ⇒ A-13b② 静态面不变）。
+    pub fn tick_anim(&mut self) {
+        if !self.window_visible() {
+            return;
+        }
+        let minimized = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+            IsIconic(self.hwnd).as_bool()
+        };
+        if minimized {
+            return;
+        }
+        if !self.curve_has_recent_traffic() {
+            return;
+        }
+        self.second_frac = self.controller.stats().window().subsecond_fraction();
+        main_window::invalidate(self);
+    }
+
+    /// 最近 3 秒里还有**带速率的样本** ⇒ 曲线正在"动"（只有这时才值得花高频重绘）。
+    ///
+    /// 读的是 `window_series`（1 Hz 快照）⇒ **零 `stats` 调用**、每拍 O(3)；序列末点是"进行中的那一秒"，
+    /// 所以取尾 3 点（当前秒 + 前面两秒）足够判定"刚发生过流量"。
+    fn curve_has_recent_traffic(&self) -> bool {
+        let tail = self.window_series.len().saturating_sub(3);
+        self.window_series
+            .get(tail..)
+            .map(|slice| {
+                slice.iter().any(|point| {
+                    point.bytes_in_per_sec.is_some() || point.bytes_out_per_sec.is_some()
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// 地址行（§7.1：始终显示**实际**监听地址 + 上游）。

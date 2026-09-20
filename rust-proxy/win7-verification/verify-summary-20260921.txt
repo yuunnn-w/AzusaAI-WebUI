@@ -2,10 +2,10 @@ verify-win7 归档摘要（命令原文 + 读数；Analyzer 报告落点 = 分�
 
 exe = C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe
 FileVersion = 0.1.0
-运行起点 = 2026-09-20 23:49:01
+运行起点 = 2026-09-21 00:02:23
 analyzer 命令 = "C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\YY.Depends.Analyzer.exe" "C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe" /Target:6.1.7600 /IgnoreReady /ReportView:Table
 analyzer rc = 0
-analyzer 报告 = C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\azusa-local-proxy.exe.md（md5 33b2c8fbe48134047dfd272133bf2286，已复制 analyzer-win7-x64-0.1.0-20260920.md）
+analyzer 报告 = C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\azusa-local-proxy.exe.md（md5 33b2c8fbe48134047dfd272133bf2286，已复制 analyzer-win7-x64-0.1.0-20260921.md）
 analyzer 已搜索路径 = C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\azusa-local-proxy.exe.md ; C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\azusa-local-proxy.md ; C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe.md
 objdump ① DLL Name = kernel32.dll | ws2_32.dll | ntdll.dll | oleaut32.dll | user32.dll | gdiplus.dll | comctl32.dll | gdi32.dll | shell32.dll | KERNEL32.dll | ADVAPI32.dll | msvcrt.dll
 objdump ① 清单外 DLL = （无）

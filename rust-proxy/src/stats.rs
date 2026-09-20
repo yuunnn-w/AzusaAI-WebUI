@@ -36,10 +36,15 @@ pub struct Stats {
     /// 那两个走 `upstream_errors` / `upstream_timeouts`）。
     upstream_4xx: AtomicU64,
     upstream_5xx: AtomicU64,
-    /// D7：**全局累计字节计数**（面板 `↑B/↓B` 与曲线的"每秒边界快照"**同源**）。
-    /// 放进 `Arc<ByteTotals>` 的理由：`Window` 也要读它（**每秒首样本**各 2 次 `load`），
-    /// 而**热路径的写入面一字不变**（`forward.rs` 每 chunk 仍然只有这一次 `fetch_add` ——
-    /// D1/D7 明令不得新增每 chunk 原子写）。
+    /// **全局累计字节计数**（面板 `↑B/↓B` 的唯一口径）。曲线侧的"同源"由 [`Stats::add_bytes_in`] /
+    /// [`Stats::add_bytes_out`] 在**同一处**顺带写近窗每秒桶保证（单一调用点 ⇒ 不会各说各话）。
+    ///
+    /// ⚠ **P8-UI4 的显式口径变更（如实登记）**：D1/D7 曾明令"**不得新增每 chunk 原子写**"，所以曲线
+    /// 当时只能读"每秒首样本的**边界快照**"——而边界快照只由**请求级事件**触发 ⇒ 一条 20 s 的流式响应
+    /// 期间一个桶都不产生、曲线**整条不出现**（真机实测：实传 136 KB、面板角标仍 `0 s / 120 s`）。
+    /// 本批为修根因，**每 chunk 新增 1 次 `Relaxed` load + 1~2 次 `fetch_add`**（[`Window::record_bytes`]）
+    /// —— 代价读数与理由见 `shared/progress/rust-proxy-p8-ui4-done.md`；**接线点仍只有这一处**
+    /// （`forward.rs` 每 chunk 一次）。
     bytes: std::sync::Arc<ByteTotals>,
     /// 本修复批（L2/L4）：连接池重置次数（"失败即弃池"的机制计数，**不是**错误 ⇒ 不进 `total_errors`）。
     pool_flushes: AtomicU64,
@@ -102,9 +107,6 @@ impl Stats {
     /// 方案 §4.1 明写"不要让 `Stats` 的 `#[derive(Default)]` 去推导 `Window`" ⇒ `Stats` 不再 derive `Default`。
     #[allow(clippy::new_without_default)] // 同上：构造必经本函数（它再经 `Window::new()`）⇒ 不提供 Default
     pub fn new() -> Stats {
-        // D7：全局累计字节计数放进共享的 `Arc<ByteTotals>`（`Stats` 与 `Window` 各持一份引用；
-        // 曲线要读"每秒边界"，但**热路径的写入面一字不变** —— 仍只有 `forward.rs` 每 chunk 那一次 `fetch_add`）。
-        let bytes = std::sync::Arc::new(ByteTotals::default());
         Stats {
             total: AtomicU64::new(0),
             preflight: AtomicU64::new(0),
@@ -115,7 +117,7 @@ impl Stats {
             client_aborted: AtomicU64::new(0),
             upstream_4xx: AtomicU64::new(0),
             upstream_5xx: AtomicU64::new(0),
-            bytes: std::sync::Arc::clone(&bytes),
+            bytes: std::sync::Arc::new(ByteTotals::default()),
             pool_flushes: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             active: AtomicI64::new(0),
@@ -123,7 +125,7 @@ impl Stats {
             latency_buckets: (0..LATENCY_BUCKET_UPPER_MS.len())
                 .map(|_| AtomicU64::new(0))
                 .collect(),
-            window: Window::with_totals(bytes),
+            window: Window::new(),
             errors: Mutex::new(VecDeque::new()),
         }
     }
@@ -179,14 +181,19 @@ impl Stats {
         self.retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 请求体字节（发往上游的 ↑）。
+    /// 请求体字节（发往上游的 ↑）—— **与曲线同源的一处**（P8-UI4：全局累计与近窗每秒速率一起动，
+    /// 见 [`Stats::window`] 的 `record_bytes`）。
     pub fn add_bytes_in(&self, bytes: u64) {
         self.bytes.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+        let window = self.window();
+        window.record_bytes(window.slice_now(), bytes, 0);
     }
 
-    /// 响应体字节（上游回给客户端的 ↓）。
+    /// 响应体字节（上游回给客户端的 ↓）—— 同 [`Stats::add_bytes_in`]。
     pub fn add_bytes_out(&self, bytes: u64) {
         self.bytes.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+        let window = self.window();
+        window.record_bytes(window.slice_now(), 0, bytes);
     }
 
     /// FR-30：记录一次"请求 → 上游响应头"延迟（毫秒）。
@@ -375,7 +382,8 @@ const CLEARING: u64 = u64::MAX;
 /// 面板延迟读数与 J-B1b/J-B1c 的诚实性判据仍以它为观测面（删掉 = 既有判据失去观测点）。
 const SERIES_OVERFLOW_Y_MS: u64 = 10_000;
 
-/// D7：**全局累计字节计数**（面板 `↑B/↓B` 与曲线"每秒边界快照"的**同一来源**）。
+/// D7：**全局累计字节计数**（面板 `↑B/↓B` 的同一来源；**P8-UI4** 起曲线的每秒速率也由这两个计数的
+/// **同一处出口**（[`Stats::add_bytes_in`] / [`Stats::add_bytes_out`]）顺带写进近窗桶）。
 ///
 /// `Window` 只在**每秒首样本**各 `load` 一次（2 次 `load` + 2 次 `store`/秒）；
 /// **热路径的写入面一字不变** —— 仍然只有 `forward.rs` 每 chunk 那一次 `fetch_add`。
@@ -386,7 +394,8 @@ pub(crate) struct ByteTotals {
 }
 
 /// 一个 1 秒桶：**18 个 `AtomicU64`** = `stamp` + `requests` + `preflight` + `errors` + `latency[12]`
-/// + **`bytes_in_at_t` / `bytes_out_at_t`**（D7：该秒**首次 touch 时**读到的全局累计字节计数）。
+/// + **`bytes_in` / `bytes_out`**（**P8-UI4**：该秒内**实际记录到的**请求/响应体字节，直接累计；
+///   不再做相邻秒边界差分）。
 ///   内存 = `18 × 8 B = 144 B`/桶 ⇒ 窗口 **`120 × 144 B = 17,280 B`**（一次性常数、无增长）。
 struct WinBucket {
     /// 两相：`slice`（本桶所属秒 = "就绪"）· `CLEARING`（有写者正在清零 ⇒ 读侧跳过）。
@@ -396,9 +405,10 @@ struct WinBucket {
     errors: AtomicU64,
     /// 复用既有 12 桶上界表（末桶 = `≥10s` 档）。
     latency: [AtomicU64; LATENCY_BUCKET_COUNT],
-    /// D7：该秒的**边界快照**（首次 touch 时的全局累计字节）。相邻秒差分 = 该秒 bytes/s。
-    bytes_in_at_t: AtomicU64,
-    bytes_out_at_t: AtomicU64,
+    /// **P8-UI4**：该秒的入向字节（发往上游的请求体）—— 速率 = 本值（不再读全局累计做差分）。
+    bytes_in: AtomicU64,
+    /// **P8-UI4**：该秒的出向字节（上游回给客户端的响应体）；语义同 `bytes_in`。
+    bytes_out: AtomicU64,
 }
 
 impl WinBucket {
@@ -412,12 +422,12 @@ impl WinBucket {
             preflight: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             latency: std::array::from_fn(|_| AtomicU64::new(0)),
-            bytes_in_at_t: AtomicU64::new(0),
-            bytes_out_at_t: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
         }
     }
 
-    /// 清零 15 个计数（**不含** `stamp`、**不含**边界快照 —— 后者在 `touch` 认领新秒时写）。
+    /// 清零 17 个计数（**不含** `stamp`）—— 每秒首样本认领新秒时调一次。
     fn clear_counts(&self) {
         self.requests.store(0, Ordering::Relaxed);
         self.preflight.store(0, Ordering::Relaxed);
@@ -425,6 +435,8 @@ impl WinBucket {
         for cell in self.latency.iter() {
             cell.store(0, Ordering::Relaxed);
         }
+        self.bytes_in.store(0, Ordering::Relaxed);
+        self.bytes_out.store(0, Ordering::Relaxed);
     }
 }
 
@@ -432,39 +444,32 @@ impl WinBucket {
 /// —— 累计口径仍是 `Stats::snapshot()` 的唯一口径（访问行 `累计 …` 与既有判据不受影响）。
 ///
 /// 成本口径：`record_*` **只做原子加**（零新增锁、零新增分配；`slice` 由调用方每请求算一次）；
-/// 每秒首样本多 2 次 `load` + 2 次 `store`（D7 的边界快照）；
-/// `snapshot()` / `series()` 是读出口，**只在 1 Hz 节拍被调用**，不进任何请求路径。
+/// 每秒首样本多 1 次 CAS + 17 次 `store`（认领新秒时清零）；
+/// **P8-UI4** 另加：**每 chunk** 1 次 `Relaxed` load + 1~2 次 `fetch_add`（[`Window::record_bytes`]）；
+/// `snapshot()` / `series()` 是读出口，**只在 1 Hz 节拍被调用**（`subsecond_fraction()` 另有每 100 ms
+/// 一次时钟读，**不碰任何桶**），都不进请求路径。
 pub struct Window {
     /// 进程内起点（构造时取一次）⇒ `slice_now()` = 自起点起的秒号。
     base: Instant,
     buckets: [WinBucket; WINDOW_SECS as usize],
-    /// D7：全局累计字节（与 `Stats::snapshot()` 的 `↑B/↓B` **同源**）⇒ 每秒边界快照的读数口。
-    totals: std::sync::Arc<ByteTotals>,
     /// 有界丢弃计数（`CLEARING` 期间 / 回退戳的样本）——可见读数，判据用 `≥/≤`（D1）。
     dropped: AtomicU64,
 }
 
 impl Window {
-    /// 便捷构造面（**自建**一组字节计数；UI 与单测用 —— `Stats::window()` 给的是与面板同源的那组）。
-    ///
-    /// 为什么不是 `Default`（方案 §4.1 的 P2-6）：`Instant` 无 `Default`、`[WinBucket; 120]` 超数组
-    /// `Default` 的 32 上限 ⇒ 走 `std::array::from_fn`；**不** derive `Default`、**不**动既有 `latency_buckets`。
+    /// 构造面（**不** derive `Default`：`Instant` 无 `Default`、`[WinBucket; 120]` 超数组 `Default` 的
+    /// 32 上限 ⇒ 走 `std::array::from_fn`；方案 §4.1 的 P2-6）。
     #[allow(clippy::new_without_default)] // 构造即取 base = Instant::now()（显式初始化动作）⇒ 不提供 Default
     pub fn new() -> Window {
-        Window::with_totals(std::sync::Arc::new(ByteTotals::default()))
-    }
-
-    /// `Stats` 用的构造面：注入**同一个** `Arc<ByteTotals>` ⇒ 面板 `↑B/↓B` 与曲线边界快照同源。
-    pub(crate) fn with_totals(totals: std::sync::Arc<ByteTotals>) -> Window {
         Window {
             base: Instant::now(),
             buckets: std::array::from_fn(|_| WinBucket::new()),
-            totals,
             dropped: AtomicU64::new(0),
         }
     }
 
-    /// 当前秒号（自 `base` 起算）。请求路径**每请求算一次**后向下传（B-3：避免每个记录点各读一次时钟）。
+    /// 当前秒号（自 `base` 起算）。请求路径**每请求算一次**后向下传（B-3：避免每个记录点各读一次时钟）；
+    /// 字节路径**每 chunk 算一次**（P8-UI4：`record_bytes` 的 `slice` 由调用点传入，见 `Stats::add_bytes_in/out`）。
     pub fn slice_now(&self) -> u64 {
         self.base.elapsed().as_secs()
     }
@@ -498,6 +503,32 @@ impl Window {
                 cell.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// 每 **chunk** 1 次（P8-UI4；`Stats::add_bytes_in/out` 的同源出口）：把该 chunk 的字节记进
+    /// **它到达的那一秒**的桶 ⇒ 该秒速率 = 桶内直接累计（不再做相邻秒边界差分）。
+    ///
+    /// **为什么必须按 chunk 记（P8-UI4 的根因修法）**：旧实现只在**请求级事件**（`record_request` /
+    /// `record_preflight` / `record_latency_ms` / `record_error`）上写"边界快照"，而一条 20 s 的流式
+    /// 响应期间**一个请求级事件都没有** ⇒ 期间每个点都 `None` ⇒ 曲线**整条不出现**（真机实测：
+    /// 流式 chat 实传 136 KB，面板角标仍 `0 s / 120 s`）。
+    /// 成本：常见路径 = 1 次 `Relaxed` load（本秒桶已就绪）+ 1~2 次 `fetch_add`；**每 chunk 每方向 1 次**
+    /// `slice_now()`（时钟读）——该成本声明已由独立复验对照 `forward.rs:487/649` 两个出口核实。
+    pub fn record_bytes(&self, slice: u64, bytes_in: u64, bytes_out: u64) {
+        if let Some(bucket) = self.touch(slice) {
+            if bytes_in > 0 {
+                bucket.bytes_in.fetch_add(bytes_in, Ordering::Relaxed);
+            }
+            if bytes_out > 0 {
+                bucket.bytes_out.fetch_add(bytes_out, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// **亚秒相位**（P8-UI4）：当前秒内已过的比例 `[0, 1)` —— 与 [`Window::slice_now`] 同一个
+    /// `base` 时钟（曲线按它**平滑左移**；只影响 X 平移，不产生任何新读数）。
+    pub fn subsecond_fraction(&self) -> f32 {
+        self.base.elapsed().as_secs_f32().fract()
     }
 
     /// 近窗聚合（面板 4 张卡 / 延迟行 / 流量行的近窗部分）。**只在 1 Hz 节拍调用**（B-6）。
@@ -547,8 +578,11 @@ impl Window {
 
     /// 逐秒序列的实现（`cur` 显式传入 ⇒ 单测可注入时间戳）。
     ///
-    /// **D7**：速率 = **相邻秒边界差分**（`t(s) − t(s−1)`）。差分要求两个相邻秒**都可比**：
-    /// 该秒或前一秒缺桶 ⇒ 该点 `rate = None`（**断线**，不是 0）—— 与"无桶秒"同一套语义。
+    /// **P8-UI4**：速率 = 该秒桶内**直接累计的字节**（`bytes_in` / `bytes_out`）—— 只要该秒有桶
+    /// （该秒里发生过任何请求/字节事件）就有速率；**零字节也是真读数**（`Some(0)`）。
+    /// 无桶 / 陈旧桶 / `CLEARING` ⇒ 整点 `None`（**断线**，不是 0）。
+    /// 序列**末点 = 进行中的那一秒**（值还在长）：`ui/curve.rs` 把它**排除在折线之外**，也不拿它当
+    /// "当前值"（后者读**最新的完整秒**）—— 调用方不要自己丢，丢的规则在几何层（有单测钉住）。
     fn series_at(&self, cur: u64, secs: u64) -> Vec<SeriesPoint> {
         let len = secs.min(WINDOW_SECS);
         let mut points = Vec::with_capacity(len as usize);
@@ -569,22 +603,12 @@ impl Window {
     /// 上一圈的陈旧桶 / `CLEARING`）**该点整体不可读** —— 全字段取默认值，**禁止读该桶的任何计数器**
     ///（陈旧桶里是 120 s 前的计数 ⇒ 直接读会把旧值画成"这一秒的 req/s" = 幽灵尖峰）。
     fn point_at(&self, slice: u64) -> SeriesPoint {
-        let Some(current) = self.boundary_at(slice) else {
+        let Some(current) = self.sample_at(slice) else {
             return SeriesPoint::absent();
         };
-        // D7：速率 = 本秒边界 − 前一秒边界；前一秒不可比 ⇒ `None`（**断线**，绝不补 0）。
-        // 计数器只增 ⇒ 差值不应为负；真出现回退（撕裂/重置）⇒ 同样判 `None`：
-        // 用饱和减法会给出一个假的 0，那是"不诚实读数"的典型来源。
-        let rate = match (slice > 0).then(|| self.boundary_at(slice - 1)).flatten() {
-            Some(previous) => match (
-                current.bytes_in.checked_sub(previous.bytes_in),
-                current.bytes_out.checked_sub(previous.bytes_out),
-            ) {
-                (Some(bytes_in), Some(bytes_out)) => Some((bytes_in, bytes_out)),
-                _ => None,
-            },
-            None => None,
-        };
+        // **P8-UI4**：速率 = 该秒桶内**实际记录到的**字节（直接累计，见 `touch`/`record_bytes`）——
+        // 只要该秒有桶（该秒里发生过任何请求/字节事件）就**有速率**；**零字节也是真读数**（`Some(0)`）。
+        // 无桶 / 陈旧桶 / `CLEARING` ⇒ 上面那一步已返回整点 `None`（**断线**，绝不补 0、不插值）。
         let p50 = percentile_ms_from_counts(&bucket_latency_counts(current.bucket), 50);
         // 末桶（`≥10s` 档）⇒ 该点 y 值落 10,000（**不**谎报 30,000），由 `latency_overflow` 标注
         let overflow = p50 == latency_overflow_upper_ms();
@@ -595,25 +619,26 @@ impl Window {
                 p50
             },
             latency_overflow: overflow,
-            bytes_in_per_sec: rate.map(|(bytes_in, _)| bytes_in),
-            bytes_out_per_sec: rate.map(|(_, bytes_out)| bytes_out),
+            bytes_in_per_sec: Some(current.bytes_in),
+            bytes_out_per_sec: Some(current.bytes_out),
             requests: current.requests,
         }
     }
 
-    /// 单秒的**边界读数**（D7）：`stamp == slice` 才可信。
+    /// 单秒读数（[`Window::sample_at`] 的返回体；借桶以复用延迟直方图读数）—— **唯一可信读法**：
+    /// `stamp == slice` 才可信（无桶 / 上一圈的陈旧桶 / `CLEARING` ⇒ `None`）。
     ///
     /// 用 `Acquire` 读就绪相 ⇒ 与 [`Window::touch`] 的 `Release` 发布配对 ⇒ 看到戳就**必然**看到
-    /// 已写好的边界字段（否则相邻秒差分可能读到一个 0 边界 = 假的巨峰）。
-    fn boundary_at(&self, slice: u64) -> Option<Boundary<'_>> {
+    /// 已经清过零的字节格（否则会读到上一个 120 s 周期留下的**残留值** = 假的巨峰）。
+    fn sample_at(&self, slice: u64) -> Option<Sample<'_>> {
         let bucket = self.buckets.get((slice % WINDOW_SECS) as usize)?;
         if bucket.stamp.load(Ordering::Acquire) != slice {
             return None;
         }
-        Some(Boundary {
+        Some(Sample {
             bucket,
-            bytes_in: bucket.bytes_in_at_t.load(Ordering::Relaxed),
-            bytes_out: bucket.bytes_out_at_t.load(Ordering::Relaxed),
+            bytes_in: bucket.bytes_in.load(Ordering::Relaxed),
+            bytes_out: bucket.bytes_out.load(Ordering::Relaxed),
             requests: bucket.requests.load(Ordering::Relaxed),
         })
     }
@@ -641,18 +666,9 @@ impl Window {
                 .is_ok()
             {
                 bucket.clear_counts();
-                // D7：**每秒首样本**的边界快照 —— 读全局累计字节（与面板 `↑B/↓B` 同源）。
-                // 顺序与内存序都是判据面的一部分：边界必须在 `stamp` 置成就绪相**之前**写好，
-                // 且就绪相用 `Release` 发布（读侧 `Acquire`）⇒ 读侧不可能看到"戳已就绪但边界还是 0"
-                // —— 那会让相邻秒差分出一个**假的巨峰**（正是"不谎报"要挡的那类错）。
-                bucket.bytes_in_at_t.store(
-                    self.totals.bytes_in.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
-                bucket.bytes_out_at_t.store(
-                    self.totals.bytes_out.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
+                // 内存序仍是判据面的一部分：**清零必须发生在 `stamp` 置成就绪相之前**，且就绪相用
+                // `Release` 发布（读侧 `Acquire`）⇒ 读侧不可能看到"戳已就绪但格子里还是**上一个
+                // 120 s 周期**的残留值" —— 那会把旧值当成"这一秒的速率" = 假的巨峰。
                 bucket.stamp.store(slice, Ordering::Release);
                 return Some(bucket);
             }
@@ -660,8 +676,11 @@ impl Window {
     }
 }
 
-/// 单秒边界读数（[`Window::boundary_at`] 的返回体；借桶以复用延迟直方图读数）。
-struct Boundary<'a> {
+/// 单秒读数（[`Window::sample_at`] 的返回体；借桶以复用延迟直方图读数）。
+///
+/// **P8-UI4**：字段 = 该秒桶内**直接累计**的字节（不再是"边界快照"）⇒ 速率 = 本结构体的
+/// `bytes_in` / `bytes_out`（无差分、无相邻秒前提）。
+struct Sample<'a> {
     bucket: &'a WinBucket,
     bytes_in: u64,
     bytes_out: u64,
@@ -679,10 +698,11 @@ pub struct SeriesPoint {
     pub latency_p50_ms: Option<u64>,
     /// `true` = 该秒 p50 落**末桶**（`≥10s` 档）⇒ 该点标 `≥10s`、y 值 = 10,000 ms（**禁止** 30,000）。
     pub latency_overflow: bool,
-    /// **D7**：该秒的入向速率（bytes/s）= 相邻秒边界差分；`None` = **断线**
-    ///（缺秒 / 无可比前一秒 / 计数回退）⇒ 折线断开、**不补 0、不插值**。
+    /// **P8-UI4**：该秒的入向速率（bytes/s）= 该秒桶内**直接累计**的请求体字节
+    ///（`Stats::add_bytes_in` 每 chunk 调一次）；**零字节也是真读数**（`Some(0)`）。
+    /// `None` = **断线**（该秒无桶 / 陈旧桶 / `CLEARING`）⇒ 折线断开、**不补 0、不插值**。
     pub bytes_in_per_sec: Option<u64>,
-    /// **D7**：该秒的出向速率（bytes/s）；语义同 `bytes_in_per_sec`（两者同生同灭）。
+    /// **P8-UI4**：该秒的出向速率（bytes/s）；语义同 `bytes_in_per_sec`（两者同生同灭）。
     pub bytes_out_per_sec: Option<u64>,
     /// 该秒桶内请求数；**不可读的秒恒为 0**（不得读陈旧桶计数器 —— 幽灵尖峰的来源）。
     pub requests: u64,
@@ -921,7 +941,8 @@ mod tests {
     /// ⇒ `× 120 = `**`17,280 B`**）。多一个字段本测试立刻红 —— 这是"桶字段面"的机械咬合面。
     ///
     /// D1 的 `16 × 8 = 128 B` / `15,360 B`（"不含字节"）**已由 D7 作废**：曲线改画速率 ⇒
-    /// 每桶 +2 格边界快照，`17,280 B` 从"上限口径"转为**设计点**。
+    /// 每桶 +2 格字节，`17,280 B` 从"上限口径"转为**设计点**。
+    /// **P8-UI4** 换的是这 2 格的**语义**（边界快照 → 该秒直接累计），**格数一字未动**（仍是 18）。
     #[test]
     fn window_bucket_stays_within_the_18_atomic_budget() {
         assert_eq!(std::mem::size_of::<AtomicU64>(), 8);
@@ -929,7 +950,7 @@ mod tests {
             std::mem::size_of::<WinBucket>(),
             18 * std::mem::size_of::<AtomicU64>(),
             "WinBucket 必须恰为 18 个 AtomicU64（stamp + requests + preflight + errors + latency[12] \
-             + bytes_in_at_t + bytes_out_at_t）"
+             + bytes_in + bytes_out）"
         );
         assert_eq!(
             std::mem::size_of::<WinBucket>() * WINDOW_SECS as usize,
@@ -938,81 +959,116 @@ mod tests {
         );
     }
 
-    /// 单测专用：直接写某秒的**边界快照**（不动全局计数，避免依赖真实时钟）。
-    fn plant_boundary(window: &Window, slice: u64, bytes_in: u64, bytes_out: u64) {
+    /// 单测专用：直接写某秒的**字节格**（不动全局计数，避免依赖真实时钟）。
+    /// **P8-UI4**：写的就是速率本身（每秒直接累计）⇒ 不再需要"造相邻秒边界"这一层。
+    fn plant_bytes(window: &Window, slice: u64, bytes_in: u64, bytes_out: u64) {
         if let Some(bucket) = window.buckets.get(slice as usize % WINDOW_SECS as usize) {
             bucket.stamp.store(slice, Ordering::Release);
-            bucket.bytes_in_at_t.store(bytes_in, Ordering::Relaxed);
-            bucket.bytes_out_at_t.store(bytes_out, Ordering::Relaxed);
+            bucket.bytes_in.store(bytes_in, Ordering::Relaxed);
+            bucket.bytes_out.store(bytes_out, Ordering::Relaxed);
         }
     }
 
-    /// 【D7】速率序列 = **相邻秒边界差分**；缺秒 / 无可比前一秒 ⇒ `None`（断线），**绝不补 0**。
+    /// 【P8-UI4】速率 = 该秒桶内**直接累计的字节**（不再是相邻秒边界差分）：**有桶就有速率**
+    ///（**零字节也是真读数** `Some(0)`），无桶 / 陈旧桶 ⇒ 整点 `None`（**断线**，绝不补 0）。
     ///
-    /// **负例（可咬）**：把"每秒边界快照"退化成"读当前全局计数但**不做差分**" ⇒ 各点等于累计值
-    /// （单调递增）⇒ 下面的 `assert_ne!(…, Some(3_000))` 与"差值 == 注入增量"两条都会红。
+    /// **负例（可咬）**：把 `point_at` 的 `stamp == slice` 校验去掉（读桶不看戳）⇒ 陈旧桶那条断言
+    /// 立刻红（9_999 会被当成"这一秒的速率" = 幽灵尖峰）。
     #[test]
-    fn d7_rate_is_the_adjacent_second_boundary_difference() {
+    fn p8ui4_rate_is_the_bytes_measured_inside_that_second() {
         let stats = Stats::new();
         let window = stats.window();
-        // 第 10 秒边界 = 0；第 11 秒 = (1,000, 2,000)；第 12 秒 = (3,000, 2,500)
-        plant_boundary(window, 10, 0, 0);
-        plant_boundary(window, 11, 1_000, 2_000);
-        plant_boundary(window, 12, 3_000, 2_500);
+        // 第 11 秒 = (1,000, 2,000)；第 12 秒 = (3,000, 2,500)
+        plant_bytes(window, 11, 1_000, 2_000);
+        plant_bytes(window, 12, 3_000, 2_500);
+        // 同槽的**陈旧桶**（另一圈的戳）：本秒 13 只看到 9_999 的残留 ⇒ 必须判不可读
+        if let Some(bucket) = window.buckets.get(13 % WINDOW_SECS as usize) {
+            bucket.stamp.store(13 + WINDOW_SECS, Ordering::Release);
+            bucket.bytes_in.store(9_999, Ordering::Relaxed);
+            bucket.bytes_out.store(9_999, Ordering::Relaxed);
+        }
 
-        let points = window.series_at(12, 4); // 覆盖 slice 9..12（旧→新）
+        let points = window.series_at(13, 4); // 覆盖 slice 10..13（旧→新）
         assert_eq!(points.len(), 4);
-        assert_eq!(points[0].bytes_in_per_sec, None, "slice 9 无桶");
         assert_eq!(
-            points[1].bytes_in_per_sec, None,
-            "slice 10 有桶但前一秒不可比 ⇒ 断线（不是「等于累计值」）"
+            points[0].bytes_in_per_sec, None,
+            "slice 10 无桶 ⇒ None（不补 0）"
         );
-        assert_eq!(points[1].bytes_out_per_sec, None);
-        assert_eq!(points[2].bytes_in_per_sec, Some(1_000), "11 − 10");
-        assert_eq!(points[2].bytes_out_per_sec, Some(2_000));
-        assert_eq!(points[3].bytes_in_per_sec, Some(2_000), "12 − 11");
-        assert_eq!(points[3].bytes_out_per_sec, Some(500));
-        // **负例的咬合面**：差分点不得等于边界累计值（漏差分 ⇒ points[3] 会是 3_000）
-        assert_ne!(points[3].bytes_in_per_sec, Some(3_000));
+        assert_eq!(points[0].bytes_out_per_sec, None);
+        assert_eq!(
+            points[1].bytes_in_per_sec,
+            Some(1_000),
+            "slice 11 = 桶内累计"
+        );
+        assert_eq!(points[1].bytes_out_per_sec, Some(2_000));
+        assert_eq!(
+            points[2].bytes_in_per_sec,
+            Some(3_000),
+            "slice 12 = 桶内累计"
+        );
+        assert_eq!(points[2].bytes_out_per_sec, Some(2_500));
+        assert_eq!(points[3].bytes_in_per_sec, None, "陈旧桶 ⇒ 整点不可读");
+        assert_ne!(points[3].bytes_in_per_sec, Some(9_999));
     }
 
-    /// 【D7】边界快照**与面板同源**：`Window` 读的就是 `Stats` 那两个全局原子（同一组计数）。
+    /// 【P8-UI4】**与面板同源**：`Stats::add_bytes_in/out` 一处**同时**动"面板累计 ↑/↓"与"曲线每秒桶"
+    /// —— 生产路径上这就是**同一个调用点**（`forward.rs` 每 chunk 一次）⇒ 曲线与面板不可能各说各话。
     #[test]
-    fn d7_boundary_snapshot_reads_the_same_global_counters_as_the_panel() {
+    fn p8ui4_byte_accounting_is_wired_at_the_same_call_site_as_the_panel_totals() {
         let stats = Stats::new();
+        // 与生产路径同一条出口
         stats.add_bytes_in(777);
         stats.add_bytes_out(333);
-        stats.window().record_request(5); // 第 5 秒**首样本** ⇒ 写边界
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.bytes_in, 777);
-        assert_eq!(snapshot.bytes_out, 333);
-        let bucket = stats
-            .window()
-            .buckets
-            .get(5 % WINDOW_SECS as usize)
-            .expect("第 5 秒的槽存在");
-        assert_eq!(
-            bucket.bytes_in_at_t.load(Ordering::Relaxed),
-            777,
-            "边界 = 面板 ↑B 的同源计数"
-        );
-        assert_eq!(bucket.bytes_out_at_t.load(Ordering::Relaxed), 333);
+        assert_eq!(snapshot.bytes_in, 777, "面板累计 ↑B");
+        assert_eq!(snapshot.bytes_out, 333, "面板累计 ↓B");
+
+        // 曲线侧：同源字节落进**当前秒**的桶。⚠ 两次 add 之间可能跨秒（极小概率）⇒ 按"最近两秒之和"
+        // 断言，避开时钟抖动的假失败（覆盖面不变：仍是"这一处出口"的记录面）。
+        let window = stats.window();
+        let cur = window.slice_now();
+        let points = window.series_at(cur, 2);
+        let sum_in: u64 = points
+            .iter()
+            .filter_map(|point| point.bytes_in_per_sec)
+            .sum();
+        let sum_out: u64 = points
+            .iter()
+            .filter_map(|point| point.bytes_out_per_sec)
+            .sum();
+        assert_eq!(sum_in, 777, "曲线速率 = 与面板同源的字节");
+        assert_eq!(sum_out, 333);
+        for point in points.iter() {
+            assert_eq!(point.requests, 0, "字节事件不冒充请求数");
+        }
     }
 
-    /// 【A-14'】速率侧的诚实性：**计数回退**（撕裂/重置）⇒ `None`（断线），
-    /// **不是** 0、也不是巨值（饱和减法会给假 0 ⇒ 这里咬死它）。
+    /// 【A-14'】速率侧的诚实性：**"没测到"与"测到 0"必须可区分** —— 无桶的那一秒是 `None`
+    ///（断线，**绝不补 0**），真有桶而一个字节都没过的那一秒是 `Some(0)`（真读数）。
+    ///
+    /// P8-UI4 改型说明：旧的"边界差分会算出假 0（饱和减法）"这条路径**已不存在**（直接累计无减法），
+    /// 但**"无桶不许当 0"** 这条口径**一字未改**，换成了"无桶 ⇒ `None`"这个更短的机械面。
     #[test]
-    fn a14_rate_never_lies_when_the_counter_goes_backwards() {
+    fn a14_no_bucket_is_none_while_a_measured_zero_is_some_zero() {
         let stats = Stats::new();
         let window = stats.window();
-        plant_boundary(window, 20, 5_000, 5_000);
-        plant_boundary(window, 21, 4_000, 6_000); // 入向回退
-        let points = window.series_at(21, 2);
+        // 第 21 秒：有桶（一次零字节事件）但一字节未过 ⇒ 真 0；第 20 / 22 秒：无桶
+        window.record_request(21);
+        let points = window.series_at(22, 3);
+        assert_eq!(points.len(), 3);
         assert_eq!(
-            points[1].bytes_in_per_sec, None,
-            "回退 ⇒ 断线（不得用饱和减法给假的 0）"
+            points[0].bytes_in_per_sec, None,
+            "slice 20 无桶 ⇒ None（不是 0）"
         );
-        assert_eq!(points[1].bytes_out_per_sec, None, "一对同生同灭");
+        assert_eq!(points[0].bytes_out_per_sec, None, "一对同生同灭");
+        assert_eq!(
+            points[1].bytes_in_per_sec,
+            Some(0),
+            "slice 21 有桶、真 0 ⇒ Some(0)"
+        );
+        assert_eq!(points[1].bytes_out_per_sec, Some(0));
+        assert_eq!(points[1].requests, 1);
+        assert_eq!(points[2].bytes_in_per_sec, None, "slice 22 无桶 ⇒ None");
     }
 
     /// 曲线 y 值口径与桶表同源：末桶（`≥10s`）的 y 值 = 倒数第二个桶上界（10,000 ms）。

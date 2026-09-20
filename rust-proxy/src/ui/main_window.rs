@@ -23,7 +23,6 @@ use windows::Win32::Graphics::Gdi::{
     DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
     DT_WORDBREAK, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
-use windows::Win32::Graphics::GdiPlus::PointF;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
 };
@@ -53,9 +52,23 @@ use super::theme::{
 };
 use super::{tray, UiState, MAIN_WINDOW_CLASS, PLAIN_TEXT_NOTICE, WM_APP_REFRESH};
 
-/// 主窗刷新定时器（§7.1：指标每 1 s 刷新）。
+/// 主窗 1 s 刷新定时器（§7.1：指标每 1 s 刷新）。
 const TIMER_REFRESH: usize = 1;
 const REFRESH_MS: u32 = 1000;
+/// **亚秒滚动定时器**（P8-UI4）：把曲线的"滚动"从"每秒跳一格"变成**连续平移**。
+///
+/// 只做两件事（不跑 `refresh()`）：① 取一次亚秒相位 `Window::subsecond_fraction()`；
+/// ② `invalidate` 一次 ⇒ **每帧成本 = 一次整帧重绘**。
+///
+/// ⚠ **`ANIM_MS` 是唯二的成本旋钮**（另一个 = `UiState::tick_anim` 的"最近有流量才动"闸）：
+/// 真机对照臂（A-16④ 口径，同一台机器、同一空闲窗）：
+/// - 旧版（只有 1 s 节拍）：`ΔCPU = 0.312 s / 18 s` ⇒ **0.217 % 单核**
+/// - 本批首测（100 ms 节拍、无闸）：`ΔCPU = 3.031 s / 19 s` ⇒ **15.95 % 单核** ✗ —— 整帧重绘 ≈ **16 ms/帧**，
+///   10 Hz 就是 0.16 s/s；
+///   ⇒ 收口 = **200 ms**（观感仍连续：窗口步长 ≈ 5.8 px/s ⇒ 1.15 px/步）+ **有空流量才动**的闸
+///   （空闲 18 s 窗回到 ≈ 基线；见 `tick_anim`）。
+const TIMER_ANIM: usize = 2;
+const ANIM_MS: u32 = 200;
 
 /// 按钮控件 ID（区间 1001–1099；托盘菜单从 2001 起，见 `ui/tray.rs`）。
 pub const IDC_TOGGLE_SERVICE: usize = 1001;
@@ -968,14 +981,20 @@ fn paint(ui: &mut UiState, hdc: windows::Win32::Graphics::Gdi::HDC, width: i32, 
     }
 }
 
-/// 画波动面板（I3-6 / **D7 改型**）：面板底 → 网格 + 中线 + 面积 + **分段**折线 → 图例 / 填充度角标 / 当前值。
+/// 画波动面板（I3-6 / **D7 改型** / **P8-UI4 滚动波形改型**）：面板底 → 网格 + 中线 + **淡色面积** +
+/// **连续**折线 → 图例 / 填充度角标 / 当前值。
+///
+/// **P8-UI4（2026-09-20）**：几何全部来自 `ui/curve.rs`（X = 时间轴 + 亚秒相位平移 + 末点不上图），
+/// 本函数只多了一步：面积改由 [`Gfx::fill_area_runs`] 按 `runs` **一次**填完（旧实现只填"第一个 ≥2
+/// 点的段"，其余段的面积是缺的），并**去掉了**旧实现在绘制路径里现搭的 `Vec<PointF>`（A-16②）。
 ///
 /// 几何**全部**来自 `ui/curve.rs`（无状态纯函数）：本函数只把几何画出来，**零 `stats` 调用**
 /// （A-13b② 的机械面）。
 ///
 /// 绘制调用数（A-16① 的读数）：**恒 10 次/帧**（`round_card` 2 + 井底 1 + 中线 1 + 网格 3 + 图例点 1
-/// + 面积 1 + 折线 1）—— 与**段数无关**（P2-① 收口：多段折线与孤立点由 `Gfx::polyline_runs`
-///   合成**单次** `GdipDrawPath`）。**空态 = 4**（面板 2 + 井底 1 + 图例点 1；空态没有折线）
+/// + 面积 1 + 折线 1）—— 与**段数无关**（P2-① 收口：多段折线 / 多段面积 / 孤立点分别由
+///   `Gfx::polyline_runs` / `Gfx::fill_area_runs` 合成**单次** `GdipDrawPath` / `GdipFillPath`）。
+///   **空态 = 4**（面板 2 + 井底 1 + 图例点 1；空态没有折线）
 ///   —— 口径：该数是**周期内单帧最大值**、与数据形态相关（有数据时恒 10）；4 的实测依据 =
 ///   同机 `段=0/点数=0` 窗读数 **11**（P2-③ 的 +7 注入）**− 注入的 7**（干净空态未单独实拍，
 ///   故写明推导链而不写成"实测 11"）。
@@ -1019,7 +1038,12 @@ unsafe fn paint_curve(
         w: (nominal.right - nominal.left) as f32,
         h: (nominal.bottom - nominal.top) as f32,
     };
-    curve::build(&ui.window_series, plot_rect, &mut ui.curve_geometry);
+    curve::build(
+        &ui.window_series,
+        plot_rect,
+        ui.second_frac,
+        &mut ui.curve_geometry,
+    );
     // C1（真机缺陷）：标签列宽 = 当前三个标签的**实测**最大宽；绘图区左缘随实测宽度右移
     // ⇒ 标签**永不进入绘图区、也永不被裁**（旧实现右对齐到一个拍脑袋带宽 + `DrawTextW` 裁左侧
     // ⇒ 真机上 `250ms/125ms/0ms` 退化成 `0ms/5ms/0ms`）。
@@ -1034,7 +1058,12 @@ unsafe fn paint_curve(
             w: (nominal.right - plot_left) as f32,
             ..plot_rect
         };
-        curve::build(&ui.window_series, plot_rect, &mut ui.curve_geometry);
+        curve::build(
+            &ui.window_series,
+            plot_rect,
+            ui.second_frac,
+            &mut ui.curve_geometry,
+        );
     }
     let geometry: &CurveGeometry = &ui.curve_geometry;
     let plot = RECT {
@@ -1209,25 +1238,16 @@ unsafe fn paint_curve(
     // = **单次 `GdipDrawPath`**。于是本函数每帧的绘制调用数**与段数无关**（恒 10 次）：
     //   面板 2 + 井底 1 + 中线 1 + 网格 3 + 图例点 1 + 面积 1 + 折线 1 = **10**。
     gfx.push_clip(plot);
-    if let Some((start, end)) = geometry
-        .runs
-        .iter()
-        .copied()
-        .find(|(start, end)| end - start >= 2)
-    {
-        let mut area: Vec<PointF> = Vec::with_capacity(end - start + 2);
-        area.push(PointF {
-            X: geometry.rate_points[start].X,
-            Y: plot.bottom as f32,
-        });
-        area.extend_from_slice(&geometry.rate_points[start..end]);
-        area.push(PointF {
-            X: geometry.rate_points[end - 1].X,
-            Y: plot.bottom as f32,
-        });
-        gfx.fill_polygon(&area, COLOR_ACCENT_SOFT);
-        ui.curve_calls += 1;
-    }
+    // 面积（**全部**分段一段不落；`fill_area_runs` = 一个 `GraphicsPath` 多闭合 figure ⇒ **单次**
+    // `GdipFillPath`，调用数与段数无关 ⇒ A-16① 的口径不变），且**零 `Vec` 分配**（旧实现每帧现搭
+    // 一个 `Vec<PointF>` 面积数组 ⇒ A-16② 的"绘制路径 0 次 `Vec` 分配"现在才真正成立）。
+    gfx.fill_area_runs(
+        &geometry.rate_points,
+        &geometry.runs,
+        plot.bottom as f32,
+        COLOR_ACCENT_SOFT,
+    );
+    ui.curve_calls += 1;
     gfx.polyline_runs(
         &geometry.rate_points,
         &geometry.runs,
@@ -1436,6 +1456,8 @@ pub unsafe extern "system" fn wndproc(
                         }
                     }
                     let _ = SetTimer(Some(hwnd), TIMER_REFRESH, REFRESH_MS, None);
+                    // P8-UI4：亚秒滚动节拍（100 ms；只更新相位 + 请求一次重绘，见 `tick_anim`）
+                    let _ = SetTimer(Some(hwnd), TIMER_ANIM, ANIM_MS, None);
                     ui.refresh();
                 });
                 if created.is_none() {
@@ -1456,6 +1478,9 @@ pub unsafe extern "system" fn wndproc(
                         }
                         ui.refresh();
                     });
+                } else if wparam.0 == TIMER_ANIM {
+                    // P8-UI4：亚秒相位 + 一次重绘（**不**重读快照/托盘/文档窗 ⇒ 10 Hz 的代价只在画一帧）
+                    with_ui(hwnd, |ui| ui.tick_anim());
                 }
                 LRESULT(0)
             }

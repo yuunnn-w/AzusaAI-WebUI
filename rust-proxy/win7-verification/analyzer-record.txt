@@ -2,7 +2,7 @@ Analyzer 报告归档记录（win7-verification/）
 命令："C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\YY.Depends.Analyzer.exe" "C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe" /Target:6.1.7600 /IgnoreReady /ReportView:Table
 退出码：0
 报告落点（主判据）：C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\azusa-local-proxy.exe.md
-报告 mtime：2026-09-20 21:57:33（本次运行起点 2026-09-20 21:57:32）
+报告 mtime：2026-09-21 00:02:23（本次运行起点 2026-09-21 00:02:23）
 报告 md5：33b2c8fbe48134047dfd272133bf2286
-归档副本：analyzer-win7-x64-0.1.0-20260920.md
+归档副本：analyzer-win7-x64-0.1.0-20260921.md
 注意：输入的 exe 路径为绝对 Windows 路径（报告 Ref Module 列含输入路径原文 ⇒ 换写法会改变报告字节）。

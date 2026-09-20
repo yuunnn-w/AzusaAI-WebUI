@@ -767,6 +767,60 @@ impl Gfx {
             let _ = GdipDeletePath(path);
         }
     }
+
+    /// **分段面积**（曲线下的淡色填充；**P8-UI4** 的"连续波形"外观件之一）。
+    ///
+    /// 与 [`Gfx::polyline_runs`] 同一收口口径（A-16①）：一个 `GraphicsPath`、**每段一个闭合 figure**
+    /// （折线段 + 基线回程）⇒ **单次 `GdipFillPath`**，调用数与段数**无关**。
+    /// 单点段**不填**（零宽多边形）—— 与折线侧的 2 px 短刻度对齐，不制造"一格宽的色块"。
+    pub fn fill_area_runs(
+        &self,
+        points: &[PointF],
+        runs: &[(usize, usize)],
+        baseline: f32,
+        color: u32,
+    ) {
+        if runs.is_empty() || points.is_empty() {
+            return;
+        }
+        let mut path: *mut GpPath = std::ptr::null_mut();
+        let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+        unsafe {
+            use windows::Win32::Graphics::GdiPlus::{
+                GdipAddPathLine2, GdipClosePathFigure, GdipFillPath, GdipStartPathFigure,
+            };
+            if GdipCreatePath(FillModeAlternate, &mut path).0 != 0 || path.is_null() {
+                return;
+            }
+            if GdipCreateSolidFill(color, &mut brush).0 != 0 || brush.is_null() {
+                let _ = GdipDeletePath(path);
+                return;
+            }
+            for (start, end) in runs.iter().copied() {
+                if end > points.len() || end <= start || end - start < 2 {
+                    continue;
+                }
+                let _ = GdipStartPathFigure(path);
+                let _ = GdipAddPathLine2(path, points[start..end].as_ptr(), (end - start) as i32);
+                let (first, last) = (points[start], points[end - 1]);
+                let back = [
+                    PointF {
+                        X: last.X,
+                        Y: baseline,
+                    },
+                    PointF {
+                        X: first.X,
+                        Y: baseline,
+                    },
+                ];
+                let _ = GdipAddPathLine2(path, back.as_ptr(), 2);
+                let _ = GdipClosePathFigure(path);
+            }
+            let _ = GdipFillPath(self.graphics, brush as *mut _, path);
+            let _ = GdipDeleteBrush(brush as *mut _);
+            let _ = GdipDeletePath(path);
+        }
+    }
 }
 
 impl Drop for Gfx {
