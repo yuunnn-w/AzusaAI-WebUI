@@ -5,9 +5,11 @@ AzusaAI WebUI 的**独立子项目**：一个便携单文件的本地反向代�
 **不改内网服务端、不改 AzusaAI 主程序**（主程序零代码改动）。Windows 7 SP1 及以上与现代 Windows 通用
 （仅依赖系统 `msvcrt.dll`，无运行库 / 安装器要求）。
 
-> **当前状态：Phase 6（批 6）收口**。本批把程序改为**无配置文件 · 零文件读写 · 零持久化**形态：
-> 配置只走命令行（运行期可在设置窗「应用」，仅本次运行、重启回默认）；日志只在内存（可复制到剪贴板）；
-> **不写注册表、不提供开机自启**；关闭按钮 = 进托盘、最小化 = 进任务栏；并交付**两个变体**（开源版 / 内网版，见下）。
+> **当前状态：Phase 7（批 7）已收口** —— 界面整体重排为 macOS 风格、新增**实时网络流量曲线**（上下行速率、
+> 单位自适应）、面板读数统一到**最近 120 s 时间窗**、日志窗限 **2,000 条**且可滚动、内置**8 章使用教程**
+> （「关于」窗口）。程序形态保持不变：**无配置文件 · 零文件读写 · 零持久化**——配置只走命令行（运行期可在
+> 设置窗「应用」，仅本次运行、重启回默认）；日志只在内存（可复制到剪贴板）；**不写注册表、不提供开机自启**；
+> 关闭按钮 = 进托盘、最小化 = 进任务栏；并交付**两个变体**（开源版 / 内网版，见下）。
 > Win7 **实机**冒烟仍未执行（本机无 Win7；覆盖声明见「覆盖范围声明」一节）。
 
 ---
@@ -16,8 +18,8 @@ AzusaAI WebUI 的**独立子项目**：一个便携单文件的本地反向代�
 
 | 变体 | 产物名 | 默认上游 | 字节 | sha256 |
 |---|---|---|---|---|
-| **开源版**（不注入） | `azusa-local-proxy-win7-x64.exe` | `http://127.0.0.1:8080` | 1,412,096 | `7471f53381c6beea6cbb40730875d0223d734f72f19243b8e8f2d597076bf04a` |
-| **内网版**（注入） | `azusa-local-proxy-win7-x64-internal.exe` | 构建时注入的内网地址 | 1,412,096 | `e007d93866fa2eb5e5dcb77e40689cf4a1b7cef8d441d6d48a4eed3110f25236` |
+| **开源版**（不注入） | `azusa-local-proxy-win7-x64.exe` | `http://127.0.0.1:8080` | 1,470,976 | `f810d09984cef9ea9ca8ebe30f1bb45427ae9835ed042bb33ed2c7fb28cf3de9` |
+| **内网版**（注入） | `azusa-local-proxy-win7-x64-internal.exe` | 构建时注入的内网地址 | 1,470,976 | `fcfbdc5659e0b2a8230dce2f973579e2a48c63064a4e79d14a026371203f1554` |
 
 - **同源同码**：两个变体由**同一份源码**构建，唯一差异 = 编译期注入的默认上游字符串；`--help` 打印**生效的默认值**
   （两版帮助文本只在这几处取值上不同）。
@@ -91,10 +93,10 @@ AzusaAI WebUI 的**独立子项目**：一个便携单文件的本地反向代�
     | 动态解析点 | 落点 | 用途 |
     |---|---|---|
     | `ntdll!RtlGetVersion` | `src/osver.rs:72,77` | Win7 上取真实系统版本（比静态导入面更小） |
-    | `dwmapi!DwmSetWindowAttribute` | `src/ui/mod.rs:615,616,625` | Win7 无此导出 ⇒ 动态取，失败自动跳过（深色标题栏） |
+    | `dwmapi!DwmSetWindowAttribute` | `src/ui/mod.rs`（动态取，3 处调用点 + 1 处文档注释） | Win7 无此导出 ⇒ 动态取，失败自动跳过（深色标题栏） |
 
-    判据 = `grep -rn "LoadLibrary|GetProcAddress" rust-proxy/src` = **7 行 / 2 文件**
-    （`osver.rs:6,72,77` · `ui/mod.rs:603,615,616,625`；其中 `:6` 与 `:603` 为文档注释）；
+    判据 = `grep -rnE "LoadLibrary|GetProcAddress" rust-proxy/src` = **7 行 / 2 文件**
+    （`src/osver.rs` · `src/ui/mod.rs`；各含一处**文档注释**。**不写行号**：行号随编辑漂移 ⇒ 按"文件 + 行数"核）；
     **新增任何第 3 处动态解析点即判缺陷**（构建期门禁与归档判据会咬）。
 
 **供内网管理员人工放行参考**
@@ -180,6 +182,10 @@ cargo test                                                                  # �
 cargo +nightly-2026-06-03 test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ```
+
+> ⚠ **跑门禁前先关掉注入**：Git Bash `export AZUSA_DEFAULT_UPSTREAM_OFF=1`、PowerShell `$env:AZUSA_DEFAULT_UPSTREAM_OFF='1'`。
+> 否则裸 `cargo` 会读本机 gitignored 的 `.internal-default.txt`，把内网默认注入 **dev/test 产物**（`target/**/debug/*.exe`）——
+> 只落 gitignored 的 `target/`、**绝不进 dist**（发布链 `build-win7.ps1` 显式关闭注入 + 对产物做 `Assert-Variant` 自证），但跑门禁时关掉更干净。
 
 ### 覆盖范围声明（诚实边界）
 

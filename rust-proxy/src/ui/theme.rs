@@ -8,18 +8,29 @@
 //! 字体回退链（§7.5 第 2 条，按序取第一个可用的）：`Segoe UI Variable Text` → `Segoe UI` →
 //! `Microsoft YaHei UI` → 系统默认（`DEFAULT_GUI_FONT` 的字体名）。中文由字体链接回退到
 //! 系统 CJK 字体渲染，无需单独指定。
+//!
+//! **分通道口径（P7 §2.1.1，写死）**：颜色令牌一律 `0xAARRGGBB`。
+//! - **GDI+ 路径**（`fill_round_rect` / `stroke_round_rect` / `fill_circle` / `line` / `polyline` /
+//!   `fill_polygon`）**直传 ARGB 常量** ⇒ alpha 生效（唯一带 alpha 的令牌 `COLOR_ACCENT_RING`
+//!   只允许走这条路径）；
+//! - **仅 GDI 路径**（`CreateSolidBrush` / `SetTextColor` / `WM_CTLCOLOR*` 返回的画刷）**必须经
+//!   [`gdi_color()`]** ⇒ **只允许不透明令牌**（α = `0xFF`）：`gdi_color` 产 `COLORREF = 0x00BBGGRR`，
+//!   **alpha 被丢弃**（本模块单测自证）—— 把半透明令牌喂给它 = 纯黑实心块。
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HINSTANCE;
+use windows::Win32::Foundation::{HINSTANCE, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, EnumFontFamiliesExW, GetDC, GetDeviceCaps,
-    ReleaseDC, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, HBRUSH, HDC,
-    HFONT, HGDIOBJ, LOGFONTW, LOGPIXELSX, OUT_DEFAULT_PRECIS, TEXTMETRICW,
+    GetTextExtentPoint32W, ReleaseDC, SelectObject, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_GUI_FONT, DEFAULT_PITCH, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, LOGPIXELSX,
+    OUT_DEFAULT_PRECIS, TEXTMETRICW,
 };
 use windows::Win32::Graphics::GdiPlus::{
-    FillModeAlternate, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill,
-    GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawPath,
-    GdipFillEllipse, GdipFillPath, GdipSetSmoothingMode, GpGraphics, GpPath, GpSolidFill,
+    CombineModeReplace, FillModeAlternate, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1,
+    GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
+    GdipDrawLines, GdipDrawPath, GdipFillEllipse, GdipFillPath, GdipFillPolygon, GdipResetClip,
+    GdipSetClipRect, GdipSetPenEndCap, GdipSetPenLineJoin, GdipSetPenStartCap,
+    GdipSetSmoothingMode, GpGraphics, GpPath, GpSolidFill, LineCapRound, LineJoinRound, PointF,
     SmoothingModeAntiAlias, UnitPixel,
 };
 use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR};
@@ -55,29 +66,108 @@ pub fn load_app_icon(hinst: HINSTANCE, size: i32) -> HICON {
 
 /// 配色（§7.5 第 3 条：浅色卡片 + 单一强调色 = 樱花粉「与主项目 `data-accent="sakura"` 一致」；
 /// 状态色只用于状态点与错误行）。ARGB 常量：`0xAARRGGBB`。
-pub const COLOR_BG: u32 = 0xFFF4F5F7;
+///
+/// P7 §2.1.1：既有常量名**一律不改名**（5 文件 67 处引用），只改值 + 新增缺失令牌；
+/// **叠色（悬停/按下）一律不透明预混实色**（禁半透明令牌直传 —— 见模块注释的分通道口径）。
+pub const COLOR_BG: u32 = 0xFFF5F5F7;
 pub const COLOR_CARD: u32 = 0xFFFFFFFF;
-pub const COLOR_CARD_BORDER: u32 = 0xFFE4E7EC;
-pub const COLOR_SEPARATOR: u32 = 0xFFE9EBEE;
-pub const COLOR_INK: u32 = 0xFF1F2937;
-pub const COLOR_INK_SOFT: u32 = 0xFF667085;
-pub const COLOR_INK_FAINT: u32 = 0xFF98A2B3;
+pub const COLOR_CARD_BORDER: u32 = 0xFFDCDCE1;
+pub const COLOR_SEPARATOR: u32 = 0xFFE5E5EA;
+pub const COLOR_INK: u32 = 0xFF1D1D1F;
+pub const COLOR_INK_SOFT: u32 = 0xFF6E6E73;
+pub const COLOR_INK_FAINT: u32 = 0xFF8E8E93;
 pub const COLOR_ACCENT_DEEP: u32 = 0xFFE8799A;
-/// 状态色（§7.5：绿 #16A34A / 黄 #D97706 / 红 #DC2626 / 灰 #9CA3AF）。
-pub const COLOR_GREEN: u32 = 0xFF16A34A;
-pub const COLOR_YELLOW: u32 = 0xFFD97706;
-pub const COLOR_RED: u32 = 0xFFDC2626;
-pub const COLOR_GRAY: u32 = 0xFF9CA3AF;
-pub const COLOR_NOTICE_BG: u32 = 0xFFFFF6E5;
-pub const COLOR_NOTICE_BORDER: u32 = 0xFFF5D9A8;
+/// 状态色（§7.5：绿 / 黄 / 红 / 灰）。P7 起**只用于状态点**；错误**文字**改用 [`COLOR_DANGER_INK`]。
+pub const COLOR_GREEN: u32 = 0xFF34C759;
+pub const COLOR_YELLOW: u32 = 0xFFFF9500;
+pub const COLOR_RED: u32 = 0xFFFF3B30;
+pub const COLOR_GRAY: u32 = 0xFF8E8E93;
+pub const COLOR_NOTICE_BG: u32 = 0xFFFFF4E5;
+pub const COLOR_NOTICE_BORDER: u32 = 0xFFF0D9A8;
 pub const COLOR_NOTICE_INK: u32 = 0xFF8A5A00;
+
+/// 曲线底 / 输入井（P7 §2.1.1 新增；**I3 曲线面板消费** ⇒ 本批显式 allow）。
+#[allow(dead_code)]
+pub const COLOR_SURFACE_SUNKEN: u32 = 0xFFFAFAFC;
+/// 聚焦态描边（**I3**：聚焦环描边；本批只落令牌）。
+#[allow(dead_code)]
+pub const COLOR_BORDER_STRONG: u32 = 0xFFC7C7CC;
+/// 禁用文本。
+pub const COLOR_INK_DISABLED: u32 = 0xFFC7C7CC;
+/// 错误**文字**（白底可读；与仅用于状态点的 [`COLOR_RED`] 分工）。
+pub const COLOR_DANGER_INK: u32 = 0xFFD70015;
+/// 主按钮悬停 / 按下（**不透明**）。按下态本批已用；悬停态待 I3 的自绘按钮悬停（需子类化）。
+pub const COLOR_ACCENT_PRESSED: u32 = 0xFFD9648A;
+#[allow(dead_code)]
+pub const COLOR_ACCENT_HOVER: u32 = 0xFFF08CA8;
+/// 焦点环 —— **全仓唯一带 alpha 的令牌**，只准走 GDI+（`stroke_round_rect` 直传 ARGB）。
+pub const COLOR_ACCENT_RING: u32 = 0x59E8799A;
+/// 叠色（不透明预混）：`base × (1 − a)`，悬停 `a = 6%`（悬停态待 I3 的自绘按钮悬停）。
+#[allow(dead_code)]
+pub const COLOR_HOVER_ON_CARD: u32 = 0xFFF0F0F0; // #FFFFFF × 0.94
+#[allow(dead_code)]
+pub const COLOR_HOVER_ON_CANVAS: u32 = 0xFFE6E6E8; // #F5F5F7 × 0.94
+/// 叠色（不透明预混）：按下 `a = 12%`。
+pub const COLOR_PRESS_ON_CARD: u32 = 0xFFE0E0E0; // #FFFFFF × 0.88
+#[allow(dead_code)]
+pub const COLOR_PRESS_ON_CANVAS: u32 = 0xFFD8D8D9; // #F5F5F7 × 0.88
+/// 分段控件选中底（`blend(#FFFFFF, #E8799A, 10%)`，不透明）。
+pub const COLOR_ACCENT_SOFT: u32 = 0xFFFDF2F5;
+/// 卡片下缘 1 DIP 的假阴影（不透明；**I3 卡片**消费）。
+#[allow(dead_code)]
+pub const COLOR_HAIRLINE_SHADE: u32 = 0xFFECECEE;
+
+/// 圆角（DIP；消费点一律经 `Theme::px()`）。
+pub const RADIUS_CARD: f32 = 10.0;
+pub const RADIUS_FIELD: f32 = 6.0;
+pub const RADIUS_BUTTON: f32 = 6.0;
+
+/// 间距阶梯（DIP）。
+/// `SPACE_L` / `SPACE_XL` 的主面板消费点在 I3 ⇒ 本批显式 allow（避免与 `-D warnings` 冲突）。
+pub const SPACE_XS: f32 = 4.0;
+pub const SPACE_S: f32 = 8.0;
+pub const SPACE_M: f32 = 12.0;
+#[allow(dead_code)]
+pub const SPACE_L: f32 = 16.0;
+#[allow(dead_code)]
+pub const SPACE_XL: f32 = 20.0;
+pub const SPACE_XXL: f32 = 24.0;
+
+/// 行高 / 行步 / 按钮高 / 页边距（设置窗行表的唯一真源）。
+pub const ROW_H: f32 = 24.0;
+pub const ROW_STEP: f32 = 30.0;
+pub const BTN_H: f32 = 32.0;
+/// 页边距（**I3 主面板**消费；设置窗用 `ui/settings_window.rs` 的 `PAD_LEFT/PAD_RIGHT`）。
+#[allow(dead_code)]
+pub const PAD_PAGE: f32 = 20.0;
+/// 卡片内 padding（**I3 卡片**消费）。
+#[allow(dead_code)]
+pub const PAD_CARD: f32 = 12.0;
+
+/// 主面板指标卡高（**I3 消费**；本批只落令牌）。
+#[allow(dead_code)]
+pub const CARD_H: f32 = 84.0;
+/// 曲线面板最小 / 最大高（**I3 消费**；本批只落令牌）。
+#[allow(dead_code)]
+pub const CURVE_MIN_H: f32 = 56.0;
+#[allow(dead_code)]
+pub const CURVE_MAX_H: f32 = 140.0;
 
 /// 字体尺寸（DIP；运行时 × scale 变成像素高度）。§7.5「字号不糊」= 每次 DPI 变化重建。
 const SIZE_UI: f32 = 13.0;
-const SIZE_SMALL: f32 = 11.5;
-const SIZE_TITLE: f32 = 19.0;
+const SIZE_SMALL: f32 = 11.0;
+const SIZE_TITLE: f32 = 22.0;
 const SIZE_NUMBER: f32 = 21.0;
 const SIZE_MONO: f32 = 12.0;
+/// 分组标题 / 曲线标题（P7 新增；**I3 曲线标题消费**）。
+#[allow(dead_code)]
+pub const SIZE_SECTION: f32 = 15.0;
+/// 正文 callout（地址行 mono 亦 12.0；**I3 消费**）。
+#[allow(dead_code)]
+pub const SIZE_CALLOUT: f32 = 12.0;
+/// 字重：正文 400 / 语义强调 600（P7：700 → 600，macOS 系统字体观感）。
+const WEIGHT_REGULAR: i32 = 400;
+const WEIGHT_SEMIBOLD: i32 = 600;
 
 pub struct Theme {
     pub dpi: u32,
@@ -89,6 +179,9 @@ pub struct Theme {
     pub font_title: HFONT,
     pub font_number: HFONT,
     pub font_mono: HFONT,
+    /// 分组标题字（P7 第 7 个字体对象；`delete()`/`rebuild()` 数组必须同步 —— A-10）。
+    #[allow(dead_code)]
+    pub font_section: HFONT,
     pub brush_bg: HBRUSH,
     pub brush_card: HBRUSH,
 }
@@ -106,6 +199,7 @@ impl Theme {
             font_title: HFONT::default(),
             font_number: HFONT::default(),
             font_mono: HFONT::default(),
+            font_section: HFONT::default(),
             brush_bg: HBRUSH::default(),
             brush_card: HBRUSH::default(),
         };
@@ -120,17 +214,19 @@ impl Theme {
         self.scale = dpi as f32 / 96.0;
         let scale = self.scale;
         let face = self.face.clone();
-        self.font_ui = create_font(&face, SIZE_UI, scale, false);
-        self.font_ui_bold = create_font(&face, SIZE_UI, scale, true);
-        self.font_small = create_font(&face, SIZE_SMALL, scale, false);
-        self.font_title = create_font(&face, SIZE_TITLE, scale, true);
-        self.font_number = create_font(&face, SIZE_NUMBER, scale, true);
-        self.font_mono = create_font("Consolas", SIZE_MONO, scale, false);
+        self.font_ui = create_font(&face, SIZE_UI, scale, WEIGHT_REGULAR);
+        self.font_ui_bold = create_font(&face, SIZE_UI, scale, WEIGHT_SEMIBOLD);
+        self.font_small = create_font(&face, SIZE_SMALL, scale, WEIGHT_REGULAR);
+        self.font_title = create_font(&face, SIZE_TITLE, scale, WEIGHT_SEMIBOLD);
+        self.font_number = create_font(&face, SIZE_NUMBER, scale, WEIGHT_SEMIBOLD);
+        self.font_mono = create_font("Consolas", SIZE_MONO, scale, WEIGHT_REGULAR);
+        self.font_section = create_font(&face, SIZE_SECTION, scale, WEIGHT_SEMIBOLD);
         self.brush_bg = unsafe { CreateSolidBrush(gdi_color(COLOR_BG)) };
         self.brush_card = unsafe { CreateSolidBrush(gdi_color(COLOR_CARD)) };
     }
 
     /// 释放 GDI 对象（退出前调用；重复调用安全）。
+    /// **字段清单必须与 `rebuild()` 的赋值一一对应**（漏一个 ⇒ GDI 基线法 A-10 必红）。
     pub fn delete(&mut self) {
         for font in [
             &mut self.font_ui,
@@ -139,6 +235,7 @@ impl Theme {
             &mut self.font_title,
             &mut self.font_number,
             &mut self.font_mono,
+            &mut self.font_section,
         ] {
             if !font.is_invalid() {
                 unsafe {
@@ -163,6 +260,13 @@ impl Theme {
     }
 }
 
+impl Drop for Theme {
+    /// 析构即释放（与 [`Theme::delete`] 幂等；防止"建了就丢"的路径漏 GDI 对象 —— A-10 的覆盖面）。
+    fn drop(&mut self) {
+        self.delete();
+    }
+}
+
 /// GDI 颜色（COLORREF = `0x00BBGGRR`；我们的常量是 `0xAARRGGBB` ⇒ 交换 R/B）。
 pub fn gdi_color(argb: u32) -> windows::Win32::Foundation::COLORREF {
     windows::Win32::Foundation::COLORREF(
@@ -170,7 +274,7 @@ pub fn gdi_color(argb: u32) -> windows::Win32::Foundation::COLORREF {
     )
 }
 
-fn create_font(face: &str, size_dip: f32, scale: f32, bold: bool) -> HFONT {
+fn create_font(face: &str, size_dip: f32, scale: f32, weight: i32) -> HFONT {
     let height = -((size_dip * scale).round() as i32);
     let face_wide = wide(face);
     unsafe {
@@ -179,7 +283,7 @@ fn create_font(face: &str, size_dip: f32, scale: f32, bold: bool) -> HFONT {
             0,
             0,
             0,
-            if bold { 700 } else { 400 },
+            weight,
             0,
             0,
             0,
@@ -193,9 +297,89 @@ fn create_font(face: &str, size_dip: f32, scale: f32, bold: bool) -> HFONT {
     }
 }
 
+/// 文本像素宽（`GetTextExtentPoint32W`；调用方自备 DC）。
+///
+/// 这是**裁切防御的唯一量宽入口**：设置窗的单行读数行在创建期用它复核，
+/// 超宽 ⇒ `logger.warn`（P3-1：不用 `debug_assert!` —— win7 release 档 `panic = "abort"`）。
+pub fn measure_text(hdc: HDC, font: HFONT, text: &str) -> i32 {
+    if text.is_empty() || font.is_invalid() {
+        return 0;
+    }
+    let mut buffer = wide(text);
+    buffer.pop(); // 去掉结尾 0：`GetTextExtentPoint32W` 吃 (指针, 字符数)
+    let mut size = SIZE::default();
+    unsafe {
+        let old = SelectObject(hdc, HGDIOBJ(font.0));
+        let ok = GetTextExtentPoint32W(hdc, &buffer, &mut size);
+        SelectObject(hdc, old);
+        if ok.as_bool() {
+            size.cx
+        } else {
+            0
+        }
+    }
+}
+
+/// 放不下 ⇒ 从尾部逐字符裁并加 `…`（结果总宽 ≤ `max_width`）；放得下 ⇒ 原样返回。
+/// 上限小到连 `…` 都放不下 ⇒ 返回空串（仍满足"总宽 ≤ 上限"）。
+pub fn fit_text(hdc: HDC, font: HFONT, text: &str, max_width: i32) -> String {
+    if max_width <= 0 {
+        return String::new();
+    }
+    if measure_text(hdc, font, text) <= max_width {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let mut candidate: String = chars.iter().collect();
+        candidate.push('…');
+        if measure_text(hdc, font, &candidate) <= max_width {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 /// 当前显示器 DPI（初始值；Per-Monitor 变化由 `WM_DPICHANGED` 通知）。
 /// **不用 `GetDpiForWindow`**（Win10 1607+ 的 API ⇒ 老系统静态导入即加载失败；
 /// 本模块只用 Win7 就有的 `GetDeviceCaps`）。
+/// 指定宽度下**折行后的文本高度**（`DrawTextW` + `DT_CALCRECT`）—— "裁切防御"的**量高**入口。
+///
+/// 为什么需要它（真机缺陷 P1-①）：卡片标签在窄窗折 2 行，而"2 行是否放得下"若按**常量**猜
+/// （如 `2 × 16 DIP`）就会漏算真实行高（`Segoe UI` 11 DIP 的行高 ≈ 13–15 DIP）⇒ 第二行被矩形底边裁掉。
+/// 与 [`measure_text`] 一起构成"量宽 + 量高"双判据的全部工具面。
+pub fn measure_wrapped_height(hdc: HDC, font: HFONT, text: &str, width: i32) -> i32 {
+    if text.is_empty() || font.is_invalid() || width <= 0 {
+        return 0;
+    }
+    let mut buffer = wide(text);
+    let length = buffer.len().saturating_sub(1);
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: 0,
+    };
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            DrawTextW, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK,
+        };
+        let previous = SelectObject(hdc, HGDIOBJ(font.0));
+        let mut measured = 0;
+        if let Some(slice) = buffer.get_mut(..length) {
+            measured = DrawTextW(
+                hdc,
+                slice,
+                &mut rect,
+                DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX,
+            );
+        }
+        SelectObject(hdc, previous);
+        measured
+    }
+}
+
 pub fn system_dpi() -> u32 {
     unsafe {
         let hdc = GetDC(None);
@@ -375,6 +559,153 @@ impl Gfx {
             }
         }
     }
+
+    /// 虚点线（曲线网格；§2.5.3 要求 `DashStyleDot`）。
+    ///
+    /// 与 [`Gfx::line`] 的唯一差别是笔的虚线样式；颜色同样**直传 ARGB**（GDI+ 通道 ⇒ 只有它安全）。
+    pub fn line_dashed(&self, x1: f32, y1: f32, x2: f32, y2: f32, color: u32, width: f32) {
+        let mut pen = std::ptr::null_mut();
+        unsafe {
+            use windows::Win32::Graphics::GdiPlus::{
+                DashStyleDot, GdipDrawLine, GdipSetPenDashStyle,
+            };
+            if GdipCreatePen1(color, width, UnitPixel, &mut pen).0 == 0 && !pen.is_null() {
+                let _ = GdipSetPenDashStyle(pen, DashStyleDot);
+                let _ = GdipDrawLine(self.graphics, pen, x1, y1, x2, y2);
+                let _ = GdipDeletePen(pen);
+            }
+        }
+    }
+
+    /// 折线（勾选标记 / 曲线；`round_join` ⇒ 圆角连接 + 圆头端点）。
+    ///
+    /// **GDI+ 路径直传 ARGB**（§2.1.1 分通道口径）⇒ 只有这条路径能安全吃 [`COLOR_ACCENT_RING`]。
+    pub fn polyline(&self, points: &[PointF], color: u32, width: f32, round_join: bool) {
+        if points.len() < 2 {
+            return;
+        }
+        let mut pen = std::ptr::null_mut();
+        unsafe {
+            if GdipCreatePen1(color, width, UnitPixel, &mut pen).0 == 0 && !pen.is_null() {
+                if round_join {
+                    let _ = GdipSetPenLineJoin(pen, LineJoinRound);
+                    let _ = GdipSetPenStartCap(pen, LineCapRound);
+                    let _ = GdipSetPenEndCap(pen, LineCapRound);
+                }
+                let _ = GdipDrawLines(self.graphics, pen, points.as_ptr(), points.len() as i32);
+                let _ = GdipDeletePen(pen);
+            }
+        }
+    }
+
+    /// 填充多边形（面积图 / 自绘三角；**I3 曲线**消费）。
+    #[allow(dead_code)]
+    pub fn fill_polygon(&self, points: &[PointF], color: u32) {
+        if points.len() < 3 {
+            return;
+        }
+        let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+        unsafe {
+            if GdipCreateSolidFill(color, &mut brush).0 == 0 && !brush.is_null() {
+                let _ = GdipFillPolygon(
+                    self.graphics,
+                    brush as *mut _,
+                    points.as_ptr(),
+                    points.len() as i32,
+                    FillModeAlternate,
+                );
+                let _ = GdipDeleteBrush(brush as *mut _);
+            }
+        }
+    }
+
+    /// 裁剪（矩形，替换模式）；与 [`Gfx::pop_clip`] 配对（曲线/井内绘制不越界；**I3 曲线**消费）。
+    #[allow(dead_code)]
+    pub fn push_clip(&self, rect: RECT) {
+        unsafe {
+            let _ = GdipSetClipRect(
+                self.graphics,
+                rect.left as f32,
+                rect.top as f32,
+                (rect.right - rect.left) as f32,
+                (rect.bottom - rect.top) as f32,
+                CombineModeReplace,
+            );
+        }
+    }
+
+    /// 恢复裁剪（`GdipResetClip`；**I3 曲线**消费）。
+    #[allow(dead_code)]
+    pub fn pop_clip(&self) {
+        unsafe {
+            let _ = GdipResetClip(self.graphics);
+        }
+    }
+    /// **多段折线 + 孤立点**：一个 `GraphicsPath`、多个 figure ⇒ **单次 `GdipDrawPath`**。
+    ///
+    /// 为什么需要它（审查 **P2-①**）：`None` 断点要求"逐段画"（不能跨缺口连起来），若每段一次
+    /// `GdipDrawLines`，调用数就随**数据形态**（段数）线性增长 ⇒ A-16① 的"≤16"变成数据依赖的界
+    /// （段数 > 7 即顶破，而实现并无错）。收口 = 把多段塞进**同一个路径**（每段一个 figure），
+    /// 孤立点画成 2 px 短刻度 ⇒ 每帧**恒定一次**绘制调用，与段数**无关**。
+    pub fn polyline_runs(
+        &self,
+        points: &[PointF],
+        runs: &[(usize, usize)],
+        color: u32,
+        width: f32,
+        round_join: bool,
+    ) {
+        if runs.is_empty() || points.is_empty() {
+            return;
+        }
+        let mut path: *mut GpPath = std::ptr::null_mut();
+        let mut pen = std::ptr::null_mut();
+        unsafe {
+            use windows::Win32::Graphics::GdiPlus::{
+                GdipAddPathLine2, GdipDrawPath, GdipStartPathFigure,
+            };
+            if GdipCreatePath(FillModeAlternate, &mut path).0 != 0 || path.is_null() {
+                return;
+            }
+            if GdipCreatePen1(color, width, UnitPixel, &mut pen).0 != 0 || pen.is_null() {
+                let _ = GdipDeletePath(path);
+                return;
+            }
+            if round_join {
+                let _ = GdipSetPenLineJoin(pen, LineJoinRound);
+                let _ = GdipSetPenStartCap(pen, LineCapRound);
+                let _ = GdipSetPenEndCap(pen, LineCapRound);
+            }
+            for (start, end) in runs.iter().copied() {
+                if end > points.len() || end <= start {
+                    continue;
+                }
+                let _ = GdipStartPathFigure(path);
+                if end - start >= 2 {
+                    // 连续 `PointF` 切片直接喂给 GDI+（`GdipAddPathLine2` 吃 (指针, 个数)）
+                    let _ =
+                        GdipAddPathLine2(path, points[start..end].as_ptr(), (end - start) as i32);
+                } else {
+                    // 孤立点（前后都是缺口）⇒ 2 px 短刻度：保住"有样本却看不见"的反面
+                    let lone = points[start];
+                    let tick = [
+                        PointF {
+                            X: lone.X - 1.0,
+                            Y: lone.Y,
+                        },
+                        PointF {
+                            X: lone.X + 1.0,
+                            Y: lone.Y,
+                        },
+                    ];
+                    let _ = GdipAddPathLine2(path, tick.as_ptr(), 2);
+                }
+            }
+            let _ = GdipDrawPath(self.graphics, pen, path);
+            let _ = GdipDeletePen(pen);
+            let _ = GdipDeletePath(path);
+        }
+    }
 }
 
 impl Drop for Gfx {
@@ -478,6 +809,76 @@ pub fn truncate_line(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// 卡片数值的**自适应字号阶梯**（UI 方案 §2.4.3；DIP）：21 → 19 → 17 → 15（+ **13 兜底档**）。
+///
+/// ⚠ **实施期实测补第 5 档 13**（依据 = `a15_main_panel_strings_fit_their_rects` 的 GDI 读数，
+/// 2026-09-20 现取）：`1,234,567` 在 **15 档下实测 69 px**，而 §2.4.3 的窄窗内宽只有 **63 DIP**
+/// ⇒ 四档阶梯在窄窗下**必然出 `…`**，与"禁 `…`"这条硬要求（A-5）直接冲突。补 13 档后窄窗
+/// 实测 ≈ 60 px ≤ 63 ✓，而"选定档 ≤ 15"的期望**依然成立**（13 ≤ 15）⇒ 这是**能力补强**，
+/// 不改 21/19/17/15 四档的顺序与语义。
+pub const NUMBER_LADDER_DIP: [f32; 5] = [21.0, 19.0, 17.0, 15.0, 13.0];
+
+/// 卡片数值的 19/17/15/13 四档字体（21 档见 [`Theme::font_number`]）。
+pub struct NumberFonts {
+    f19: HFONT,
+    f17: HFONT,
+    f15: HFONT,
+    f13: HFONT,
+}
+
+impl NumberFonts {
+    pub fn new(face: &str, scale: f32) -> NumberFonts {
+        NumberFonts {
+            f19: create_font(face, NUMBER_LADDER_DIP[1], scale, WEIGHT_SEMIBOLD),
+            f17: create_font(face, NUMBER_LADDER_DIP[2], scale, WEIGHT_SEMIBOLD),
+            f15: create_font(face, NUMBER_LADDER_DIP[3], scale, WEIGHT_SEMIBOLD),
+            f13: create_font(face, NUMBER_LADDER_DIP[4], scale, WEIGHT_SEMIBOLD),
+        }
+    }
+
+    /// 释放四个字体对象（幂等；DPI 重建前与退出前调用 —— 漏释放即 GDI 句柄泄漏）。
+    pub fn delete(&mut self) {
+        for font in [&mut self.f19, &mut self.f17, &mut self.f15, &mut self.f13] {
+            if !font.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(font.0));
+                }
+                *font = HFONT::default();
+            }
+        }
+    }
+
+    /// 逐级降字号，返回**放得下**的最大档（`(字体, 档位下标 ∈ 0..=4)`）。
+    ///
+    /// 判据 A-5：`1,234,567` 在卡片内宽 73 DIP（默认）与 63 DIP（窄窗）下选定档位 ≤ 15
+    /// ∧ 渲染文本**不含** `…`（现实现用 `DT_END_ELLIPSIS`，超宽会被压成 `1,23…` = 信息丢失）。
+    /// 全档都放不下 ⇒ 返回最小档（13），由调用方按需再兜底。
+    pub fn pick_index(
+        &self,
+        hdc: HDC,
+        theme: &Theme,
+        text: &str,
+        max_width: i32,
+    ) -> (HFONT, usize) {
+        let candidates = [theme.font_number, self.f19, self.f17, self.f15, self.f13];
+        for (index, font) in candidates.iter().enumerate() {
+            if font.is_invalid() {
+                continue;
+            }
+            if measure_text(hdc, *font, text) <= max_width {
+                return (*font, index);
+            }
+        }
+        (self.f13, NUMBER_LADDER_DIP.len() - 1)
+    }
+}
+
+impl Drop for NumberFonts {
+    fn drop(&mut self) {
+        self.delete();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +959,237 @@ mod tests {
         let wide = wide("运行");
         assert_eq!(wide.len(), 3);
         assert_eq!(wide[2], 0);
+    }
+
+    /// WCAG 相对亮度（sRGB 线性化；纯算术 ⇒ 与渲染无关）。
+    fn relative_luminance(argb: u32) -> f64 {
+        fn channel(value: u8) -> f64 {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.039_28 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        let red = ((argb >> 16) & 0xFF) as u8;
+        let green = ((argb >> 8) & 0xFF) as u8;
+        let blue = (argb & 0xFF) as u8;
+        0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+    }
+
+    fn contrast_ratio(foreground: u32, background: u32) -> f64 {
+        let first = relative_luminance(foreground);
+        let second = relative_luminance(background);
+        let (high, low) = if first > second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (high + 0.05) / (low + 0.05)
+    }
+
+    /// **A-4（判据）**：正文对照度 ≥ 4.5:1（改色最容易改坏可读性 ⇒ 纯算术防线）。
+    #[test]
+    fn text_contrast_meets_wcag_aa() {
+        for (name, foreground, background) in [
+            ("INK/BG", COLOR_INK, COLOR_BG),
+            ("INK_SOFT/CARD", COLOR_INK_SOFT, COLOR_CARD),
+            ("DANGER_INK/CARD", COLOR_DANGER_INK, COLOR_CARD),
+            ("NOTICE_INK/NOTICE_BG", COLOR_NOTICE_INK, COLOR_NOTICE_BG),
+        ] {
+            let ratio = contrast_ratio(foreground, background);
+            assert!(
+                ratio >= 4.5,
+                "{name} 对比度 {ratio:.2}:1 < 4.5:1（前景 {foreground:#010X} / 背景 {background:#010X}）"
+            );
+        }
+    }
+
+    /// **A-4b（判据）**：叠色令牌必须是**不透明预混实色**且 ≠ 纯黑；alpha 位只允许存在于焦点环。
+    ///
+    /// 咬的是这一灾难：把半透明令牌喂给 [`gdi_color()`]（抹掉 alpha）⇒ 悬停/按下变纯黑实心块。
+    /// A-4 抓不到它（A-4 只测不透明对），所以这里单独钉三条。
+    #[test]
+    fn blend_tokens_are_opaque_solids_never_black() {
+        // ① "≠ 纯黑"（4 条叠色令牌）
+        for (name, token) in [
+            ("HOVER_ON_CARD", COLOR_HOVER_ON_CARD),
+            ("HOVER_ON_CANVAS", COLOR_HOVER_ON_CANVAS),
+            ("PRESS_ON_CARD", COLOR_PRESS_ON_CARD),
+            ("PRESS_ON_CANVAS", COLOR_PRESS_ON_CANVAS),
+        ] {
+            assert_ne!(
+                token, 0xFF00_0000,
+                "COLOR_{name} 不得是纯黑（半透明令牌误喂 GDI 的后果）"
+            );
+            assert_eq!(token >> 24, 0xFF, "COLOR_{name} 必须不透明");
+        }
+        // ② 焦点环 = 全仓唯一 alpha 令牌，alpha 位 = 0x59 且未被改写
+        assert_eq!(COLOR_ACCENT_RING >> 24, 0x59);
+        assert_eq!(
+            COLOR_ACCENT_RING & 0x00FF_FFFF,
+            COLOR_ACCENT_DEEP & 0x00FF_FFFF
+        );
+        // ③ GDI 白名单：凡允许经 `gdi_color()` 的令牌，α 必须 = 0xFF
+        for (name, token) in [
+            ("BG", COLOR_BG),
+            ("CARD", COLOR_CARD),
+            ("CARD_BORDER", COLOR_CARD_BORDER),
+            ("SEPARATOR", COLOR_SEPARATOR),
+            ("INK", COLOR_INK),
+            ("INK_SOFT", COLOR_INK_SOFT),
+            ("INK_FAINT", COLOR_INK_FAINT),
+            ("ACCENT_DEEP", COLOR_ACCENT_DEEP),
+            ("ACCENT_HOVER", COLOR_ACCENT_HOVER),
+            ("ACCENT_PRESSED", COLOR_ACCENT_PRESSED),
+            ("ACCENT_SOFT", COLOR_ACCENT_SOFT),
+            ("GREEN", COLOR_GREEN),
+            ("YELLOW", COLOR_YELLOW),
+            ("RED", COLOR_RED),
+            ("GRAY", COLOR_GRAY),
+            ("NOTICE_BG", COLOR_NOTICE_BG),
+            ("NOTICE_BORDER", COLOR_NOTICE_BORDER),
+            ("NOTICE_INK", COLOR_NOTICE_INK),
+            ("SURFACE_SUNKEN", COLOR_SURFACE_SUNKEN),
+            ("BORDER_STRONG", COLOR_BORDER_STRONG),
+            ("INK_DISABLED", COLOR_INK_DISABLED),
+            ("DANGER_INK", COLOR_DANGER_INK),
+            ("HAIRLINE_SHADE", COLOR_HAIRLINE_SHADE),
+            ("HOVER_ON_CARD", COLOR_HOVER_ON_CARD),
+            ("HOVER_ON_CANVAS", COLOR_HOVER_ON_CANVAS),
+            ("PRESS_ON_CARD", COLOR_PRESS_ON_CARD),
+            ("PRESS_ON_CANVAS", COLOR_PRESS_ON_CANVAS),
+        ] {
+            assert_eq!(token >> 24, 0xFF, "COLOR_{name} 走 GDI 路径 ⇒ α 必须 0xFF");
+        }
+        // ④ 机理自证：`gdi_color()` 抹 alpha（不透明令牌安全、alpha 令牌必坏）
+        assert_eq!(gdi_color(COLOR_ACCENT_RING).0 >> 24, 0);
+        assert_ne!(
+            gdi_color(COLOR_HOVER_ON_CARD).0,
+            gdi_color(0xFF00_0000).0,
+            "叠色经 GDI 路径不得退化成纯黑"
+        );
+        // ⑤ 预混公式复算（分通道；防"改值改错一格"）
+        assert_eq!(COLOR_HOVER_ON_CARD, argb(0xFF, 0xF0, 0xF0, 0xF0));
+        assert_eq!(COLOR_HOVER_ON_CANVAS, argb(0xFF, 0xE6, 0xE6, 0xE8));
+        assert_eq!(COLOR_PRESS_ON_CARD, argb(0xFF, 0xE0, 0xE0, 0xE0));
+        assert_eq!(COLOR_PRESS_ON_CANVAS, argb(0xFF, 0xD8, 0xD8, 0xD9));
+        assert_eq!(COLOR_ACCENT_SOFT, argb(0xFF, 0xFD, 0xF2, 0xF5));
+    }
+
+    /// **A-8（判据）**：`fit_text` 恰好放得下 ⇒ 原样；超 1 px ⇒ 末尾 `…` 且总宽 ≤ 上限。
+    #[test]
+    fn fit_text_never_exceeds_its_budget() {
+        let theme = Theme::new(96);
+        unsafe {
+            let hdc = GetDC(None);
+            let text = "共 2000 / 上限 2000 条（已挤出 0）";
+            let exact = measure_text(hdc, theme.font_ui, text);
+            assert!(exact > 0, "量宽必须可用（GetDC/GetTextExtentPoint32W）");
+            assert_eq!(
+                fit_text(hdc, theme.font_ui, text, exact),
+                text,
+                "恰好放得下"
+            );
+            let tight = fit_text(hdc, theme.font_ui, text, exact - 1);
+            assert!(tight.ends_with('…'), "超宽必须带省略号：{tight}");
+            assert!(
+                measure_text(hdc, theme.font_ui, &tight) < exact,
+                "截断结果必须 ≤ 上限"
+            );
+            assert!(
+                text.starts_with(tight.trim_end_matches('…')),
+                "截断必须保留原串前缀：{tight}"
+            );
+            // 上限小到放不下省略号 ⇒ 空串（仍满足 ≤ 上限）
+            assert!(measure_text(hdc, theme.font_ui, &fit_text(hdc, theme.font_ui, text, 2)) <= 2);
+            // 空串 / 零宽边界
+            assert_eq!(fit_text(hdc, theme.font_ui, "", 10), "");
+            assert_eq!(fit_text(hdc, theme.font_ui, text, 0), "");
+            ReleaseDC(None, hdc);
+        }
+    }
+
+    fn gdi_object_count() -> u32 {
+        unsafe {
+            windows::Win32::System::Threading::GetGuiResources(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                windows::Win32::System::Threading::GR_GDIOBJECTS,
+            )
+        }
+    }
+
+    /// **A-10（判据）**：GDI 基线法 —— 50 次 `rebuild` + `delete` 后 GDI 对象数回到基线；
+    /// `delete()` 后全部字段 `is_invalid()`。**负例（[E13] 强制）**：临时删掉 `delete()`
+    /// 数组里任意一行字体释放 ⇒ 本断言必须 FAIL（本批已注入验证一次，见 done.md）。
+    ///
+    /// 计数是**进程级**的且测试并行 ⇒ 允许并行同伴的瞬时占用：只在"读数仍高于基线"时重测
+    /// （真泄漏是多达数百个对象的单调上升，重测不会自己消失）。
+    #[test]
+    fn gdi_objects_return_to_baseline_after_rebuild_delete_cycles() {
+        let mut theme = Theme::new(96);
+        let baseline = gdi_object_count();
+        for index in 0..50 {
+            theme.rebuild(120 + index % 3);
+        }
+        theme.delete();
+        let mut after = gdi_object_count();
+        for _ in 0..20 {
+            if after <= baseline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            after = gdi_object_count();
+        }
+        assert!(
+            after <= baseline,
+            "50 次 rebuild/delete 后 GDI 对象 {after} > 基线 {baseline}（漏释放 ⇒ 长跑爆句柄）"
+        );
+        for (name, font) in [
+            ("font_ui", theme.font_ui),
+            ("font_ui_bold", theme.font_ui_bold),
+            ("font_small", theme.font_small),
+            ("font_title", theme.font_title),
+            ("font_number", theme.font_number),
+            ("font_mono", theme.font_mono),
+            ("font_section", theme.font_section),
+        ] {
+            assert!(font.is_invalid(), "delete() 后 {name} 必须已释放");
+        }
+        assert!(theme.brush_bg.is_invalid());
+        assert!(theme.brush_card.is_invalid());
+    }
+
+    /// 【A-5】卡片数值自适应字号（§2.4.3）：`1,234,567` 在卡片内宽 **73 DIP（默认）** 与
+    /// **63 DIP（窄窗 460 → 420）** 下都必须**放得下**（放得下 ⇒ 不会出 `…`）。
+    ///
+    /// 内宽 = `card.w − 24`（`PAD_CARD` 两侧各 12），`card.w = (content_w − 3×10) / 4`：
+    /// 客户区 460 ⇒ `content_w 420` ⇒ `card.w 97` ⇒ 内宽 **73**；客户区 420 ⇒ `content_w 380`
+    /// ⇒ `card.w 87` ⇒ 内宽 **63**（与 UI 方案 §2.4.3 的两个数字逐一对应）。
+    #[test]
+    fn number_ladder_keeps_big_values_ellipsis_free() {
+        let theme = Theme::new(96);
+        let fonts = NumberFonts::new(&theme.face, theme.scale);
+        let hdc = unsafe { GetDC(None) };
+        let mut readings = Vec::new();
+        for inner_dip in [73, 63] {
+            let (font, index) = fonts.pick_index(hdc, &theme, "1,234,567", inner_dip);
+            let width = measure_text(hdc, font, "1,234,567");
+            readings.push((inner_dip, NUMBER_LADDER_DIP[index], width));
+            assert!(
+                width <= inner_dip,
+                "选定档放不下：{width} px > {inner_dip} DIP（会出 `…`）"
+            );
+            assert!(
+                NUMBER_LADDER_DIP[index] <= 15.0,
+                "内宽 {inner_dip} DIP 下必须降到 ≤ 15 档（实得 {})",
+                NUMBER_LADDER_DIP[index]
+            );
+        }
+        // 21 档放不下 9 字符（否则这条阶梯就是死代码）
+        let (_, wide_index) = fonts.pick_index(hdc, &theme, "1,234,567", 200);
+        assert_eq!(wide_index, 0, "内宽充足时应当用 21 档");
+        unsafe { ReleaseDC(None, hdc) };
+        println!("卡片数值字号自适应读数（内宽 DIP, 选定字号 DIP, 文本宽 px）：{readings:?}");
     }
 }

@@ -50,7 +50,10 @@ function Write-Capped([string]$Text, [string]$Path, [int]$MaxBytes = 65536) {
         [System.Array]::Copy($bytes, $slice, $MaxBytes)
         $Text = [System.Text.Encoding]::UTF8.GetString($slice) + "`n...(已按 $MaxBytes 字节封顶)"
     }
-    Set-Content -LiteralPath $Path -Value $Text -Encoding UTF8
+    # 行尾纪律（审查 P2-④）：证据文件按仓库约定写「UTF-8 无 BOM + LF」——`Set-Content -Encoding UTF8`
+    #   会加 BOM 并补 CRLF，而本仓库 `* -text`（禁任何自动行尾转换）⇒ 那些字节会原样入库（混合行尾）。
+    if (-not $Text.EndsWith("`n")) { $Text += "`n" }
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 $started = Get-Date

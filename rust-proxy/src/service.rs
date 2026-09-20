@@ -33,6 +33,82 @@ pub const WM_APP_REFRESH: u32 = 0x8000 + 1;
 /// 停机时"等服务真的收尾"的额外上限（`GRACE_SHUTDOWN` 之后还等不到 ⇒ abort 服务任务）。
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(GRACE_SHUTDOWN.as_secs() + 2);
 
+/// **谁**在停服务（P0-1 的根因面：`Command::Stop` 与 `Inner::apply` 都走 `stop()`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopOrigin {
+    /// 配置热生效（`Inner::apply`）：停机只是中途步骤，终态由 `apply()` 的每条出口落。
+    Apply,
+    /// 用户点「停止」（`Command::Stop`）。
+    User,
+    /// 程序退出（`Command::Shutdown`）：UI 可能已不在，只发布必要状态。
+    Shutdown,
+}
+
+/// 配置/服务状态机的"当前显示阶段"（UI 只读它决定结果行文案与墨色）。
+///
+/// - `Applying` = 已受理、正在停旧监听；`Draining` = 已发停机信号、等在途请求收尾；
+/// - `Applied` / `Failed` = 配置热生效的终态；`Idle` = 无在办事项（也是"用户停止"的终态）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyStage {
+    Idle,
+    Applying,
+    Draining,
+    Applied,
+    Failed,
+}
+
+impl ApplyStage {
+    /// 终态判定（J-A8 的机械出口：末条 `配置应用阶段：` 行必须是三态之一）。
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Idle | Self::Applied | Self::Failed)
+    }
+}
+
+/// 结果行文案常量（逐字，判据依赖；P7 行为方案 §2.A.4）。
+pub const APPLY_START_TEXT: &str = "正在应用…（正在停旧监听）";
+/// **I1 口径：不带 N**（`N` 依赖 I3 的 guard 前移 B-5；跨批纪律 ⇒ I1 禁止显示"等待 0 个"）。
+pub const APPLY_DRAIN_TEXT: &str = "正在应用…（等待在途请求收尾，上限 5 s）";
+/// 带 N 变体：**仅 I3 落地 B-5 之后允许启用**（本批只登记接口，不得引用）。
+pub const APPLY_DRAIN_TEXT_N: &str = "正在应用…（等待 {n} 个在途请求收尾，上限 5 s）";
+pub const APPLY_RESTART_TEXT: &str = "正在应用…（新监听启动中）";
+/// 用户点「停止」的进行态 / 终态（D5：这条路径**不得**出现"正在应用…"）。
+pub const STOP_TEXT: &str = "正在停止…";
+pub const STOPPED_TEXT: &str = "已停止";
+
+/// `stop()` **进入**时的（阶段, 文案）：按 origin 分叉（D5）。
+///
+/// `Draining` 帧**只在 apply 发起时写** —— 用户点「停止」若无条件写 Draining，
+/// 结果行会永久停在"正在应用…"，既是诉求 ② 复发也是文案撒谎。
+fn stop_entry_notice(origin: StopOrigin) -> (ApplyStage, Option<String>) {
+    match origin {
+        StopOrigin::Apply => (ApplyStage::Draining, Some(APPLY_DRAIN_TEXT.to_string())),
+        StopOrigin::User => (ApplyStage::Idle, Some(STOP_TEXT.to_string())),
+        StopOrigin::Shutdown => (ApplyStage::Idle, None),
+    }
+}
+
+/// `stop()` **末尾**的（阶段, 文案）—— "任何 `stop()` 路径末尾必落终态"的落点。
+///
+/// `Apply` 档的"终态"由 `apply()` 的每条出口写（本函数只把阶段推向"新监听启动中"，
+/// 紧跟着 `start()` + 终态帧，同一 async 任务内没有能永久挂住的分支）。
+fn stop_exit_notice(origin: StopOrigin) -> (ApplyStage, Option<String>) {
+    match origin {
+        StopOrigin::Apply => (ApplyStage::Applying, Some(APPLY_RESTART_TEXT.to_string())),
+        StopOrigin::User => (ApplyStage::Idle, Some(STOPPED_TEXT.to_string())),
+        StopOrigin::Shutdown => (ApplyStage::Idle, None),
+    }
+}
+
+/// 终态 stage 的**唯一真源 = `apply_ok`**（**禁用** `running.is_some()` —— 否则
+/// "回滚失败但服务已恢复"会被渲染成成功）。
+fn terminal_stage(apply_ok: bool) -> ApplyStage {
+    if apply_ok {
+        ApplyStage::Applied
+    } else {
+        ApplyStage::Failed
+    }
+}
+
 /// 服务相位（UI 状态灯 / 托盘图标四态的输入）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -62,10 +138,14 @@ pub struct Status {
     pub last_error: Option<String>,
     /// 本次运行的起点（uptime 计时）。
     pub started_at: Option<Instant>,
-    /// 配置热生效的序号 + 结果（UI 靠序号变化识别"这次保存的结果"）。
+    /// 配置热生效的序号 + 结果（UI 靠**快照去重**识别阶段变化；`apply_seq` 退回"事件序号"）。
     pub apply_seq: u64,
     pub apply_message: Option<String>,
+    /// 兼容字段：**不再参与渲染**（渲染唯一真源 = `apply_stage`），
+    /// 但仍是**终态映射**的唯一真源（见 `terminal_stage`）。
     pub apply_ok: bool,
+    /// 当前显示阶段（P7 新增；UI 结果行的三态渲染读它）。
+    pub apply_stage: ApplyStage,
     /// CLI `--port` 覆盖（显示用；`None` = 用配置值）。
     pub cli_port: Option<u16>,
 }
@@ -87,6 +167,7 @@ impl Status {
             apply_seq: 0,
             apply_message: None,
             apply_ok: true,
+            apply_stage: ApplyStage::Idle,
             cli_port,
         }
     }
@@ -179,6 +260,7 @@ impl Controller {
             apply_seq: 0,
             apply_message: None,
             apply_ok: true,
+            apply_stage: ApplyStage::Idle,
             stats: Arc::clone(&stats),
             logger: Arc::clone(&logger),
             notices: Arc::clone(&notices),
@@ -323,6 +405,7 @@ struct Inner {
     apply_seq: u64,
     apply_message: Option<String>,
     apply_ok: bool,
+    apply_stage: ApplyStage,
     stats: Arc<Stats>,
     logger: Arc<Logger>,
     notices: Arc<WarnThrottle>,
@@ -340,13 +423,13 @@ async fn command_loop(
                 inner.start(&shared).await;
             }
             Command::Stop => {
-                inner.stop(&shared).await;
+                inner.stop(&shared, StopOrigin::User).await;
             }
             Command::Apply(config) => {
                 inner.apply(*config, &shared).await;
             }
             Command::Shutdown(done) => {
-                inner.stop(&shared).await;
+                inner.stop(&shared, StopOrigin::Shutdown).await;
                 let _ = done.send(());
                 break;
             }
@@ -362,6 +445,7 @@ impl Inner {
         status.apply_seq = self.apply_seq;
         status.apply_message = self.apply_message.clone();
         status.apply_ok = self.apply_ok;
+        status.apply_stage = self.apply_stage;
         match &self.running {
             Some(running) => {
                 status.listen_addr = Some(running.listen_addr.clone());
@@ -528,10 +612,35 @@ impl Inner {
         shared.publish(self.snapshot(Phase::Running));
     }
 
+    /// 写"显示阶段"（+ 当前阶段文案）：**阶段值变化**时记一条 info 行
+    /// `配置应用阶段：{stage:?}` —— 它是 J-A5/J-A7/J-A8 读 stdout 的**机械出口**（每次操作 3–4 行，
+    /// 进环无害；与"每秒诊断必须绕环"的规则不冲突）。
+    ///
+    /// `force`（P7-I5a）：**终态行必须无条件落地**（绕开上面那条"变化才记"的去重）。理由 = J-A8 的
+    /// 机械出口是"**末条** `配置应用阶段：` 行 ∈ 三态"，而在**从未 apply 过**的会话里点「停止」是
+    /// `Idle -> Idle`（阶段没变化）⇒ 去重把唯一的终态行吞掉 ⇒ 该臂取不到末条、判据返回 `False`
+    /// （**假红**，不是"出口为空"）。`apply()` 各帧的 stage 必然变化（`Applying -> Draining ->
+    /// Applying -> Applied|Failed`）⇒ 它一律传 `false`，行结构与顺序（J-A5）逐字不变。
+    fn set_stage(&mut self, stage: ApplyStage, message: Option<String>, force: bool) {
+        if force || self.apply_stage != stage {
+            self.logger.info(&format!("配置应用阶段：{stage:?}"));
+        }
+        self.apply_stage = stage;
+        self.apply_message = message;
+    }
+
     /// 停服务（FR-34：停止接受新连接 → 等在途收尾 ≤ GRACE_SHUTDOWN → 释放端口）。
-    async fn stop(&mut self, shared: &SharedStatus) {
+    ///
+    /// **任何出口都落终态**（D5 / 行为方案 §2.A.4 的"路径 × 终态"表）：
+    /// `User` ⇒ 末尾 `Idle + 已停止`；`Shutdown` ⇒ 末尾 `Idle`；
+    /// `Apply` ⇒ 末尾 `Applying + 新监听启动中`（其终态由 `apply()` 的每条出口落）。
+    async fn stop(&mut self, shared: &SharedStatus, origin: StopOrigin) {
         if let Some(running) = self.running.take() {
             running.shutdown.trigger();
+            // 停机信号已发、还在等在途收尾 ⇒ 立刻可见的进行帧（Draining 只在 apply 档写）
+            let (stage, message) = stop_entry_notice(origin);
+            self.set_stage(stage, message, false);
+            shared.publish(self.snapshot(Phase::Stopped));
             let mut task = running.task;
             match tokio::time::timeout(STOP_JOIN_TIMEOUT, &mut task).await {
                 Ok(Ok(Ok(()))) => {
@@ -556,31 +665,56 @@ impl Inner {
                 }
             }
         }
+        // 尾声：所有 origin 在这里落"路径 × 终态"表的对应行（含 `running == None` 的早退）。
+        // **终态无条件记行**（`force`）：`User`/`Shutdown` 档的出口是 `Idle`（= 终态），若此前就是
+        // `Idle`（从未 apply 过的会话）⇒ 去重不记行 ⇒ J-A8 取不到末条（假红）；`Apply` 档出口是
+        // `Applying`（非终态，其终态由 `apply()` 的每条出口落）⇒ 不强制，该路径行结构不变。
+        let (stage, message) = stop_exit_notice(origin);
+        let force = stage.is_terminal();
+        self.set_stage(stage, message, force);
         shared.publish(self.snapshot(Phase::Stopped));
     }
 
     /// 配置热生效（**仅内存**：P6-S4 起不再有任何配置文件，改动的生命周期 = 本次运行）。
     /// 这里负责"停旧起新 / 失败回滚"；校验与提示由 UI 侧完成。
+    ///
+    /// **三条发布点**（顺序不可换）：① 受理帧（任何 `await` 之前，立刻可见）→ ② `stop()` 内的
+    /// `Draining` 帧 → ③ `start()` 之后的终态帧（`apply_ok` 唯一决定 `Applied|Failed`）。
     async fn apply(&mut self, config: Config, shared: &SharedStatus) {
         let previous = self.config.clone();
         let was_running = self.running.is_some();
         self.config = config;
         self.apply_logging();
         self.apply_seq += 1;
-        self.apply_message = None;
         self.apply_ok = true;
+        // ① 受理帧：顺序硬约束 = 先清（`set_stage` 里覆盖 message）再写首帧文案
+        self.set_stage(
+            ApplyStage::Applying,
+            Some(APPLY_START_TEXT.to_string()),
+            false,
+        );
+        shared.publish(self.snapshot(if was_running {
+            Phase::Running
+        } else {
+            Phase::Stopped
+        }));
 
         if !was_running {
-            self.apply_message = Some(
-                "已应用到本次运行（不写文件；关掉程序即回到默认）；\
-                 服务当前是停止状态，改动将在下次启动时生效"
-                    .to_string(),
+            // 「路径 × 终态」表第 1 行：早退也必须落终态（apply_ok 恒 true ⇒ Applied）
+            self.set_stage(
+                ApplyStage::Applied,
+                Some(
+                    "已应用到本次运行（不写文件；关掉程序即回到默认）；\
+                     服务当前是停止状态，改动将在下次启动时生效"
+                        .to_string(),
+                ),
+                false,
             );
             shared.publish(self.snapshot(Phase::Stopped));
             return;
         }
 
-        self.stop(shared).await;
+        self.stop(shared, StopOrigin::Apply).await;
         self.start(shared).await;
         if self.running.is_none() {
             // 新配置起不来 ⇒ 回滚到旧配置（仅内存：没有文件可回滚）
@@ -601,6 +735,7 @@ impl Inner {
                         .unwrap_or_else(|| "未知原因".to_string())
                 )
             };
+            // ⚠ 回滚**成功**也走这一支：终态唯一真源 = `apply_ok` ⇒ `Failed`（服务恢复 ≠ 新配置生效）
             self.apply_ok = false;
             self.apply_message = Some(format!("新配置未生效：{failure}；{restored}"));
             self.logger.warn(&format!(
@@ -629,6 +764,10 @@ impl Inner {
         } else {
             Phase::Error
         };
+        // ③ 终态帧（`apply_ok` 是唯一真源；**不得**引用 `running.is_some()` 决定 stage）
+        // `force = false`：这里 stage 必然从 `Applying` 变过来 ⇒ 去重语义已足够（I5a 只强制 stop 的终态）
+        let message = self.apply_message.take();
+        self.set_stage(terminal_stage(self.apply_ok), message, false);
         shared.publish(self.snapshot(phase));
     }
 }
@@ -680,5 +819,225 @@ mod tests {
         assert!(status.uptime().is_none());
         status.started_at = Some(Instant::now() - Duration::from_secs(3));
         assert!(status.uptime().map(|value| value.as_secs()).unwrap_or(0) >= 3);
+    }
+
+    /// **J-A7/J-A8 的静态面**：阶段三态 + "路径 × 终态"表的映射纯粹函数。
+    #[test]
+    fn apply_stage_terminal_and_origin_notices() {
+        // 初值 = Idle（Status::for_config 一处补齐）
+        assert_eq!(
+            Status::for_config(Config::default(), None).apply_stage,
+            ApplyStage::Idle
+        );
+        // 终态判定
+        assert!(ApplyStage::Idle.is_terminal());
+        assert!(ApplyStage::Applied.is_terminal());
+        assert!(ApplyStage::Failed.is_terminal());
+        assert!(!ApplyStage::Applying.is_terminal());
+        assert!(!ApplyStage::Draining.is_terminal());
+
+        // 进入帧：Draining **只在** apply 档写；User/Shutdown 一律 Idle
+        assert_eq!(
+            stop_entry_notice(StopOrigin::Apply),
+            (ApplyStage::Draining, Some(APPLY_DRAIN_TEXT.to_string()))
+        );
+        assert_eq!(stop_entry_notice(StopOrigin::User).0, ApplyStage::Idle);
+        assert_eq!(
+            stop_entry_notice(StopOrigin::Shutdown),
+            (ApplyStage::Idle, None)
+        );
+
+        // 尾声帧：任何 origin 都不停在非终态（Apply 档由 apply() 的出口接续）
+        assert_eq!(
+            stop_exit_notice(StopOrigin::User),
+            (ApplyStage::Idle, Some(STOPPED_TEXT.to_string()))
+        );
+        assert_eq!(
+            stop_exit_notice(StopOrigin::Shutdown),
+            (ApplyStage::Idle, None)
+        );
+        assert_eq!(
+            stop_exit_notice(StopOrigin::Apply),
+            (ApplyStage::Applying, Some(APPLY_RESTART_TEXT.to_string()))
+        );
+    }
+
+    /// **J-A7 的文案面**：用户点「停止」的路径**全程不得出现"正在应用"**（D5 的撒谎面）。
+    #[test]
+    fn user_stop_never_says_applying() {
+        let texts = [
+            Some(STOP_TEXT.to_string()),
+            Some(STOPPED_TEXT.to_string()),
+            stop_entry_notice(StopOrigin::User).1,
+            stop_exit_notice(StopOrigin::User).1,
+        ];
+        for text in texts.into_iter().flatten() {
+            assert!(
+                !text.contains("正在应用"),
+                "「停止」路径出现撒谎文案：{text}"
+            );
+        }
+        // 反向咬合：apply 档**必须**是"正在应用"系（否则本判据退化成恒真）
+        assert!(APPLY_START_TEXT.contains("正在应用"));
+        assert!(stop_entry_notice(StopOrigin::Apply)
+            .1
+            .unwrap_or_default()
+            .contains("正在应用"));
+    }
+
+    /// **I1 跨批纪律**：进度串不带 N（`N` 依赖 I3 的 B-5 ⇒ 本批禁止显示"等待 0 个"）。
+    #[test]
+    fn drain_text_has_no_placeholder_in_i1() {
+        assert!(!APPLY_DRAIN_TEXT.contains("{n}"));
+        assert!(!APPLY_DRAIN_TEXT.contains("0 个"));
+        assert!(APPLY_DRAIN_TEXT.contains("等待在途请求收尾"));
+        // 带 N 变体只登记接口（I3 落地 B-5 后才允许启用）
+        assert!(APPLY_DRAIN_TEXT_N.contains("{n}"));
+    }
+
+    /// **终态唯一真源 = `apply_ok`**（回滚成功也必须是 `Failed` —— 服务恢复 ≠ 新配置生效）。
+    #[test]
+    fn terminal_stage_comes_from_apply_ok_only() {
+        assert_eq!(terminal_stage(true), ApplyStage::Applied);
+        assert_eq!(
+            terminal_stage(false),
+            ApplyStage::Failed,
+            "回滚成功（服务已恢复）仍是 Failed：唯一真源是 apply_ok，不是 running.is_some()"
+        );
+    }
+
+    // ---- P7-I5a：`stop()` 的终态行（J-A8 的机械出口）------------------------------------------
+
+    /// 「从未 apply 过」的 `Inner`（`running == None`、阶段 = 初值 `Idle`）—— I5a 的回归装置。
+    fn idle_inner(config: Config, logger: Arc<Logger>) -> Inner {
+        Inner {
+            config,
+            cli_port: None,
+            running: None,
+            last_error: None,
+            apply_seq: 0,
+            apply_message: None,
+            apply_ok: true,
+            apply_stage: ApplyStage::Idle,
+            stats: Arc::new(Stats::new()),
+            logger,
+            notices: Arc::new(WarnThrottle::new()),
+        }
+    }
+
+    fn shared_for(config: Config) -> SharedStatus {
+        SharedStatus {
+            status_slot: Arc::new(Mutex::new(Status::for_config(config, None))),
+            notify_hwnd: Arc::new(AtomicIsize::new(0)),
+        }
+    }
+
+    /// 按 J-A8 的机械出口口径抽阶段名（与 `probe-j-a7a8.ps1` 同规则：**整行以阶段名结尾**）。
+    fn stage_markers(lines: &[String]) -> Vec<ApplyStage> {
+        const STAGES: [ApplyStage; 5] = [
+            ApplyStage::Idle,
+            ApplyStage::Applying,
+            ApplyStage::Draining,
+            ApplyStage::Applied,
+            ApplyStage::Failed,
+        ];
+        let mut markers = Vec::new();
+        for line in lines {
+            for stage in STAGES {
+                if line.ends_with(&format!("配置应用阶段：{stage:?}")) {
+                    markers.push(stage);
+                }
+            }
+        }
+        markers
+    }
+
+    /// **I5a 回归面（正例）**：**从未 apply 过**的会话里点「停止」（或程序退出）必须留下**终态**
+    /// `配置应用阶段：` 行 —— 否则 J-A8 的机械出口取不到末条 ⇒ 谓词返回 `False`（假红）。
+    #[tokio::test]
+    async fn stop_after_never_applied_always_emits_terminal_stage_line() {
+        for origin in [StopOrigin::User, StopOrigin::Shutdown] {
+            let config = Config::default();
+            let logger = Arc::new(Logger::new(Level::Info));
+            let mut inner = idle_inner(config.clone(), Arc::clone(&logger));
+            let shared = shared_for(config);
+            assert_eq!(
+                inner.apply_stage,
+                ApplyStage::Idle,
+                "前提：从未 apply 过（阶段 = 初值 Idle）"
+            );
+
+            inner.stop(&shared, origin).await;
+
+            let (lines, _) = logger.snapshot_lines(usize::MAX);
+            let stages = stage_markers(&lines);
+            assert!(
+                !stages.is_empty(),
+                "从未 apply 过的会话里 stop({origin:?}) 必须留下阶段行；实际日志 = {lines:?}"
+            );
+            let last = stages[stages.len() - 1];
+            assert!(
+                matches!(
+                    last,
+                    ApplyStage::Idle | ApplyStage::Applied | ApplyStage::Failed
+                ),
+                "stop({origin:?}) 的末条 `配置应用阶段：` 行必须 ∈ 三态集合；实际 = {last:?}"
+            );
+            assert_eq!(
+                last,
+                stop_exit_notice(origin).0,
+                "stop({origin:?}) 的末条阶段行 = 「路径 × 终态」表的出口行"
+            );
+        }
+    }
+
+    /// **J-A7 的撒谎面（反向咬合）**：`User` 停止**不得**写 apply 档的进行帧
+    /// （`Draining`/`Applying`）。只统计**本次 stop 新增**的行（前置的 `apply` 本来就该写
+    /// `Applying`），且前置 apply 让"停止把阶段推回 `Idle`"是**真变化** —— 若 stop 借用 apply
+    /// 档的帧，本断言必红。
+    #[tokio::test]
+    async fn user_stop_never_logs_applying_or_draining_stage() {
+        let config = Config::default();
+        let logger = Arc::new(Logger::new(Level::Info));
+        let mut inner = idle_inner(config.clone(), Arc::clone(&logger));
+        let shared = shared_for(config.clone());
+        inner.apply(config, &shared).await;
+        let (before, _) = logger.snapshot_lines(usize::MAX);
+
+        inner.stop(&shared, StopOrigin::User).await;
+
+        let (after, _) = logger.snapshot_lines(usize::MAX);
+        let stages = stage_markers(&after[before.len()..]);
+        assert!(
+            !stages
+                .iter()
+                .any(|stage| matches!(stage, ApplyStage::Applying | ApplyStage::Draining)),
+            "用户「停止」路径不得出现 apply 档的进行帧；本次新增序列 = {stages:?}"
+        );
+        assert_eq!(
+            stages.last(),
+            Some(&ApplyStage::Idle),
+            "用户「停止」的末条阶段行 = Idle（终态）"
+        );
+    }
+
+    /// **apply 路径的行结构不受 I5a 影响**（硬要求 ④）：未运行时点「应用」仍是 `Applying -> Applied`
+    /// 两行（既不因 I5a 的强制记行多写，也没有重复行）。
+    #[tokio::test]
+    async fn apply_without_running_keeps_the_two_line_sequence() {
+        let config = Config::default();
+        let logger = Arc::new(Logger::new(Level::Info));
+        let mut inner = idle_inner(config.clone(), Arc::clone(&logger));
+        let shared = shared_for(config.clone());
+
+        inner.apply(config, &shared).await;
+
+        let (lines, _) = logger.snapshot_lines(usize::MAX);
+        let stages = stage_markers(&lines);
+        assert_eq!(
+            stages,
+            vec![ApplyStage::Applying, ApplyStage::Applied],
+            "apply（未运行）的阶段行必须是 Applying -> Applied，且不得因 I5a 的强制记行多写"
+        );
     }
 }

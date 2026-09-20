@@ -274,6 +274,27 @@ async fn handle(State(state): State<Arc<MockState>>, request: Request) -> Respon
             .into_response();
     }
 
+    // I4（P7 小批）：404 的另两种 body 形状 —— 与 `/status?code=404`（有 body + CL）合起来覆盖三条路径。
+    // `/empty404`：**零长体**（`content-length: 0`）—— 客户端可见长度为 0 时 hyper 按 `Encoder::length(0)`
+    // 收尾、从不 poll 响应体流（I4 修的假阳性形状）。
+    if path == "/empty404" {
+        state.push(record_of(&method, &path, &query, &headers, 0));
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .expect("构造 /empty404 响应");
+    }
+
+    // `/chunked404`：`Transfer-Encoding: chunked` 且**零帧**（上游流正常收尾 ⇒ 走 `Ready(None)` 判据）。
+    if path == "/chunked404" {
+        state.push(record_of(&method, &path, &query, &headers, 0));
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .body(Body::from_stream(EmptyStream))
+            .expect("构造 /chunked404 响应");
+    }
+
     if path == "/redirect" {
         state.push(record_of(&method, &path, &query, &headers, 0));
         // 目标主机 = 测试进程里**没有监听**的端口 ⇒ 一旦代理跟随重定向，立刻会失败并被计数
@@ -437,6 +458,17 @@ impl Stream for NeverStream {
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Pending
+    }
+}
+
+/// **零帧**响应体（`/chunked404`）：chunked 编码下 = 只有终止块（I4 的第三种 body 形状）。
+struct EmptyStream;
+
+impl Stream for EmptyStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(None)
     }
 }
 

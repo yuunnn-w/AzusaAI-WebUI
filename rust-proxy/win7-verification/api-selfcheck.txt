@@ -1,4 +1,4 @@
-﻿数据库 = C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\Config\x64\6.1.7600.txt（1926651 B）
+数据库 = C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\Config\x64\6.1.7600.txt（1926651 B）
 grep -c "=GetQueuedCompletionStatusEx$"        = 3   （期望 > 0；tokio/mio IOCP 主循环）
 grep -c "=GetSystemTimePreciseAsFileTime$"     = 0   （期望 = 0；Win8 新增 ⇒ 由 win7 std 分支/thunk 覆盖）
 grep -c "=GetHostNameW$"                       = 0   （期望 = 0）

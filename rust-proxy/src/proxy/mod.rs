@@ -141,8 +141,11 @@ pub type SharedState = Arc<AppState>;
 
 /// FR-29「当前活跃连接数」/ FR-34「在途请求收尾」的守卫：构造即 +1，drop 即 −1。
 ///
-/// 转发路径把它**移进响应体**（`forward::UpstreamBody`）⇒ 流式请求的"活跃"一直计到 body
-/// 结束（客户端断开也走 drop ⇒ 计数不泄漏）；本地预检/错误路径让它随 handler 返回时 drop。
+/// **建点 = `handle_request` 的第一句**（B-5 前移；原建点在 `forward::UpstreamBody::new` ⇒
+/// 「等待上游响应头」期间 `活跃 = 0` 是**假 0**）。整条请求路径**移交同一个 guard**：
+/// `handle_request` → `forward::forward` → `forward::success_response` → `forward::UpstreamBody`，
+/// 后者把它放进响应体 ⇒ 流式请求的"活跃"一直计到 body 结束（客户端断开也走 drop ⇒ 计数不泄漏）；
+/// 失败/预检路径让它随 handler（或 `forward`）返回时 drop。
 pub struct ActiveGuard {
     state: Arc<AppState>,
 }
@@ -173,8 +176,14 @@ pub fn router(state: SharedState) -> Router {
 
 async fn handle_request(State(state): State<SharedState>, request: Request<Body>) -> Response {
     let started = Instant::now();
+    // B-5：`活跃` 从**请求进入**就计（含"等待上游响应头"与本地预检）—— 原建点在
+    // `forward::UpstreamBody::new` ⇒ 等待响应头期间 `活跃 = 0`（§0.2 A2 的"在途=0 与 请求=1 并存"）。
+    let guard = ActiveGuard::new(Arc::clone(&state));
     let (parts, body) = request.into_parts();
+    // D1 / B-3：窗口秒号**每请求只算一次**后向下传（避免每个记录点各读一次时钟）。
+    let slice = state.stats.window().slice_now();
     state.stats.inc_total();
+    state.stats.window().record_request(slice);
 
     let method = parts.method.clone();
     let path = parts
@@ -191,20 +200,22 @@ async fn handle_request(State(state): State<SharedState>, request: Request<Body>
     }
 
     if cors::is_preflight(&parts.method, &parts.headers) {
-        // 本地预检应答：body 极小且已全量在内存 ⇒ 守卫随本函数返回即 drop
-        let _active = ActiveGuard::new(Arc::clone(&state));
+        // 本地预检应答：body 极小且已全量在内存 ⇒ 守卫（顶层那个）随本函数返回即 drop
+        // ⚠ **不得**在此新建 `ActiveGuard`（J-B6：否则预检 `活跃 = 2`）
         state.stats.inc_preflight();
+        state.stats.window().record_preflight(slice);
         let response = cors::preflight_response(&parts.headers, &state.config.cors);
         log_access(&state, &method, &path, 204, started, true, None);
         return response;
     }
 
-    let (response, meta) = forward::forward(&state, parts, body).await;
+    let (response, meta) = forward::forward(&state, parts, body, guard).await;
 
     // FR-30：上游延迟（请求 → 上游响应头到达）—— 成功与失败都记（失败也含真实等待时长）。
-    state
-        .stats
-        .record_upstream_latency_ms(started.elapsed().as_millis() as u64);
+    let latency_ms = started.elapsed().as_millis() as u64;
+    state.stats.record_upstream_latency_ms(latency_ms);
+    // D1 / B-3：同一时刻落近窗桶（同一 `slice`，不重复读时钟）
+    state.stats.window().record_latency_ms(slice, latency_ms);
 
     let status = response.status().as_u16();
     if meta.timed_out {
@@ -222,6 +233,8 @@ async fn handle_request(State(state): State<SharedState>, request: Request<Body>
     }
     // FR-31：最近错误（合成错误 = 具体原因；上游 4xx/5xx = "上游返回 …"）
     if status >= 400 {
+        // D1 / B-3：近窗错误桶（与 `record_error(&summary)` 同一条件 ⇒ `status >= 400`）
+        state.stats.window().record_error(slice);
         let summary = match &meta.error_reason {
             Some(reason) => format!("HTTP {status} {reason}"),
             None => format!("HTTP {status}"),
@@ -423,6 +436,89 @@ mod tests {
         );
         let (lines, _) = loud.logger.snapshot_lines(1);
         assert!(lines[0].contains("响应字节=-"), "{}", lines[0]);
+    }
+
+    /// **J-B7（热路径预算）**：同机两臂对照 —— 「接线前」（只有既有的 `inc_total()`）vs
+    /// 「接线后」（`slice_now()` **每请求 1 次** + `record_request` + `record_latency_ms`）。
+    ///
+    /// 口径（B-3）：
+    /// - 两臂都**不含** `ActiveGuard` —— 本批把它的建点从 `forward::UpstreamBody::new` 前移到
+    ///   `handle_request` 首句，对**非预检**请求只是提前建，`inc_active`/`dec_active` 的次数不变；
+    ///   预检请求新增的那一对由第三臂单独报数（`inc_active`+`dec_active` = 2 次原子 RMW）；
+    /// - 「每请求算一次 `slice`」按生产写法落在臂内（不额外多读时钟）。
+    ///
+    /// 报数用（`cargo test -- --nocapture`）；断言只咬**结构性失控**（差值 < 1 µs/请求 —— 那意味着
+    /// 意外引入了锁/分配），阈值判据（J-B7：≤5% 或 ≤100 ns）在 done.md 里按实测值判定。
+    #[test]
+    fn p7_i3b_hot_path_cost_reading() {
+        const ITERS: usize = 200_000;
+        const ROUNDS: usize = 5;
+        let state = state_with(Level::Error);
+        let window = state.stats.window();
+        let mut before_ns = u128::MAX;
+        let mut after_ns = u128::MAX;
+        let mut guard_ns = u128::MAX;
+        for _ in 0..ROUNDS {
+            // 臂 A：接线前（每请求只做既有的累计计数）
+            let started = Instant::now();
+            for _ in 0..ITERS {
+                state.stats.inc_total();
+            }
+            before_ns = before_ns.min(started.elapsed().as_nanos());
+
+            // 臂 B：接线后（+ 1 次秒号 + 2 次触桶）
+            let started = Instant::now();
+            for _ in 0..ITERS {
+                state.stats.inc_total();
+                let slice = window.slice_now();
+                window.record_request(slice);
+                window.record_latency_ms(slice, 12);
+            }
+            after_ns = after_ns.min(started.elapsed().as_nanos());
+
+            // 臂 C：预检新增面（在途计数一对；`ActiveGuard` 的构造与 drop 就这两下）
+            let started = Instant::now();
+            for _ in 0..ITERS {
+                state.stats.inc_active();
+                state.stats.dec_active();
+            }
+            guard_ns = guard_ns.min(started.elapsed().as_nanos());
+        }
+        let per = |ns: u128| ns as f64 / ITERS as f64;
+        let (before, after, guard) = (per(before_ns), per(after_ns), per(guard_ns));
+        println!(
+            "J-B7 热路径读数（{ROUNDS} 轮取 min，每轮 {ITERS} 次）：接线前 {before:.1} ns/请求 · \
+             接线后 {after:.1} ns/请求 · 差 {:.1} ns（{:.1}%）· 预检在途计数一对 {guard:.1} ns",
+            after - before,
+            if before > 0.0 {
+                (after - before) / before * 100.0
+            } else {
+                f64::INFINITY
+            }
+        );
+        assert!(
+            after - before < 1_000.0,
+            "接线后每请求不得多付 ≥1 µs（那意味着热路径意外引入了锁/分配）：{before:.1} → {after:.1} ns"
+        );
+    }
+
+    /// **J-B6 的单测半边**：预检分支**不得**再新建 `ActiveGuard`（B-5 的删除项 ⑤）。
+    /// 真机读数（`--no-gui` + `OPTIONS` 预检 ⇒ 访问行 `活跃=1`）另见 done.md；
+    /// 这里钉住**结构**：`handle_request` 是本模块生产面里唯一的 `ActiveGuard::new` 调用点。
+    #[test]
+    fn p7_i3b_preflight_reuses_the_top_level_guard() {
+        // 针串在**运行期**拼出：否则本测试自己的源码会把计数抬高（自咬）
+        let needle = concat!("ActiveGuard", "::new(", "Arc::clone(&state))");
+        let source = include_str!("mod.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(source);
+        assert_eq!(
+            production.matches(needle).count(),
+            1,
+            "生产面只允许一处 `{needle}`（`handle_request` 首句）—— 预检分支不得再建"
+        );
     }
 
     /// **§8-P1-A 的定点读数**：1e6 量级下「仅级别早退」（改动后）vs

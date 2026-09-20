@@ -1,4 +1,4 @@
-﻿	DLL Name: kernel32.dll
+	DLL Name: kernel32.dll
 	DLL Name: ws2_32.dll
 	DLL Name: ntdll.dll
 	DLL Name: oleaut32.dll

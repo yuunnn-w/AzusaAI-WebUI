@@ -1312,3 +1312,128 @@ async fn i20_blackhole_empty_pool_is_bounded() {
     upstream.state.set_silent(false);
     proxy.stop().await;
 }
+// ── I21/I22 ── P7 小批 I4（`client_aborted` 假阳性）───────────────────────────────
+//
+// 复现（exe 级，40 次串行 GET 打「`Content-Length: 0` 的 404」上游）= 第 40 行读数 `客户端中止=39`
+// —— 见 `shared/tmp/rust-proxy-p7/i4/out/r1-pre-cl0/`。机制：hyper 对**零长体**写完响应头即
+// `Encoder::length(0)`（`is_eof()` 为真）⇒ 认为无体可写 ⇒ 响应体流**一次都不被 poll**、直接被 drop。
+// 下面 I21 把"三种 body 形状的 404 都不得记中止"钉成门禁，I22 是它的**负例**（读到一半断连
+// 必须仍然计数）—— 两条成对，缺一不可。
+
+/// I21（正例）：**三种 body 形状**的 404 各跑 3 次 ⇒ `client_aborted` 恒为 0。
+/// 形状 = ① `/empty404`（`content-length: 0`，本次假阳性的形状）② `/status?code=404`（有 body + CL）
+/// ③ `/chunked404`（chunked 零帧）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i21_three_404_body_shapes_are_not_client_aborts() {
+    const ROUNDS: usize = 3;
+    let paths = ["/empty404", "/status?code=404", "/chunked404"];
+    let upstream = MockUpstream::start().await;
+    let proxy = ProxyHandle::start(&upstream.base, TimeoutsConfig::default()).await;
+    let client = client();
+
+    for round in 0..ROUNDS {
+        for path in paths {
+            let response = client
+                .get(proxy.url(path))
+                .send()
+                .await
+                .expect("请求必须发出");
+            assert_eq!(response.status().as_u16(), 404, "第 {round} 轮 {path}");
+            let body = response.text().await.expect("读响应体");
+            // 三种形状各自可辨（否则本用例的"三形状"是自我欺骗）
+            match path {
+                "/empty404" => assert!(body.is_empty(), "空体形状必须真的没有 body"),
+                "/chunked404" => assert!(body.is_empty(), "chunked 零帧也必须没有 body"),
+                _ => assert!(!body.is_empty(), "有 body 的形状必须有 body"),
+            }
+        }
+    }
+
+    assert_eq!(
+        upstream.state.count(),
+        paths.len() * ROUNDS,
+        "上游必须收到全部请求"
+    );
+    let snapshot = proxy.state.stats.snapshot();
+    assert_eq!(
+        snapshot.client_aborted, 0,
+        "客户端把 404 完整读完（含零长体）⇒ 不得记客户端中止（实测 {}）",
+        snapshot.client_aborted
+    );
+    assert_eq!(snapshot.stream_errors, 0, "上游侧无错");
+    assert_eq!(snapshot.active, 0, "三次都收尾后活跃必须回落");
+    proxy.stop().await;
+}
+
+/// I22（**负例**）：客户端**读到一半就断** ⇒ 必须恰好计一次。
+/// 与 I21 同一判据、只差"读没读完"—— 这是"新判据仍能抓真缺陷"的端到端证明。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_client_abort_midway_is_still_counted() {
+    let upstream = MockUpstream::start().await;
+    let proxy = ProxyHandle::start(&upstream.base, TimeoutsConfig::default()).await;
+
+    let mut response = client()
+        .get(proxy.url("/sse?frames=8&interval_ms=200&label=i22"))
+        .send()
+        .await
+        .expect("请求必须发出");
+    let first = response.chunk().await.expect("第一帧必须可读");
+    let second = response.chunk().await.expect("第二帧必须可读");
+    assert!(first.is_some() && second.is_some(), "至少读到 2 帧再中止");
+    drop(response); // ← 客户端读到一半断连
+
+    let counted = wait_until(Duration::from_secs(5), || {
+        proxy.state.stats.snapshot().client_aborted >= 1
+    })
+    .await;
+    assert!(counted, "读到一半断连必须记客户端中止");
+    let snapshot = proxy.state.stats.snapshot();
+    assert_eq!(
+        snapshot.client_aborted, 1,
+        "本用例只有一次请求 ⇒ 必须恰好计一次（实测 {}）",
+        snapshot.client_aborted
+    );
+    assert!(
+        upstream.state.frames_sent() < 8,
+        "上游不应把 8 帧全部发完（实际 {} 帧）",
+        upstream.state.frames_sent()
+    );
+    proxy.stop().await;
+}
+
+/// I23：**同一根因的第二张脸** —— `HEAD` 请求的响应头带上游真实 `Content-Length`，但客户端可见体恒为 0
+/// （hyper `!can_have_body(HEAD, …) ⇒ Encoder::length(0)`，同样**从不 poll** 响应体流）。
+/// 修前这条也会被误记成客户端中止；修后按"客户端可见长度 = 0"判为读完。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_head_request_is_not_a_client_abort() {
+    let upstream = MockUpstream::start().await;
+    let proxy = ProxyHandle::start(&upstream.base, TimeoutsConfig::default()).await;
+    let client = client();
+
+    for round in 0..3 {
+        let response = client
+            .head(proxy.url("/echo"))
+            .send()
+            .await
+            .expect("HEAD 请求必须发出");
+        assert_eq!(response.status().as_u16(), 200, "第 {round} 轮");
+        assert!(
+            header_text(&response, "content-length").is_some(),
+            "HEAD 响应应带上游声明的 Content-Length（这正是修前误判的来源）"
+        );
+        let body = response
+            .text()
+            .await
+            .expect("HEAD 响应体必须可读（应为空）");
+        assert!(body.is_empty(), "HEAD 不得有 body");
+    }
+
+    let snapshot = proxy.state.stats.snapshot();
+    assert_eq!(
+        snapshot.client_aborted, 0,
+        "HEAD 的客户端可见体长为 0 ⇒ 不得记客户端中止（实测 {}）",
+        snapshot.client_aborted
+    );
+    assert_eq!(snapshot.active, 0, "收尾后活跃必须回落");
+    proxy.stop().await;
+}

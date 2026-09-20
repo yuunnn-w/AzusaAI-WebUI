@@ -139,7 +139,12 @@ pub struct ForwardMeta {
 ///   让连接池失效（`AppState::flush_client_pool`，2 s 节流）⇒ 陈旧连接不再被后续请求复用；
 /// - **L4**：只对 `{GET,HEAD,OPTIONS} ∧ 无体 ∧ 未发字节` 做**恰一次**安全重试（走新池、新拨号）；
 ///   SSE/对话 = POST + 体 ⇒ **结构性永不重试**。
-pub async fn forward(state: &Arc<AppState>, parts: Parts, body: Body) -> (Response, ForwardMeta) {
+pub async fn forward(
+    state: &Arc<AppState>,
+    parts: Parts,
+    body: Body,
+    guard: ActiveGuard,
+) -> (Response, ForwardMeta) {
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -177,13 +182,14 @@ pub async fn forward(state: &Arc<AppState>, parts: Parts, body: Body) -> (Respon
     let first = attempt_send(request, Some(body_done_rx), limit).await;
 
     match first {
-        Attempt::Sent(Ok(upstream)) => success_response(state, &parts, upstream, url),
+        Attempt::Sent(Ok(upstream)) => success_response(state, &parts, upstream, url, guard),
         Attempt::Sent(Err(err)) => {
             // L2 触发面②：`send()` 传输错误 —— 谓词收窄：**排除**请求体类（客户端上传中断）
             // 与构造器类（URL 写错等本地问题），只有"上游侧"故障才清池（方案 §2.3/P2-2）。
             if !(err.is_body() || err.is_builder()) {
                 state.note_upstream_fault("上游连接失败（send 传输错误）");
             }
+            // B-5：本路径没有响应体 ⇒ `guard` 随本函数返回而 drop（`活跃` 计满整条请求）
             failure_response(state, &parts, &url, &err)
         }
         Attempt::HeadTimeout { limit } => {
@@ -207,7 +213,9 @@ pub async fn forward(state: &Arc<AppState>, parts: Parts, body: Body) -> (Respon
                 // ⚠ **重试腿不再 flush**（审查 P2-2，语义边界如实写死）：重试前 L1 刚命中过 ⇒ 池已被
                 // 重置过（新 client = 空池）⇒ 重试腿再失败也**没有陈旧连接可留**，不 flush 无害。
                 match attempt_send(retry_request, None, Some(limit)).await {
-                    Attempt::Sent(Ok(upstream)) => success_response(state, &parts, upstream, url),
+                    Attempt::Sent(Ok(upstream)) => {
+                        success_response(state, &parts, upstream, url, guard)
+                    }
                     Attempt::Sent(Err(err)) => failure_response(state, &parts, &url, &err),
                     Attempt::HeadTimeout { limit } => {
                         head_timeout_response(state, &parts, &url, limit, body_bytes)
@@ -297,22 +305,52 @@ pub fn retry_eligible(method: &Method, headers: &HeaderMap, seen: u64) -> bool {
     }
 }
 
+/// **「客户端该拿多少字节」**——`UpstreamBody` 读完判据（`client_read_in_full`）的基准，
+/// **镜像 hyper 服务端的成帧规则**（hyper `proto::h1::role::Server::encode_headers` 结尾：
+/// `!can_have_body(method, status) ⇒ encoder = Encoder::length(0)`）。
+///
+/// 为什么不能直接拿上游的 `Content-Length` 当基准：`HEAD` / 1xx / 204 / 304 / CONNECT+2xx 这几种形态下
+/// hyper 一律按**零长体**收尾（零长体的响应头写完即 `is_eof()` ⇒ hyper 认为无体可写、**从不 poll**
+/// 响应体流，见 `proto::h1::dispatch::Dispatcher::poll_write` 的 `!can_write_body()` 分支）。
+/// 此时上游头里那个数（`HEAD` 常带真实长度、204 可能有脏 `Content-Length`）与"客户端要读多少"无关，
+/// 拿它当基准会把"客户端已拿到完整响应"误记成客户端中止（I4 修的就是这个假阳性）。
+fn client_body_length(
+    method: &Method,
+    status: StatusCode,
+    upstream_length: Option<u64>,
+) -> Option<u64> {
+    let forced_empty = method == Method::HEAD
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+        || (method == Method::CONNECT && status.is_success());
+    if forced_empty {
+        return Some(0);
+    }
+    upstream_length
+}
+
 /// 成功路径：原样透传状态码/头/体（含 FR-11 的 CORS 注入与 FR-30 的 4xx/5xx 归类）。
+///
+/// B-5：`guard` 由 `handle_request` 一路移交进来 ⇒ 由 `UpstreamBody` 持有到 body 结束（活跃语义不变）。
 fn success_response(
     state: &Arc<AppState>,
     parts: &Parts,
     upstream: reqwest::Response,
     url: String,
+    guard: ActiveGuard,
 ) -> (Response, ForwardMeta) {
     let status = upstream.status();
     // 上游声明的长度（若为 chunked/SSE 则无此头）⇒ 判定"整包是否已送达完"，
-    // 见 `UpstreamBody`：不这么判，客户端读满 Content-Length 后 hyper 不再 poll 到
+    // 见 `UpstreamBody::client_read_in_full`：不这么判，客户端读满 Content-Length 后 hyper 不再 poll 到
     // `Ready(None)`，会把"正常读完"误记成客户端中止。
-    let content_length = upstream
+    let upstream_length = upstream
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
+    // 客户端可见的长度（`HEAD` / 204 / 304 等被 hyper 强制作零长体 ⇒ `Some(0)`）
+    let client_length = client_body_length(&parts.method, status, upstream_length);
     let mut headers = HeaderMap::new();
     for (name, value) in upstream.headers().iter() {
         if !is_hop_by_hop(name) {
@@ -327,7 +365,8 @@ fn success_response(
         upstream.bytes_stream(),
         url,
         state.config.timeouts.first_byte(),
-        content_length,
+        client_length,
+        guard,
     );
     let mut response = Response::new(Body::from_stream(bridge));
     *response.status_mut() = status;
@@ -479,11 +518,14 @@ impl Drop for CountingBody {
 ///    （此刻状态码已发）⇒ 命中表现为**中断该流**（不伪造 `[DONE]`），而不是改写成 504；
 /// 3. **客户端断开探测**（FR-19）：未读完就被 drop ⇒ `client_aborted` +1；上游连接随
 ///    reqwest 流一起 drop ⇒ 不留孤儿连接（`active` 也在同一时刻回落，FR-29）；
-/// 4. **`active` 在途计数**：`ActiveGuard` 挂在本体上 ⇒ 流式请求的"活跃"一直计到 body 结束。
+/// 4. **`active` 在途计数**：`ActiveGuard`（**建点在 `handle_request`**，B-5）挂在本体上 ⇒ 流式请求的
+///    "活跃"一直计到 body 结束（本类型只移交/持有，不新建 —— 否则等待响应头那段仍是假 0）。
 ///
-/// ⚠ 「读完」的判定有两条路（都必要）：① 上游流返回 `Ready(None)`（chunked/SSE 的正常收尾）；
-/// ② 已送达字节数**达到上游 `Content-Length`** —— 客户端读满长度后 hyper 不会再多 poll 一次
-/// 去取 `None`，只看 ① 会把"正常读完"误记成客户端中止（本批实测到的假阳性）。
+/// ⚠ 「读完」的判定 = `client_read_in_full`（**唯一判据**）：① 上游流自己收尾（`Ready(None)`）；
+/// ② 已送达字节数达到**客户端可见的长度**（`client_body_length`）—— 两条路都必要：客户端读满长度后
+/// hyper 不会再多 poll 一次去取 `None`，只看 ① 会把"正常读完"误记成客户端中止；
+/// 而"客户端可见长度为 0"（`Content-Length: 0` / `HEAD` / 1xx / 204 / 304）时 hyper **一次都不 poll**
+/// ⇒ 只看 ① 同样误判（I4 修的假阳性；机制见 `client_body_length` 的文档）。
 struct UpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     state: Arc<AppState>,
@@ -492,23 +534,28 @@ struct UpstreamBody {
     watchdog_limit: Option<Duration>,
     url: String,
     delivered: u64,
+    /// 客户端可见的响应体长度（`None` = 无声明：chunked / close-delimited / 上游流式）
     expected: Option<u64>,
     first_chunk: bool,
+    /// 上游响应流**自己**给出终局（`Ready(None)` / `Err` / 首字节 watchdog 命中）时的标记。
+    /// ⚠ 它**不是**"读完"的全部：hyper 可能在零长体外提前 drop 本流（见 `client_read_in_full`）。
     finished: bool,
 }
 
 impl UpstreamBody {
+    /// B-5：`guard` 由调用方（`handle_request` → `success_response`）移交进来，本类型只**持有**它
+    /// ⇒ "活跃计到 body 结束"的语义不变，且**等待上游响应头**那一段也已计入（原来这段是假 0）。
     fn new<S>(
         state: Arc<AppState>,
         stream: S,
         url: String,
         first_byte: Option<Duration>,
         expected: Option<u64>,
+        guard: ActiveGuard,
     ) -> UpstreamBody
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
-        let guard = ActiveGuard::new(Arc::clone(&state));
         UpstreamBody {
             inner: Box::pin(stream),
             state,
@@ -520,6 +567,27 @@ impl UpstreamBody {
             expected,
             first_chunk: true,
             finished: false,
+        }
+    }
+
+    /// **「客户端该拿的字节都拿到了」**——`Drop` 判定 `client_aborted` 的唯一依据。
+    ///
+    /// 三条路任一成立即为真：
+    /// 1. `finished`（上游流自己收尾 / 报错 / watchdog 命中：后两者已按 `stream_errors` 归类，不再算中止）；
+    /// 2. 已送达字节数 **≥ 客户端可见长度**（`expected`）—— 客户端读满长度即 done；
+    /// 3. 上一条在 `expected == Some(0)` 时的特例：**零长体**（`Content-Length: 0` / `HEAD` / 1xx /
+    ///    204 / 304）是 `0 >= 0`，**不需要任何一次 poll 就成立** —— 这正是旧判据的漏洞所在：
+    ///    hyper 对零长体写完响应头即 `Encoder::length(0)`（`is_eof()`）⇒ **从不 poll 本流**，
+    ///    body 被直接 drop ⇒ 任何"只能在 poll 里置位"的标志都永远置不上。
+    ///
+    /// 判据取"状态"而非"标志"：drop 时刻的字节账目是最后的真相，谁也漏不掉。
+    fn client_read_in_full(&self) -> bool {
+        if self.finished {
+            return true;
+        }
+        match self.expected {
+            Some(expected) => self.delivered >= expected,
+            None => false,
         }
     }
 }
@@ -576,12 +644,8 @@ impl Stream for UpstreamBody {
                 this.watchdog = None;
                 this.watchdog_limit = None;
                 this.delivered += chunk.len() as u64;
-                if let Some(expected) = this.expected {
-                    if this.delivered >= expected {
-                        // 上游声明的长度已送完 ⇒ 整包完成（客户端不会再 poll 到 None）
-                        this.finished = true;
-                    }
-                }
+                // ⚠ 这里**不**置 `finished`：读完与否由 drop 时刻的 `client_read_in_full` 按字节账目
+                // 判定（I4：把判据从"沿途置位的标志"改成"drop 时刻的状态"，零长体外不再有漏判面）。
                 this.state.stats.add_bytes_out(chunk.len() as u64);
                 Poll::Ready(Some(Ok(chunk)))
             }
@@ -602,12 +666,16 @@ impl Stream for UpstreamBody {
 
 impl Drop for UpstreamBody {
     fn drop(&mut self) {
-        if !self.finished {
-            // FR-19：客户端断开 / 停止生成 ⇒ 本 body 被丢 ⇒ 上游流一起被 drop（取消该请求）
+        if !self.client_read_in_full() {
+            // FR-19：客户端读到一半断开 / 停止生成 ⇒ 本 body 被丢 ⇒ 上游流一起被 drop（取消该请求）
             self.state.stats.inc_client_aborted();
+            let expected_text = match self.expected {
+                Some(expected) => format!("{expected} B"),
+                None => "无声明（chunked / 流式）".to_string(),
+            };
             self.state.logger.debug(&format!(
-                "{} 响应流未读完即结束（客户端断开 ⇒ drop 上游流取消该请求，FR-19；已送达 {} B）",
-                self.url, self.delivered
+                "{} 响应流未读完即结束（客户端断开 ⇒ drop 上游流取消该请求，FR-19；已送达 {} B / 应送达 {}）",
+                self.url, self.delivered, expected_text
             ));
         }
     }
@@ -648,6 +716,10 @@ mod tests {
     )]
 
     use super::*;
+    use crate::config::Config;
+    use crate::logging::{Level, Logger};
+    use crate::proxy::notice::WarnThrottle;
+    use crate::stats::Stats;
 
     /// U1：路径拼接矩阵（方案 §10.1 U1）。
     #[test]
@@ -713,5 +785,171 @@ mod tests {
             let name = HeaderName::from_bytes(name.as_bytes()).unwrap();
             assert!(!strip_request_header(&name), "{name} 必须保留");
         }
+    }
+
+    // ── I4（P7 小批）：`client_aborted` 假阳性（`Content-Length: 0` 的 404） ──────────────────
+    //
+    // 复现读数（exe 级，40 次串行 GET 打「CL: 0 的 404」上游）= 第 40 行 `客户端中止=39`，
+    // 证据 `shared/tmp/rust-proxy-p7/i4/out/r1-pre-cl0/`。机制：hyper 对**零长体**写完响应头即
+    // `Encoder::length(0)`（`is_eof()` 为真）⇒ `writing = KeepAlive` ⇒ 响应体流**一次都不会被 poll**、
+    // 直接被 drop ⇒ 任何"只在 poll 里置位"的标志都永远置不上 ⇒ 旧判据 `!finished` 必然假阳性。
+    // 下面四条把判据钉在 **drop 时刻的状态**（字节账目）上，不依赖 poll 是否发生过。
+
+    fn i4_state() -> Arc<AppState> {
+        Arc::new(
+            AppState::new(
+                Config::default(),
+                Arc::new(Stats::new()),
+                Arc::new(Logger::new(Level::Error)),
+                Arc::new(WarnThrottle::new()),
+            )
+            .expect("测试用 reqwest client 必须可建（本项目无 TLS、纯本地配置）"),
+        )
+    }
+
+    /// 测试用上游流：按给定顺序出帧，出完即 `Ready(None)`。
+    struct FakeUpstream {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl Stream for FakeUpstream {
+        type Item = Result<Bytes, reqwest::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().chunks.pop_front().map(Ok))
+        }
+    }
+
+    /// `first_byte = None`（不挂 watchdog）⇒ 无需 tokio 运行时，普通 `#[test]` 即可。
+    ///
+    /// B-5：`guard` 由调用方建（生产路径 = `handle_request` 的第一句）⇒ 本装置照同一拓扑建一个，
+    /// 「活跃」读数的语义与生产一致（`UpstreamBody` 只持有）。
+    fn i4_body(expected: Option<u64>, chunks: &[&'static [u8]]) -> (Arc<AppState>, UpstreamBody) {
+        let state = i4_state();
+        let chunks = chunks
+            .iter()
+            .map(|chunk| Bytes::from_static(chunk))
+            .collect();
+        let guard = ActiveGuard::new(Arc::clone(&state));
+        let body = UpstreamBody::new(
+            Arc::clone(&state),
+            FakeUpstream { chunks },
+            "http://127.0.0.1:9/i4-probe".to_string(),
+            None,
+            expected,
+            guard,
+        );
+        (state, body)
+    }
+
+    fn poll_chunk(body: &mut UpstreamBody) -> Poll<Option<Result<Bytes, std::io::Error>>> {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        Pin::new(body).poll_next(&mut cx)
+    }
+
+    /// 基准函数逐格对照 hyper 的成帧规则（`Server::encode_headers` 结尾的 `Encoder::length(0)` 面）。
+    #[test]
+    fn i4_client_body_length_mirrors_hyper_framing() {
+        // 被 hyper 强制作零长体的形态：客户端可见长度 = 0（**不是**上游头里那个数）
+        assert_eq!(
+            client_body_length(&Method::HEAD, StatusCode::OK, Some(1234)),
+            Some(0),
+            "HEAD 响应无体（上游仍带真实 CL）"
+        );
+        assert_eq!(
+            client_body_length(&Method::GET, StatusCode::CONTINUE, Some(1234)),
+            Some(0),
+            "1xx"
+        );
+        assert_eq!(
+            client_body_length(&Method::GET, StatusCode::NO_CONTENT, Some(1234)),
+            Some(0),
+            "204"
+        );
+        assert_eq!(
+            client_body_length(&Method::GET, StatusCode::NOT_MODIFIED, Some(1234)),
+            Some(0),
+            "304"
+        );
+        assert_eq!(
+            client_body_length(&Method::CONNECT, StatusCode::OK, None),
+            Some(0),
+            "CONNECT + 2xx"
+        );
+        // 其余形态如实取上游声明；无声明（chunked / SSE / close-delimited）保持 None
+        assert_eq!(
+            client_body_length(&Method::GET, StatusCode::NOT_FOUND, Some(0)),
+            Some(0),
+            "零长体"
+        );
+        assert_eq!(
+            client_body_length(&Method::GET, StatusCode::NOT_FOUND, Some(33)),
+            Some(33)
+        );
+        assert_eq!(client_body_length(&Method::GET, StatusCode::OK, None), None);
+    }
+
+    /// 正例①（本批的缺陷面）：零长体**一次都没被 poll** 就 drop ⇒ 不得记客户端中止。
+    #[test]
+    fn i4_zero_length_body_never_polled_is_not_client_abort() {
+        let (state, body) = i4_body(Some(0), &[]);
+        let active_before = state.stats.snapshot().active;
+        assert_eq!(active_before, 1, "body 在 → ActiveGuard 计数为 1");
+        drop(body);
+        let snapshot = state.stats.snapshot();
+        assert_eq!(
+            snapshot.client_aborted, 0,
+            "客户端拿到的是完整的 404（content-length: 0）⇒ 不是中止"
+        );
+        assert_eq!(snapshot.active, 0, "drop 即回落（FR-29）");
+        assert_eq!(snapshot.stream_errors, 0);
+    }
+
+    /// 正例②：读满客户端可见长度（**没有** `Ready(None)`，hyper 不会再 poll）后 drop ⇒ 不计中止。
+    #[test]
+    fn i4_full_declared_length_is_not_client_abort() {
+        let (state, mut body) = i4_body(Some(6), &[b"abc", b"def"]);
+        assert!(
+            matches!(poll_chunk(&mut body), Poll::Ready(Some(Ok(_)))),
+            "第 1 帧"
+        );
+        assert!(
+            matches!(poll_chunk(&mut body), Poll::Ready(Some(Ok(_)))),
+            "第 2 帧"
+        );
+        drop(body);
+        let snapshot = state.stats.snapshot();
+        assert_eq!(snapshot.client_aborted, 0);
+        assert_eq!(snapshot.bytes_out, 6);
+    }
+
+    /// 正例③：无声明长度（chunked / SSE）+ 流正常收尾 ⇒ 不计中止。
+    #[test]
+    fn i4_stream_end_is_not_client_abort() {
+        let (state, mut body) = i4_body(None, &[b"abc"]);
+        assert!(matches!(poll_chunk(&mut body), Poll::Ready(Some(Ok(_)))));
+        assert!(
+            matches!(poll_chunk(&mut body), Poll::Ready(None)),
+            "上游流收尾"
+        );
+        drop(body);
+        assert_eq!(state.stats.snapshot().client_aborted, 0);
+    }
+
+    /// **负例**（证明新判据仍能抓真缺陷）：读到一半就 drop ⇒ 必须 +1。
+    #[test]
+    fn i4_drop_midway_still_counts_client_abort() {
+        let (state, mut body) = i4_body(Some(100), &[b"0123456789"]);
+        assert!(
+            matches!(poll_chunk(&mut body), Poll::Ready(Some(Ok(_)))),
+            "先读到 10 B（应送达 100 B）"
+        );
+        drop(body);
+        let snapshot = state.stats.snapshot();
+        assert_eq!(
+            snapshot.client_aborted, 1,
+            "读到 10/100 B 就断 ⇒ 必须恰好计一次客户端中止"
+        );
+        assert_eq!(snapshot.stream_errors, 0, "上游侧无错 ⇒ 不得混进流中断");
     }
 }

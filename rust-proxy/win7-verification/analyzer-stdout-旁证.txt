@@ -1,5 +1,4 @@
-﻿命令："C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\YY.Depends.Analyzer.exe" "C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe" /Target:6.1.7600 /IgnoreReady /ReportView:Table
+命令："C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\YY.Depends.Analyzer.exe" "C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\target\x86_64-win7-windows-msvc\release\azusa-local-proxy.exe" /Target:6.1.7600 /IgnoreReady /ReportView:Table
 退出码：0
 
 信息：成功分析依赖，请查看文件 C:\Azusa\Code\AzusaAI-WebUI\AzusaAI-WebUI\rust-proxy\tools\depends\azusa-local-proxy.exe.md
-

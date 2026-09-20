@@ -33,6 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::theme::{self, wide, Gfx};
 use azusa_local_proxy::logging::Logger;
 use azusa_local_proxy::service::{Phase, Status};
+use azusa_local_proxy::stats::WindowSnapshot;
 
 /// 托盘回调消息（`WM_APP + 2`；`WM_APP + 1` 是 service 的状态刷新消息）。
 pub const WM_APP_TRAY: u32 = 0x8000 + 2;
@@ -89,14 +90,25 @@ pub fn icon_state_for(status: &Status) -> IconState {
     }
 }
 
-/// Tooltip：`AzusaAI 本地反代 · 运行中 · 127.0.0.1:80`（§7.2）。
-pub fn tooltip_for(status: &Status) -> String {
+/// Tooltip：`AzusaAI 本地反代 · 运行中 · 127.0.0.1:80 · 请求 12 · 0.1 req/s · 错误 3`（§7.2 + **D8**）。
+///
+/// D8：补 **req/s**（近窗平均 = `window.requests / window.secs`）与**错误数**（近窗，与面板
+/// 「错误（近 120 s）」卡同源 ⇒ 两处不会给出互相矛盾的数字）。结构沿用既有实现（一段 `format!`
+/// + [`super::theme::truncate_line`] 的 120 字符上限，`szTip` 128 硬限）；两个新读数排在地址之后
+///   ⇒ 地址再长也只是尾部被截，读数不会消失。
+pub fn tooltip_for(status: &Status, window: &WindowSnapshot) -> String {
     let state = icon_state_for(status);
     let address = status
         .listen_addr
         .clone()
         .unwrap_or_else(|| format!("未监听（主端口 {}）", status.requested_port));
-    let text = format!("AzusaAI 本地反代 · {} · {address}", state.label());
+    let text = format!(
+        "AzusaAI 本地反代 · {} · {address} · 请求 {} · {:.1} req/s · 错误 {}",
+        state.label(),
+        window.requests,
+        window.requests as f64 / window.secs.max(1) as f64,
+        window.errors
+    );
     super::theme::truncate_line(&text, 120)
 }
 
@@ -660,19 +672,43 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_mentions_state_and_address() {
+    fn tooltip_mentions_state_address_and_live_readings() {
         let mut status = azusa_local_proxy::service::Status::for_config(Config::default(), None);
         status.phase = Phase::Running;
         status.listen_addr = Some("127.0.0.1:80".to_string());
-        let tooltip = tooltip_for(&status);
+        let window = azusa_local_proxy::stats::Window::new().snapshot();
+        let tooltip = tooltip_for(&status, &window);
         assert!(tooltip.contains("运行中"), "{tooltip}");
         assert!(tooltip.contains("127.0.0.1:80"), "{tooltip}");
+        // D8：两个新读数是**常驻**的（空窗也有位，值为 0），不会被地址挤掉
+        assert!(tooltip.contains("0.0 req/s"), "{tooltip}");
+        assert!(tooltip.contains("错误 0"), "{tooltip}");
 
         status.phase = Phase::Stopped;
         status.listen_addr = None;
-        let tooltip = tooltip_for(&status);
+        let tooltip = tooltip_for(&status, &window);
         assert!(tooltip.contains("已停止"), "{tooltip}");
         assert!(tooltip.contains("未监听"), "{tooltip}");
+    }
+
+    /// 【D8】tooltip 补 `req/s` 与错误数，且经 `truncate_line(&text, 120)`（`szTip` 128 的保守上界）
+    /// 之后**仍含**两个读数串 ⇒ "长地址把读数挤掉"这一类缺陷会被这条判据抓住。
+    #[test]
+    fn d8_tooltip_keeps_req_per_sec_and_error_count_after_truncation() {
+        let mut status = azusa_local_proxy::service::Status::for_config(Config::default(), None);
+        status.phase = Phase::Running;
+        status.listen_addr = Some("127.0.0.1:18080".to_string());
+        let mut window = azusa_local_proxy::stats::Window::new().snapshot();
+        window.requests = 12;
+        window.errors = 3;
+        let text = tooltip_for(&status, &window);
+        let clipped = crate::ui::theme::truncate_line(&text, 120);
+        assert!(clipped.contains("0.1 req/s"), "{clipped}");
+        assert!(clipped.contains("错误 3"), "{clipped}");
+        assert!(
+            !clipped.contains('…'),
+            "120 字符内必须完整（截断即判据失败）：{clipped}"
+        );
     }
 
     #[test]

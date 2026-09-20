@@ -69,6 +69,14 @@ pub struct Logger {
     ring: Mutex<VecDeque<String>>,
     /// 被环挤掉的条数（面板头行如实显示）。
     ring_dropped: AtomicU64,
+    /// **单调总写入条数**（P7-I2）：`push()` 每入环一次 +1，环满丢最旧也照加 ⇒
+    /// 恒等式 `written == retained + dropped`（单测钉住）。文档窗的日志模式靠它算"新增了多少行"
+    /// （`written - seen_written`）—— **只取尾部新增**，不重建全量文本（C-2 的机械判据）。
+    ///
+    /// ⚠ **绕环诊断不计入本计数**（D6）：每秒的 `日志窗口刷新 N 行` 走 `crate::output::log_line`
+    /// 直写 stdout，**不经 [`Logger::log`]** ⇒ 否则 debug 档下诊断行自身入环 ⇒ 下一秒又有新增
+    /// ⇒ 永续自增（J-C4 的"静置 30 s = 0 条"必红）。
+    written: AtomicU64,
 }
 
 impl Logger {
@@ -77,6 +85,7 @@ impl Logger {
             level: AtomicU8::new(level.as_u8()),
             ring: Mutex::new(VecDeque::with_capacity(LOG_RING_CAPACITY)),
             ring_dropped: AtomicU64::new(0),
+            written: AtomicU64::new(0),
         }
     }
 
@@ -132,6 +141,9 @@ impl Logger {
             self.ring_dropped.fetch_add(1, Ordering::Relaxed);
         }
         ring.push_back(line);
+        // 计数在**持锁段内**自增（与 `ring_dropped` 同临界区）⇒ 读者拿到的 `written` 与
+        // `retained + dropped` 不会出现"已计数但还没入环"的瞬时错配。
+        self.written.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 只读快照：**最后 `max` 行**（旧 → 新）+ 被挤出条数（方案 §3.3）。
@@ -158,6 +170,14 @@ impl Logger {
     /// 被环挤掉的条数（面板/设置窗头行「已挤出 M 条」用）。
     pub fn dropped_count(&self) -> u64 {
         self.ring_dropped.load(Ordering::Relaxed)
+    }
+
+    /// **单调总写入条数**（文档窗日志模式算"尾部新增了几行"的唯一读出口）。
+    ///
+    /// 恒等式 `written_count() == retained_count() + dropped_count()` 在**持锁段内**成立
+    /// （`push()` 的两处计数在同一临界区自增；单测 `written_equals_retained_plus_dropped` 钉住）。
+    pub fn written_count(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
     }
 }
 
@@ -431,6 +451,39 @@ mod tests {
         // 多次快照读数一致（只读，不消费环）
         assert_eq!(logger.snapshot_lines(10).1, 5);
         assert_eq!(logger.retained_count(), LOG_RING_CAPACITY);
+    }
+
+    /// **恒等式**（P7-I2 新增计数）：`written == retained + dropped`；单调不减；级别过滤不计入。
+    #[test]
+    fn written_equals_retained_plus_dropped() {
+        let logger = logger_with(Level::Info);
+        assert_eq!(logger.written_count(), 0, "新 logger 的写入计数必须为 0");
+        // 未达容量：written == retained，dropped == 0
+        for index in 0..10 {
+            logger.info(&format!("line-{index}"));
+        }
+        assert_eq!(logger.written_count(), 10);
+        assert_eq!(
+            logger.written_count(),
+            logger.retained_count() as u64 + logger.dropped_count()
+        );
+        // 超容量：written 继续单调增，恒等式仍成立
+        for index in 0..(LOG_RING_CAPACITY + 5) {
+            logger.info(&format!("overflow-{index}"));
+        }
+        // 总写入 = 10 + 2005 = 2015；环内 2000 ⇒ 被挤掉的是**多出来的 15 条**（前 10 条 + 5 条）
+        assert_eq!(logger.written_count(), 10 + LOG_RING_CAPACITY as u64 + 5);
+        assert_eq!(logger.dropped_count(), 15);
+        assert_eq!(logger.retained_count(), LOG_RING_CAPACITY);
+        assert_eq!(
+            logger.written_count(),
+            logger.retained_count() as u64 + logger.dropped_count(),
+            "恒等式 written == retained + dropped 必须成立"
+        );
+        // 级别过滤发生在入环之前 ⇒ 被过滤的行**不进环也不计数**（否则日志窗会看到"幽灵新增"）
+        logger.apply(Level::Warn);
+        logger.debug("filtered-out");
+        assert_eq!(logger.written_count(), 10 + LOG_RING_CAPACITY as u64 + 5);
     }
 
     /// `snapshot_lines` 条数语义：只取**最后** `max` 行，且 ≤ 环内实际条数。
