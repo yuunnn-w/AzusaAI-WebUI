@@ -102,7 +102,7 @@ node scripts/lint.js      # 启发式检查「调用了但未声明」的标识�
 - 只存 `settings` + `activeId` + `promptLib` + `fetchedModels`；会话本体在 IndexedDB。
 - 特殊值约定：`temperature` / `topP` 为 `-1` 表示「不发送」（滑块拉到最左）；`reasoningEffort: ""` 表示不发送；`maxTokens: 0` 表示不发送（Anthropic 协议必须带 `max_tokens`，未设置按 256K 发送）。
 - `mergeSettings` 的迁移动作（只执行一次）：旧强调色名 → 马卡龙色名、旧硬编码采样参数 → 不发送、`codeWrap` 默认改真；历史版本还做过 `delete ctxBudget`（按 token 截断历史整体移除，只留「最多携带条数」`ctxMsgs`）、删除旧的「对外暴露工具服务」配置、`toolLimits` 改新默认、`run_js` → `ExecuteJavaScript` 的权限键搬迁等；**0.2.1 起**多了一条条件式迁移 —— `pdfMode` → `attachImgMode`（三档附件图片策略）：显式 `"image"` ⇒ `"image"`、其余（含旧 `"text"` / 缺键 / 非法值）⇒ `"both"`，**旧键不删**（单向兼容：老用户盘上的 `pdfMode` 原样保留，旧版本回退仍能读到；新版本只写新键）。
-- **Base URL 不做自动迁移**：旧默认曾是内网地址，现不保留其字面量（`DEFAULT_BASE` = 本机回环 `http://127.0.0.1:8080/v1`）；任何已存值（老默认、自定义值）都原样保留，只有「缺 `baseUrl` 字段」的设置才会被合并上默认值。
+- **Base URL 不做自动迁移**：旧默认曾是内网地址，现不保留其字面量（`DEFAULT_BASE` = 本机回环 `http://127.0.0.1/v1`）；任何已存值（老默认、自定义值）都原样保留，只有「缺 `baseUrl` 字段」的设置才会被合并上默认值。
 - `schema` 未升但后来新增的字段（`attachImgMode` / `pdfDpi` / `pdfMaxPages` / `ocrLangs` / `visionForce` / `modelVision` / `pyTaskTimeoutMs` / `genMax` 等）都有默认值，旧库不需要额外动作；`attachImgMode` 是唯一例外 —— 它有一条条件式迁移（见上一条），旧 `pdfMode` 只作读入来源、新版本不再写出。**0.2.1 起** `pyTaskStopKills` 被显式丢弃（D-5 裁决作废该设置项：`delete out.pyTaskStopKills`，旧库载入 / 导入备份都不复活，幂等）。
 - 迁移完成后写入当前 `schema`，之后用户手动修改不会被改回。
 

@@ -65,12 +65,12 @@ var LS_KEY = "chatgpt-webui-v1";
    0.1.0 之前的旧默认曾是某个局域网地址 —— 已随首个公开版本移除;为不在公开源码里保留内网字面量,
    这里**不做**「旧默认 → 新默认」的等值改名迁移:任何已存设置都原样保留(见 mergeSettings 里的说明)。
    全新安装(或用户自己清空该字段)才会得到这个默认值 */
-var DEFAULT_BASE = "http://127.0.0.1:8080/v1";
+var DEFAULT_BASE = "http://127.0.0.1/v1";
 /* 用户可见版本号的**唯一权威**(改值 = 改这一处):环境面板 / 环境信息 / 导出备份 version 字段 /
    MCP clientInfo.version / 关于弹窗都读它;启动时把 <meta name="version"> 也同步成它。
-   口径 = README 头 + CHANGELOG [0.2.2] + 发布 tag v0.2.2(0.1.0 是首个公开版本,旧值 "2.1" 是历史遗留)。(发布前须让本值 = 本次 tag 的版本号:三档产物自报版本读它)
+   口径 = README 头 + CHANGELOG [0.2.3] + 发布 tag v0.2.3(0.1.0 是首个公开版本,旧值 "2.1" 是历史遗留)。(发布前须让本值 = 本次 tag 的版本号:三档产物自报版本读它)
    注意:它不是存储 schema(那是 SCHEMA,另算),也不是 MCP 协议版本(MCP_PROTOCOL,另算) */
-var APP_VERSION = "0.2.2";
+var APP_VERSION = "0.2.3";
 /* 作者显示名与项目主页(唯一权威):关于弹窗的 hero 由 JS 从这里填充,
    HTML / CSS / 其它 JS 里不得再出现这两个字面量(日后改一行) */
 var APP_AUTHOR = "yuunnn-w";

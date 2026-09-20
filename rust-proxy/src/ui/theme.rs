@@ -11,8 +11,8 @@
 //!
 //! **分通道口径（P7 §2.1.1，写死）**：颜色令牌一律 `0xAARRGGBB`。
 //! - **GDI+ 路径**（`fill_round_rect` / `stroke_round_rect` / `fill_circle` / `line` / `polyline` /
-//!   `fill_polygon`）**直传 ARGB 常量** ⇒ alpha 生效（唯一带 alpha 的令牌 `COLOR_ACCENT_RING`
-//!   只允许走这条路径）；
+//!   `fill_polygon` / `fill_soft_shadow`）**直传 ARGB 常量** ⇒ alpha 生效（两个带 alpha 的令牌 ——
+//!   `COLOR_ACCENT_RING` 焦点环与 `COLOR_SHADOW` 柔和投影 —— 只允许走这条路径）；
 //! - **仅 GDI 路径**（`CreateSolidBrush` / `SetTextColor` / `WM_CTLCOLOR*` 返回的画刷）**必须经
 //!   [`gdi_color()`]** ⇒ **只允许不透明令牌**（α = `0xFF`）：`gdi_color` 产 `COLORREF = 0x00BBGGRR`，
 //!   **alpha 被丢弃**（本模块单测自证）—— 把半透明令牌喂给它 = 纯黑实心块。
@@ -100,7 +100,7 @@ pub const COLOR_DANGER_INK: u32 = 0xFFD70015;
 pub const COLOR_ACCENT_PRESSED: u32 = 0xFFD9648A;
 #[allow(dead_code)]
 pub const COLOR_ACCENT_HOVER: u32 = 0xFFF08CA8;
-/// 焦点环 —— **全仓唯一带 alpha 的令牌**，只准走 GDI+（`stroke_round_rect` 直传 ARGB）。
+/// 焦点环 —— 带 alpha 的两个令牌之一（另一个 = [`COLOR_SHADOW`]），只准走 GDI+（`stroke_round_rect` 直传 ARGB）。
 pub const COLOR_ACCENT_RING: u32 = 0x59E8799A;
 /// 叠色（不透明预混）：`base × (1 − a)`，悬停 `a = 6%`（悬停态待 I3 的自绘按钮悬停）。
 #[allow(dead_code)]
@@ -117,10 +117,50 @@ pub const COLOR_ACCENT_SOFT: u32 = 0xFFFDF2F5;
 #[allow(dead_code)]
 pub const COLOR_HAIRLINE_SHADE: u32 = 0xFFECECEE;
 
+/// **互斥选项组（P8-UI2「托盘 + 选中胶囊」）**：托盘底 = 浅灰（比窗口画布 `COLOR_BG` 深一档，
+/// 比卡片白浅一档），把一整组选项括起来；选中项在托盘上浮起一枚白色胶囊（不透明 + 1 DIP 极淡描边）。
+///
+/// 为什么换掉旧的「每段一个圆角框 + 粉色描边选中」：粉色描边把**颜色**当选中信号 ⇒ 与主按钮
+/// （樱花底）争夺注意力，且并排的框会读成「两个半截的盒子」（用户原话：不精致、间距太近）。
+///
+/// ⚠ **P8-UI2-tweak（用户报障：远看认不出"这是一组互斥选项"）**：旧值 `#F1F2F4` 与画布 `#F5F5F7`
+/// 只差 3–4/通道（相对亮度差 0.027，WCAG 1.03）⇒ 托盘在真机上几乎看不见。现**加深一档**到
+/// `#E7E8EC`：对画布的相对亮度差 0.107（WCAG 1.12，是旧值的 ~4 倍），与下方白胶囊的层次**反而更强**
+/// （胶囊 vs 托盘 0.113 → 0.192）。本批**不动任何几何常量**（`SEG_*`，A-3b ⑤b/⑤c 判据依赖它们）。
+pub const COLOR_SEG_TRAY: u32 = 0xFFE7E8EC;
+/// 托盘 1 DIP 极淡描边（不描边 ⇒ 托盘边界靠圆角自身，四角的层级感会糊）：随托盘**同步加深**
+/// （`#E8E9ED` → `#D8DAE0`；托盘变深后描边若不动就与托盘同色 = 描边消失）。
+pub const COLOR_SEG_TRAY_EDGE: u32 = 0xFFD8DAE0;
+/// 选中胶囊面（**白**，与卡片同色 ⇒ 与「输入井」同一套层级语言）。
+pub const COLOR_SEG_CAPSULE: u32 = 0xFFFFFFFF;
+/// 选中胶囊 1 DIP 极淡描边（把胶囊从托盘上「拎」出来）。**随托盘同步加深一档**
+/// （`#E3E4E9` → `#DCDEE4`）：托盘变深后，若胶囊描边不动，它对托盘的对比会从 1.13 掉到 1.04
+/// ⇒ 描边"消失"；现 1.10 ⇒ 与改前的"极淡但看得见"同一档（胶囊面 vs 托盘的身体色差另已由 0.113 涨到 0.192）。
+pub const COLOR_SEG_CAPSULE_EDGE: u32 = 0xFFDCDEE4;
+/// **柔和投影**（胶囊 / 下拉面板）：GDI+ 无 blur ⇒ 用 2 层递减 alpha 的外扩圆角矩形模拟
+/// （§2.1.4 的等价手段）。**这是全仓第二个带 alpha 的令牌**（第一个 = [`COLOR_ACCENT_RING`]），
+/// **只准走 GDI+ 路径**（`fill_round_rect` 直传 ARGB；喂给 `gdi_color()` 会变纯黑实心块）。
+pub const COLOR_SHADOW: u32 = 0x0000_0000; // 基色 = 黑；alpha 逐层给（见 `fill_soft_shadow`）
+/// 胶囊投影的层 alpha（由外到内：越外越淡）。
+pub const SHADOW_ALPHAS: [u32; 2] = [0x0A, 0x16];
+
 /// 圆角（DIP；消费点一律经 `Theme::px()`）。
 pub const RADIUS_CARD: f32 = 10.0;
 pub const RADIUS_FIELD: f32 = 6.0;
 pub const RADIUS_BUTTON: f32 = 6.0;
+
+/// **互斥选项组几何**（P8-UI2；DIP）—— 组 = 托盘 + N 个自绘段，段宽**按文字实测**定。
+///
+/// 托盘：`[段1][间距 12][段2]` 外包 `SEG_TRAY_PAD` 的横向余量（圆角 `SEG_TRAY_RADIUS`）；
+/// 选中段在托盘上画一枚纵向内缩 `SEG_CAPSULE_INSET` 的胶囊（圆角 `SEG_CAPSULE_RADIUS`）。
+pub const SEG_TRAY_PAD: f32 = 2.0;
+pub const SEG_TRAY_RADIUS: f32 = 8.0;
+/// 两个互斥选项之间的间距（用户诉求：**间距不要那么近**；旧实现是 1 DIP 的「并排盒子」）。
+pub const SEG_ITEM_GAP: f32 = 12.0;
+/// 段内文字左右留白（**段宽 = 文字实测（粗体）+ 2 × 本值** ⇒ 不再写死宽度、不撑满列槽）。
+pub const SEG_ITEM_PAD_H: f32 = 5.0;
+pub const SEG_CAPSULE_INSET: f32 = 2.0;
+pub const SEG_CAPSULE_RADIUS: f32 = 6.0;
 
 /// 间距阶梯（DIP）。
 /// `SPACE_L` / `SPACE_XL` 的主面板消费点在 I3 ⇒ 本批显式 allow（避免与 `-D warnings` 冲突）。
@@ -131,6 +171,7 @@ pub const SPACE_M: f32 = 12.0;
 pub const SPACE_L: f32 = 16.0;
 #[allow(dead_code)]
 pub const SPACE_XL: f32 = 20.0;
+#[allow(dead_code)]
 pub const SPACE_XXL: f32 = 24.0;
 
 /// 行高 / 行步 / 按钮高 / 页边距（设置窗行表的唯一真源）。
@@ -498,6 +539,26 @@ impl Gfx {
                 let _ = GdipDeleteBrush(brush as *mut _);
             }
             let _ = GdipDeletePath(path);
+        }
+    }
+
+    /// **柔和投影**（P8-UI2）：GDI+ 无高斯模糊 ⇒ 用 [`SHADOW_ALPHAS`] 的 2 层**递减 alpha**外扩
+    /// 圆角矩形模拟（§2.1.4 的等价手段；`COLOR_SHADOW` 是 alpha 令牌 ⇒ 只能走这条 GDI+ 路径）。
+    ///
+    /// 调用方的矩形应当是**投影的内边界**（胶囊 / 下拉面板）；本函数只向外扩。
+    /// 超出控件矩形的部分由 DRAWITEM / 子窗的裁剪面自然吃掉（不会脏别的控件）。
+    pub fn fill_soft_shadow(&self, x: f32, y: f32, w: f32, h: f32, radius: f32, scale: f32) {
+        for (index, alpha) in SHADOW_ALPHAS.iter().enumerate() {
+            let grow = (index as f32 + 1.0) * scale;
+            let argb = (alpha << 24) | (COLOR_SHADOW & 0x00FF_FFFF);
+            self.fill_round_rect(
+                x - grow,
+                y - grow,
+                w + grow * 2.0,
+                h + grow * 2.0,
+                radius + grow,
+                argb,
+            );
         }
     }
 
@@ -1059,9 +1120,24 @@ mod tests {
             ("HOVER_ON_CANVAS", COLOR_HOVER_ON_CANVAS),
             ("PRESS_ON_CARD", COLOR_PRESS_ON_CARD),
             ("PRESS_ON_CANVAS", COLOR_PRESS_ON_CANVAS),
+            ("SEG_TRAY", COLOR_SEG_TRAY),
+            ("SEG_TRAY_EDGE", COLOR_SEG_TRAY_EDGE),
+            ("SEG_CAPSULE", COLOR_SEG_CAPSULE),
+            ("SEG_CAPSULE_EDGE", COLOR_SEG_CAPSULE_EDGE),
         ] {
             assert_eq!(token >> 24, 0xFF, "COLOR_{name} 走 GDI 路径 ⇒ α 必须 0xFF");
         }
+        // ②b 投影令牌（P8-UI2 新增的第二个 alpha 令牌）：基色透明 + 层 alpha ∈ (0, 0xFF)；
+        //     它**只准走 GDI+**（`fill_soft_shadow`），断言层数 ≥ 2（"2–3 层模拟 blur"的机械面）。
+        assert_eq!(
+            COLOR_SHADOW >> 24,
+            0x00,
+            "COLOR_SHADOW 只带基色，alpha 由层表给"
+        );
+        assert!(SHADOW_ALPHAS.len() >= 2);
+        assert!(SHADOW_ALPHAS
+            .iter()
+            .all(|alpha| *alpha > 0 && *alpha < 0xFF));
         // ④ 机理自证：`gdi_color()` 抹 alpha（不透明令牌安全、alpha 令牌必坏）
         assert_eq!(gdi_color(COLOR_ACCENT_RING).0 >> 24, 0);
         assert_ne!(
@@ -1075,6 +1151,53 @@ mod tests {
         assert_eq!(COLOR_PRESS_ON_CARD, argb(0xFF, 0xE0, 0xE0, 0xE0));
         assert_eq!(COLOR_PRESS_ON_CANVAS, argb(0xFF, 0xD8, 0xD8, 0xD9));
         assert_eq!(COLOR_ACCENT_SOFT, argb(0xFF, 0xFD, 0xF2, 0xF5));
+    }
+
+    /// **A-4c（判据，P8-UI2-tweak）**：互斥选项组的**三层顺序**（画布 → 托盘 → 白胶囊）必须逐层变亮，
+    /// 且"托盘 vs 画布"要**一眼可见**（用户报障：旧值 `#F1F2F4` 与画布只差 3–4/通道 ⇒ 远看糊成一片）。
+    ///
+    /// 阈值取"改前实测的 2 倍以上"这一档——纯算术防线，不依赖截图；**负例锚点**：把 `COLOR_SEG_TRAY`
+    /// 改回 `#F1F2F4` ⇒ 第一条断言必 FAIL（实测 Δ 0.027 < 0.06）。
+    #[test]
+    fn seg_tray_layers_stay_ordered_and_visible() {
+        let step = |first: u32, second: u32| {
+            (relative_luminance(first) - relative_luminance(second)).abs()
+        };
+        let canvas_to_tray = step(COLOR_SEG_TRAY, COLOR_BG);
+        let tray_to_edge = step(COLOR_SEG_TRAY_EDGE, COLOR_SEG_TRAY);
+        let tray_to_capsule = step(COLOR_SEG_CAPSULE, COLOR_SEG_TRAY);
+        let tray_to_capsule_edge = step(COLOR_SEG_CAPSULE_EDGE, COLOR_SEG_TRAY);
+        println!(
+            "托盘层次（相对亮度差）：画布→托盘 {canvas_to_tray:.4}（改前 #F1F2F4 = {:.4}）/ \
+             托盘→描边 {tray_to_edge:.4} / 托盘→白胶囊 {tray_to_capsule:.4}（改前 = {:.4}）/ \
+             托盘→胶囊描边 {tray_to_capsule_edge:.4}",
+            step(0xFFF1F2F4, COLOR_BG),
+            step(COLOR_SEG_CAPSULE, 0xFFF1F2F4)
+        );
+        assert!(
+            canvas_to_tray >= 0.06,
+            "托盘 vs 画布相对亮度差 {canvas_to_tray:.4} < 0.06 ⇒ 远看认不出托盘（回退到了旧值 #F1F2F4 的档位）"
+        );
+        assert!(
+            relative_luminance(COLOR_SEG_TRAY) < relative_luminance(COLOR_BG),
+            "托盘必须比画布深"
+        );
+        assert!(
+            relative_luminance(COLOR_SEG_TRAY_EDGE) < relative_luminance(COLOR_SEG_TRAY),
+            "托盘描边必须比托盘深（否则等于没有描边）"
+        );
+        assert!(
+            relative_luminance(COLOR_SEG_CAPSULE) > relative_luminance(COLOR_SEG_TRAY),
+            "白胶囊必须比托盘亮（选中项的层级）"
+        );
+        assert!(
+            tray_to_capsule >= 0.15,
+            "白胶囊 vs 托盘相对亮度差 {tray_to_capsule:.4} < 0.15 ⇒ 选中层次不够"
+        );
+        assert!(
+            tray_to_capsule_edge >= 0.06,
+            "胶囊描边 vs 托盘相对亮度差 {tray_to_capsule_edge:.4} < 0.06 ⇒ 描边会被托盘吃掉（托盘加深后必须同步加深描边）"
+        );
     }
 
     /// **A-8（判据）**：`fit_text` 恰好放得下 ⇒ 原样；超 1 px ⇒ 末尾 `…` 且总宽 ≤ 上限。

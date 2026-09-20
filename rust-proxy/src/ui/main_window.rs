@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
     EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
     DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    DT_WORDBREAK, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    DT_WORDBREAK, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::Graphics::GdiPlus::PointF;
 use windows::Win32::UI::Controls::{
@@ -606,6 +606,156 @@ fn status_label(status: &Status) -> &'static str {
     }
 }
 
+/// 把一段**实测文本宽**在 `[left, right]` 容器内水平居中 → `(left, right)`（两者相差**恰为**
+/// `text_width` ⇒ 居中由**矩形本身**承载，与 `DT_*` 对齐标志无关）。
+///
+/// 为什么不是"整条内带 + `DT_CENTER`"了事：单行形态下要参与机械判据
+/// （`p8_main_panel_texts_are_horizontally_centered` 的"文本矩形中心 ≡ 容器中心"）——
+/// 只有"矩形宽 = 实测文本宽"这一形态能让"画在哪"与"量到的在哪"是同一个数。
+/// 必须折行的形态（卡片标签在窄窗）另走"整条内带 + `DT_CENTER`"，两态各用其形。
+pub fn centered_text_span(left: i32, right: i32, text_width: i32) -> (i32, i32) {
+    let center = left + (right - left) / 2;
+    let half = text_width.max(0) / 2;
+    (center - half, center - half + text_width.max(0))
+}
+
+/// 卡片标签的**绘制计划**（矩形 + 对齐标志）—— `paint` 与单测共用的**唯一几何出口**。
+///
+/// 用户真机报障（192 DPI）：「主页面的四个框框下方的文字也没有居中」—— 旧实现把标签画在
+/// `[card.left + 2, card.right − 2]` 的整条内带上且 `DT_LEFT` ⇒ 文字一律贴卡片左内缘。
+///
+/// 现口径（**按实测宽算 x，不写死偏移**）：
+/// - **单行放得下**（默认 / 放大档）⇒ 矩形**恰为实测文本宽**（`theme::measure_text`）、
+///   中心 = 卡片中心（[`centered_text_span`]）；
+/// - **必须折行**（窄窗：`请求（近 120 s）` 实测 92 px > 内带 87 px）⇒ 整条内带（对称于卡片中心，
+///   折行需要它）+ `DT_CENTER` 逐行居中；
+/// - 竖直两段式（P1-①：量高决定折行还是单行省略）**一字未动**。
+///
+/// **负例锚点**：把 [`centered_text_span`] 的结果左移 8 px ⇒
+/// `p8_main_panel_texts_are_horizontally_centered` 的卡片断言必 FAIL（原始失败消息见 done.md）。
+pub fn card_label_plan(
+    hdc: HDC,
+    font: HFONT,
+    card: &RECT,
+    label: &str,
+    scale: f32,
+    value_bottom: i32,
+) -> (RECT, DRAW_TEXT_FORMAT) {
+    let pad = (2.0 * scale).round() as i32;
+    let gap = (2.0 * scale).round() as i32;
+    let band_left = card.left + pad;
+    let band_right = card.right - pad;
+    let band_width = (band_right - band_left).max(0);
+    let measured = super::theme::measure_text(hdc, font, label);
+    let needed = super::theme::measure_wrapped_height(hdc, font, label, band_width);
+    let band_top_max = value_bottom + gap;
+    let band_bottom = card.bottom - pad;
+    let plan_top = card.top + (52.0 * scale).round() as i32;
+    let two_lines_fit = needed > 0 && band_bottom - band_top_max >= needed;
+    // 水平：单行放得下 ⇒ 收成"恰为实测文本宽"的居中矩形；否则整条内带交给折行逐行居中
+    let (left, right) = if measured > 0 && measured <= band_width {
+        centered_text_span(card.left, card.right, measured)
+    } else {
+        (band_left, band_right)
+    };
+    let (top, format) = if two_lines_fit {
+        // 折行：上缘取"计划位"与"下沿 − 实测高度"的较小者，且不低于数值下方
+        (
+            plan_top.min(band_bottom - needed).max(band_top_max),
+            DT_CENTER | DT_WORDBREAK | DT_VCENTER,
+        )
+    } else {
+        // 兜底（极窄 × 极矮）：单行 + 省略号 —— **不出卡片、不半字**
+        (
+            band_top_max,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        )
+    };
+    (
+        RECT {
+            left,
+            top,
+            right,
+            bottom: band_bottom,
+        },
+        format,
+    )
+}
+
+/// 卡片**数值**的绘制计划（矩形 + 字体 + 对齐标志）—— `paint` 与单测共用的**唯一几何出口**
+/// （与 [`card_label_plan`] 同形）。
+///
+/// 用户真机报障（192 DPI，承接上批"标签居中"）：「框里的**数值**仍旧贴左，与标签不在一条轴上」——
+/// 旧实现把数值画在 `[card.left + PAD_CARD, card.right − PAD_CARD]` 的整条内带上且 `DT_LEFT`，
+/// 而标签已居中到卡片中心 ⇒ 同一张卡里两行文字两个轴。
+///
+/// 现口径（**只动 x；竖直与字号阶梯一字未动**）：
+/// - `pick_index` 仍吃**整条内带宽**（`卡宽 − 2 × PAD_CARD`）⇒ §2.4.3「按 `measure_text` 逐级降字号、
+///   保证不出 `…`」（A-5）的**输入与判据不变**，阶梯照旧能咬；
+/// - 选定字体下按实测宽收成"恰为实测文本宽"的居中矩形（[`centered_text_span`]）
+///   ⇒ 数值中心 ≡ 卡片中心 ≡ 标签中心（与标签**同一容器** `card.left..card.right`，内带左右对称
+///   ⇒ 两个容器的中心逐位相同）；
+/// - 实测宽溢出内带（理论上阶梯已保证不会，13 DIP 档是最后一道）⇒ 退回整条内带 + `DT_CENTER` 兜底
+///   （宁居中省略也不贴左出格）。
+///
+/// **负例锚点**：把 [`centered_text_span`] 的结果左移 8 px ⇒
+/// `p8_main_panel_texts_are_horizontally_centered` 的**数值**断言必 FAIL
+/// （原始失败消息见 `shared/progress/rust-proxy-p8-tweak-done.md`）。
+pub fn card_value_plan(
+    hdc: HDC,
+    fonts: &super::theme::NumberFonts,
+    theme: &Theme,
+    card: &RECT,
+    value: &str,
+    scale: f32,
+) -> (RECT, HFONT, DRAW_TEXT_FORMAT) {
+    let pad = (PAD_CARD * scale).round() as i32;
+    let value_h = (26.0 * scale).round() as i32;
+    let band_left = card.left + pad;
+    let band_right = card.right - pad;
+    let band = (band_right - band_left).max(0);
+    let (font, _) = fonts.pick_index(hdc, theme, value, band);
+    let measured = super::theme::measure_text(hdc, font, value);
+    let (left, right) = if measured > 0 && measured <= band {
+        centered_text_span(card.left, card.right, measured)
+    } else {
+        (band_left, band_right)
+    };
+    (
+        RECT {
+            left,
+            top: card.top + pad,
+            right,
+            bottom: card.top + pad + value_h,
+        },
+        font,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    )
+}
+
+/// 空态"井"的矩形（`geometry.is_empty()` 时绘图区那块浅底）—— **对称于曲线面板**。
+///
+/// ⚠ 空态井**不**沿用名义绘图区 `layout.curve_plot`：那个矩形的左缘 = `panel.left + px(62)` 是给
+/// **Y 轴标签列**让位用的，而空态**不画任何轴标签**（空态分支在画标签之前就返回）⇒ 那 62 DIP 是一条
+/// 纯空白，右侧却只有 `SPACE_M`(12 DIP)，井整体右偏 `(62 − 12) / 2 = 25 DIP`（用户报障：
+/// 「网络波动下方显示的栏目也没有居中」—— 空态文案本身在井内是居中的，**井**没居中）。
+/// 空态 ⇒ 左右内缩都取 12 DIP：左缘与标题「网络波动」同轴（`PAD_CARD`），右缘与名义绘图区不变
+/// （`SPACE_M`）⇒ 中心 = 面板中心。竖直两档（`plot.top` / `plot.bottom`）保持原样。
+pub fn empty_state_well(panel: &RECT, plot: &RECT, scale: f32) -> RECT {
+    RECT {
+        left: panel.left + (PAD_CARD * scale).round() as i32,
+        top: plot.top,
+        right: panel.right - (SPACE_M * scale).round() as i32,
+        bottom: plot.bottom,
+    }
+}
+
+/// 空态文案在一段可用宽度（= 空态井）内**按实测宽居中** → `(left, right)`；`paint_curve` 与单测共用。
+pub fn empty_hint_span(hdc: HDC, font: HFONT, well: &RECT, text: &str) -> (i32, i32) {
+    let width = super::theme::measure_text(hdc, font, text);
+    centered_text_span(well.left, well.right, width)
+}
+
 /// 绘制一帧（画进双缓冲的内存 DC）。
 ///
 /// `&mut UiState`：函数体要写三个 A-16 诊断计数（帧数 / 单帧最多调用 / 单帧最长耗时）。
@@ -702,8 +852,6 @@ fn paint(ui: &mut UiState, hdc: windows::Win32::Graphics::Gdi::HDC, width: i32, 
 
         // 文案**全部**来自 `panel_texts`（B-4：唯一来源；本函数只做排版）
         let texts = panel_texts(&ui.window, &ui.snapshot);
-        let card_pad = (PAD_CARD * scale).round() as i32;
-        let value_h = (26.0 * scale).round() as i32;
         // 卡片的**标签**几乎用满整卡宽（内缩 2 DIP）+ **折行但绝不越出卡片**（P1-①）：
         // `请求（近 120 s）` 真机实测 **92 px**，默认整卡 97 DIP、窄窗只有 87 DIP ⇒ 沿用 12 DIP 内缩 +
         // `DT_END_ELLIPSIS` 会把尾部 `s）` 压成 `…`（I3-b 的可见截断）；而单纯 `DT_WORDBREAK` 在窄窗
@@ -713,65 +861,32 @@ fn paint(ui: &mut UiState, hdc: windows::Win32::Graphics::Gdi::HDC, width: i32, 
         //   ② 若"数值下方 → 卡片下沿"这块空间装得下 ⇒ 折行（保持"无 `…`"的既有观感），
         //      否则 ⇒ 退化为 `DT_SINGLELINE | DT_END_ELLIPSIS`（宁 `请求（近 1…` 也不出卡片 ——
         //      与审阅建议一致，且只在极窄×极矮的角落生效）。
-        let label_pad = (2.0 * scale).round() as i32;
-        let label_gap = (2.0 * scale).round() as i32;
+        // ⚠ 水平**改居中**（用户报障：旧实现 `DT_LEFT` ⇒ 标签贴左内缘）：矩形与对齐标志全部来自
+        //   [`card_label_plan`]（绘制与单测的同一出口 ⇒ "标签中心 ≡ 卡片中心"是机械判据）。
         for (index, card) in layout.cards.iter().enumerate() {
             let (label, value) = match texts.cards.get(index) {
                 Some((label, value)) => (label.as_str(), value.as_str()),
                 None => ("", ""),
             };
-            let value_rect = RECT {
-                left: card.left + card_pad,
-                top: card.top + card_pad,
-                right: card.right - card_pad,
-                bottom: card.top + card_pad + value_h,
-            };
-            // §2.4.3：数值按文本宽逐级降字号（21 → 19 → 17 → 15），**保证不出现 `…`**
-            let (value_font, _) = ui.number_fonts.pick_index(
+            // ⚠ 数值**也**居中（用户报障：数值与标签不在同一轴上）：矩形 / 字体 / 对齐标志全部来自
+            //   [`card_value_plan`]（绘制与单测的同一出口 ⇒ "数值中心 ≡ 卡片中心"是机械判据）；
+            //   §2.4.3 的**字号阶梯入口（整条内宽带）在该函数里** ⇒ A-5 一字未改。
+            let (value_rect, value_font, value_format) =
+                card_value_plan(hdc, &ui.number_fonts, &ui.theme, card, value, scale);
+            draw_text(hdc, value_font, COLOR_INK, value_rect, value, value_format);
+            let (label_rect, label_format) = card_label_plan(
                 hdc,
-                &ui.theme,
-                value,
-                value_rect.right - value_rect.left,
+                ui.theme.font_small,
+                card,
+                label,
+                scale,
+                value_rect.bottom,
             );
-            draw_text(
-                hdc,
-                value_font,
-                COLOR_INK,
-                value_rect,
-                value,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-            );
-            // P1-① 的两段式：先量"折行需要的真实高度"，再决定折行还是单行省略。
-            let label_width = (card.right - label_pad) - (card.left + label_pad);
-            let needed =
-                super::theme::measure_wrapped_height(hdc, ui.theme.font_small, label, label_width);
-            let band_top_max = value_rect.bottom + label_gap;
-            let band_bottom = card.bottom - label_pad;
-            let plan_top = card.top + (52.0 * scale).round() as i32;
-            let two_lines_fit = needed > 0 && band_bottom - band_top_max >= needed;
-            let (label_top, label_format) = if two_lines_fit {
-                // 折行：上缘取"计划位"与"下沿 − 实测高度"的较小者，且不低于数值下方
-                (
-                    plan_top.min(band_bottom - needed).max(band_top_max),
-                    DT_LEFT | DT_WORDBREAK | DT_VCENTER,
-                )
-            } else {
-                // 兜底（极窄 × 极矮）：单行 + 省略号 —— **不出卡片、不半字**
-                (
-                    band_top_max,
-                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-                )
-            };
             draw_text(
                 hdc,
                 ui.theme.font_small,
                 COLOR_INK_SOFT,
-                RECT {
-                    left: card.left + label_pad,
-                    top: label_top,
-                    right: card.right - label_pad,
-                    bottom: band_bottom,
-                },
+                label_rect,
                 label,
                 label_format,
             );
@@ -981,16 +1096,26 @@ unsafe fn paint_curve(
         return;
     }
     if geometry.is_empty() {
-        // 空态：绘图区画 `COLOR_SURFACE_SUNKEN` 圆角底 + 居中 caption（文案 = `latency_text()` 同一真源）
-        let (x, y, w, h) = rect_tuple(&plot);
+        // 空态：画 `COLOR_SURFACE_SUNKEN` 圆角底 + 居中 caption（文案 = `latency_text()` 同一真源）。
+        // ⚠ 井**不是** `plot`：空态不画轴标签 ⇒ 名义绘图区左侧那条"Y 轴标签列让位"（62 DIP）在空态
+        // 是纯空白，井会整体右偏 —— 见 [`empty_state_well`]（用户报障的**真正偏移源**）。
+        let well = empty_state_well(panel, &nominal, scale);
+        let (x, y, w, h) = rect_tuple(&well);
         gfx.fill_round_rect(x, y, w, h, RADIUS_CARD * scale, COLOR_SURFACE_SUNKEN);
         ui.curve_calls += 1;
+        let hint = ui.window.latency_text();
+        let (hint_left, hint_right) = empty_hint_span(hdc, ui.theme.font_small, &well, &hint);
         draw_text(
             hdc,
             ui.theme.font_small,
             COLOR_INK_FAINT,
-            layout.curve_hint,
-            &ui.window.latency_text(),
+            RECT {
+                left: hint_left,
+                top: layout.curve_hint.top,
+                right: hint_right,
+                bottom: layout.curve_hint.bottom,
+            },
+            &hint,
             DT_CENTER | DT_SINGLELINE | DT_VCENTER,
         );
         ui.curve_micros_max = ui.curve_micros_max.max(started.elapsed().as_micros());
@@ -2013,5 +2138,266 @@ mod tests {
             texts.latency
         );
         assert_eq!(texts.cards[0].0, "请求（近 60 s）");
+    }
+
+    /// 几何中心（判据用；`left + (right-left)/2` 与 `(left+right)/2` 对非负坐标同值）。
+    fn center_x(rect: &RECT) -> i32 {
+        rect.left + (rect.right - rect.left) / 2
+    }
+
+    /// 【P8-UI2 · 居中】主面板两处文字的**水平居中**机械判据（用户真机报障 192 DPI：
+    /// 「四个框框下方的文字也没有居中，网络波动下方显示的栏目也没有居中」）：
+    ///
+    /// ① **四张卡的标签**：文本矩形中心 ≡ 卡片中心（≤ 1 DIP）；
+    /// ①b **四张卡的数值**（P8-UI2-tweak 补）：数值矩形中心 ≡ 卡片中心（≤ 1 DIP）
+    ///     —— 四档取值（空闲 `0` / 大数 `1,234`·`5,678`·`1,234,567` / 合成探针 `1,234,567` /
+    ///     超宽兜底 `12,345,678`）各自都要居中，且矩形 ∈ 卡片；放得下 ⇒ 矩形宽 ≡ 实测文本宽、
+    ///     放不下 ⇒ 矩形宽 ≡ 整条内带（两种形态都不许贴左）；`pick_index` 的入口仍是**整条内带**；
+    /// ② **曲线空态行**（`—（近 120 s 无样本）`）：文本中心 ≡ 其**栏位**（空态井）中心 ≡ 曲线面板中心；
+    /// ③ **四档 DPI**（96 / 120 / 144 / 192）× **折行 / 非折行客户区**（460 单行标签 / 433·420 折两行 /
+    ///     420×366 兜底档）各跑一遍；
+    /// ④ 对齐标志必须含 `DT_CENTER`（旧缺陷形态 = 整条内带 + `DT_LEFT` ⇒ 贴左内缘）；
+    /// ⑤ 阶梯**必要性**：`1,234,567` 在 21 DIP 档放不下 ⇒ 必须降档（A-5 的输入是整条内带，
+    ///     把它换成"居中后的矩形宽"会先在这一条断）。
+    ///
+    /// **负例锚点**（[E13] 强制；三条本批实跑/沿用，原始失败消息见 done.md）：
+    /// - 把 [`centered_text_span`] 的结果左移 8 px ⇒ ① 必 FAIL；
+    /// - 把 [`card_value_plan`] 里 [`centered_text_span`] 的结果左移 8 px ⇒ ①b 必 FAIL；
+    /// - 把 [`empty_hint_span`] 的结果左移 4 px ⇒ ② 必 FAIL。
+    ///
+    /// ⚠ 本判据是"绘制同一出口"的机械面（`card_label_plan` / `card_value_plan` / `empty_state_well` /
+    /// `empty_hint_span` 就是 `paint` 用的那四个函数）；**像素级**证据另见真机截图（`main-after/`）。
+    #[test]
+    fn p8_main_panel_texts_are_horizontally_centered() {
+        let snapshot = Stats::new().snapshot();
+        let idle = Stats::new().window().snapshot();
+        let texts = panel_texts(&idle, &snapshot);
+        // ①b 的取值四档：空闲 `0` / **大数档**（真实的四位数与七位数）/ **阶梯探针**（A-5 的既有样本
+        // `1,234,567` —— 它在 21 DIP 档放不下 ⇒ 每张卡都会真走到"阶梯降档"那条路）/
+        // **超宽兜底档**（`12,345,678`：8 位 + 两个逗号**超出 13 DIP 档**的能力 ⇒ 走"整条内带"分支；
+        // 实测 96 DPI × 420 DIP 客户区 = 70 px > 内带 66 px —— 这是**既有能力边界**，非本批引入）。
+        let mut big_window = Stats::new().window().snapshot();
+        big_window.requests = 1234;
+        big_window.preflight = 5_678;
+        big_window.errors = 1_234_567;
+        let big_texts = panel_texts(&big_window, &Stats::new().snapshot());
+        const LADDER_PROBE: &str = "1,234,567";
+        const OVER_WIDE_PROBE: &str = "12,345,678";
+        let mut report = Vec::new();
+        for dpi in [96_u32, 120, 144, 192] {
+            let scale = dpi as f32 / 96.0;
+            let theme = Theme::new(dpi);
+            let hdc = unsafe { GetDC(None) };
+            let number_fonts = super::super::theme::NumberFonts::new(&theme.face, theme.scale);
+            // 默认 460 DIP（标签单行）+ 窄窗 420 DIP（标签**折两行** ⇒ 走"整条内带 + DT_CENTER"
+            // 那条分支）+ 最小高 366（竖直两段式的兜底档）—— 三种客户区都要居中。
+            for (width_dip, height_dip) in [
+                (460.0_f32, 400.0_f32),
+                (433.0, 400.0),
+                (420.0, 400.0),
+                (420.0, 366.0),
+            ] {
+                let width = (width_dip * scale).round() as i32;
+                let height = (height_dip * scale).round() as i32;
+                let layout = layout_metrics(scale, width, height, false, false);
+
+                // ── ① 四张卡：标签文本矩形中心 ≡ 卡片中心
+                for (index, card) in layout.cards.iter().enumerate() {
+                    // ①b 数值（P8-UI2-tweak）：矩形中心 ≡ 卡片中心、矩形 ∈ 卡片、宽 ≡ 实测宽。
+                    // `must_fit=true` 的档 = 真实取值 ⇒ 还必须"选定档真放得下"（A-5 的入口没被改窄：
+                    // `pick_index` 的上限仍是**整条内带**，不是居中后的矩形宽）。
+                    for (tag, value_text, must_fit) in [
+                        ("空闲", texts.cards[index].1.as_str(), true),
+                        ("大数", big_texts.cards[index].1.as_str(), true),
+                        ("阶梯探针", LADDER_PROBE, true),
+                        ("超宽兜底", OVER_WIDE_PROBE, false),
+                    ] {
+                        let (v_rect, v_font, v_format) =
+                            card_value_plan(hdc, &number_fonts, &theme, card, value_text, scale);
+                        let v_measured = measure_text(hdc, v_font, value_text);
+                        let v_band =
+                            (card.right - theme.px(PAD_CARD)) - (card.left + theme.px(PAD_CARD));
+                        let fallback = v_measured <= 0 || v_measured > v_band;
+                        report.push(format!(
+                            "{dpi} DPI {width_dip}×{height_dip} 卡{index} 数值「{value_text}」({tag}) \
+                             实测 {v_measured}px / 内带 {v_band}px / {} ⇒ 数值矩形 {v_rect:?} 中心 {} \
+                             vs 卡中心 {}",
+                            if fallback { "兜底内带" } else { "恰为实测宽" },
+                            center_x(&v_rect),
+                            center_x(card)
+                        ));
+                        assert!(
+                            (center_x(&v_rect) - center_x(card)).abs() <= 1,
+                            "{} DPI 卡片 {index} 数值「{value_text}」({tag}) **没有居中**：数值矩形中心 {} \
+                             与卡片中心 {} 偏差 {} px（> 1 DIP）—— 数值矩形 {v_rect:?} / 卡片 {card:?}",
+                            dpi,
+                            center_x(&v_rect),
+                            center_x(card),
+                            (center_x(&v_rect) - center_x(card)).abs()
+                        );
+                        assert_eq!(
+                            (v_format.0 & DT_CENTER.0),
+                            DT_CENTER.0,
+                            "{dpi} DPI 卡片 {index} 数值「{value_text}」({tag}) 的绘制标志必须含 \
+                             DT_CENTER（实得 {:#X}）",
+                            v_format.0
+                        );
+                        // 矩形 ∈ 卡片（居中不得以出界为代价）
+                        assert!(
+                            v_rect.left >= card.left && v_rect.right <= card.right,
+                            "{dpi} DPI 卡片 {index} 数值「{value_text}」({tag})：数值矩形 {v_rect:?} \
+                             越出卡片 {card:?}"
+                        );
+                        // 两种形态各用其形：放得下 ⇒ 恰为实测宽；放不下 ⇒ **整条内带**（仍居中 + 省略号）
+                        let expect_w = if fallback { v_band } else { v_measured };
+                        assert_eq!(
+                            v_rect.right - v_rect.left,
+                            expect_w,
+                            "{dpi} DPI 卡片 {index} 数值「{value_text}」({tag}) 的矩形宽必须 = \
+                             {}（实测 {v_measured} / 内带 {v_band} / 矩形 {}）",
+                            if fallback {
+                                "整条内带"
+                            } else {
+                                "实测文本宽"
+                            },
+                            v_rect.right - v_rect.left
+                        );
+                        assert!(
+                            !must_fit || !fallback,
+                            "{} DPI 卡片 {index} 数值「{value_text}」({tag}) 会出 `…`：{v_measured}px > \
+                             内带 {v_band}px —— 阶梯入口（整条内带）必须仍然咬得住",
+                            dpi
+                        );
+                    }
+
+                    let label = texts.cards[index].0.as_str();
+                    // 标签的竖直下界 = **数值计划的底边**（与 `paint` 同一出口 ⇒ 不再各算一遍常量）
+                    let value_bottom = card_value_plan(
+                        hdc,
+                        &number_fonts,
+                        &theme,
+                        card,
+                        texts.cards[index].1.as_str(),
+                        scale,
+                    )
+                    .0
+                    .bottom;
+                    let (rect, format) =
+                        card_label_plan(hdc, theme.font_small, card, label, scale, value_bottom);
+                    let measured = measure_text(hdc, theme.font_small, label);
+                    let card_pad = theme.px(2.0);
+                    let band = (card.right - card_pad) - (card.left + card_pad);
+                    report.push(format!(
+                        "{dpi} DPI {width_dip}×{height_dip} 卡{index}「{label}」实测 {measured}px / \
+                         内带 {band}px ⇒ 文本矩形 {rect:?} 中心 {} vs 卡中心 {}",
+                        center_x(&rect),
+                        center_x(card)
+                    ));
+                    assert!(
+                        (center_x(&rect) - center_x(card)).abs() <= 1,
+                    "{} DPI 卡片 {index}「{label}」**没有居中**：文本矩形中心 {} 与卡片中心 {} \
+                     偏差 {} px（> 1 DIP）—— 文本矩形 {rect:?} / 卡片 {card:?}",
+                    dpi,
+                    center_x(&rect),
+                    center_x(card),
+                    (center_x(&rect) - center_x(card)).abs()
+                );
+                    assert_eq!(
+                        (format.0 & DT_CENTER.0),
+                        DT_CENTER.0,
+                        "{dpi} DPI 卡片 {index}「{label}」的绘制标志必须含 DT_CENTER（实得 {:#X}）",
+                        format.0
+                    );
+                    // 矩形 ∈ 卡片（居中不得以出界为代价）
+                    assert!(
+                        rect.left >= card.left && rect.right <= card.right,
+                        "{dpi} DPI 卡片 {index}：标签矩形 {rect:?} 越出卡片 {card:?}"
+                    );
+                    // 单行形态：矩形宽 ≡ 实测文本宽（"按实测宽算 x"这一半也要能咬）
+                    if measured > 0 && measured <= band {
+                        assert_eq!(
+                            rect.right - rect.left,
+                            measured,
+                            "{dpi} DPI 卡片 {index}「{label}」单行形态的矩形宽必须 = 实测文本宽 \
+                         （实测 {measured} / 矩形 {}）",
+                            rect.right - rect.left
+                        );
+                    }
+                }
+
+                // ── ①c 阶梯**必要性**（A-5 的入口是整条内带，不是"居中后的矩形宽"）：
+                //     合成探针在 21 DIP 档放不下 ⇒ 必须降档；把入口改窄会让这条先断。
+                let probe_band = (layout.cards[0].right - theme.px(PAD_CARD))
+                    - (layout.cards[0].left + theme.px(PAD_CARD));
+                let probe_at_21 = measure_text(hdc, theme.font_number, LADDER_PROBE);
+                let (probe_font, probe_index) =
+                    number_fonts.pick_index(hdc, &theme, LADDER_PROBE, probe_band);
+                report.push(format!(
+                    "{dpi} DPI {width_dip}×{height_dip} 阶梯探针「{LADDER_PROBE}」21 档 {probe_at_21}px / \
+                     内带 {probe_band}px ⇒ 选定 {probe_index} 档（{}px）",
+                    measure_text(hdc, probe_font, LADDER_PROBE)
+                ));
+                assert!(
+                    probe_at_21 > probe_band,
+                    "{dpi} DPI {width_dip}×{height_dip}：探针「{LADDER_PROBE}」在 21 DIP 档居然放得下\
+                     （{probe_at_21} ≤ {probe_band}）⇒ ①c 失去意义（卡宽/字号变了要换探针）"
+                );
+                assert!(
+                    probe_index >= 1,
+                    "{dpi} DPI {width_dip}×{height_dip}：探针必须**降过档**（实得第 {probe_index} 档）"
+                );
+
+                // ── ② 曲线空态行：文本中心 ≡ 空态井中心 ≡ 曲线面板中心
+                let well = empty_state_well(&layout.curve_panel, &layout.curve_plot, scale);
+                let empty_hint = idle.latency_text();
+                let (hint_left, hint_right) =
+                    empty_hint_span(hdc, theme.font_small, &well, &empty_hint);
+                let hint_center = hint_left + (hint_right - hint_left) / 2;
+                report.push(format!(
+                "{dpi} DPI 空态「{empty_hint}」文本 {hint_left}..{hint_right} 中心 {hint_center} / \
+                 井中心 {} / 面板中心 {}",
+                center_x(&well),
+                center_x(&layout.curve_panel)
+            ));
+                assert!(
+                    (hint_center - center_x(&well)).abs() <= 1,
+                    "{} DPI 曲线空态行**没有在栏位内居中**：文本中心 {hint_center} 与井中心 {} \
+                 偏差 {} px（井 {well:?} / 文本 {hint_left}..{hint_right}）",
+                    dpi,
+                    center_x(&well),
+                    (hint_center - center_x(&well)).abs()
+                );
+                // 井本身也必须居中（**真正的偏移源**：旧实现沿用名义绘图区 ⇒ 左 62 DIP 让位给 Y 标签列、
+                // 右只有 12 DIP ⇒ 井整体右偏 25 DIP。空态不画轴标签 ⇒ 左右内缩必须相等）
+                assert!(
+                    (center_x(&well) - center_x(&layout.curve_panel)).abs() <= 1,
+                    "{} DPI 空态井**没有在面板内居中**：井中心 {} vs 面板中心 {}（井 {well:?} / \
+                 面板 {:?}）—— 空态不画 Y 轴标签 ⇒ 不得沿用名义绘图区的左侧标签列让位",
+                    dpi,
+                    center_x(&well),
+                    center_x(&layout.curve_panel),
+                    layout.curve_panel
+                );
+                assert_eq!(
+                    well.left - layout.curve_panel.left,
+                    layout.curve_panel.right - well.right,
+                    "{dpi} DPI 空态井左右内缩必须相等（左 {} / 右 {}）",
+                    well.left - layout.curve_panel.left,
+                    layout.curve_panel.right - well.right
+                );
+                assert!(
+                    well.left >= layout.curve_panel.left
+                        && well.right <= layout.curve_panel.right
+                        && well.top >= layout.curve_panel.top
+                        && well.bottom <= layout.curve_panel.bottom,
+                    "{dpi} DPI 空态井 {well:?} 越出面板 {:?}",
+                    layout.curve_panel
+                );
+            }
+            // DC 每档 DPI 一个（**不能**放进客户区循环 —— 放里面会在第二档起晒出已释放的 DC：
+            // 实测会静默退化成 `measure_text = 0`）
+            unsafe { ReleaseDC(None, hdc) };
+        }
+        println!("P8-UI2 居中读数（DPI · 客户区 · 文本矩形 · 中心）：{report:?}");
     }
 }

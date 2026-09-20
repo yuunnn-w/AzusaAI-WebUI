@@ -106,10 +106,14 @@ pub struct UiState {
     /// 为什么不是"seq 变化"闸：服务端一次 apply 有 3 条 publish（seq 恒为 N），
     /// 用 seq 当闸 ⇒ 终态帧被当成"没变化"丢掉 ⇒ 结果行永远停在「正在应用…」（P7 诉求 ②）。
     pub last_apply_notice: Option<(u64, service::ApplyStage, Option<String>)>,
-    /// 设置窗分段控件的**草稿态**（状态自持：不读 `BM_GETCHECK`/`CB_GETCURSEL`；不持久化）。
+    /// 设置窗互斥选项组的**草稿态**（状态自持：不读 `BM_GETCHECK`/`CB_GETCURSEL`；不持久化）。
     pub draft_cors: usize,
+    /// 日志级别（**下拉**；索引 ↔ 配置字符串的唯一映射 = `settings_window::log_level_name`）。
     pub draft_log_level: usize,
     pub draft_close_action: usize,
+    /// 日志级别下拉是否展开 + 悬停项（P8-UI2；展开时列表是设置窗的子窗口覆盖层，收起即隐藏）。
+    pub dropdown_open: bool,
+    pub dropdown_hover: Option<usize>,
     /// 「高级选项」是否展开（决定行表可见行与窗口高）。
     pub advanced_open: bool,
     /// 设置窗结果行墨色（三态渲染读它；三个 owner 各自设置）。
@@ -160,6 +164,8 @@ impl UiState {
             draft_cors: 0,
             draft_log_level: 2,
             draft_close_action: 0,
+            dropdown_open: false,
+            dropdown_hover: None,
             advanced_open: false,
             result_tone: settings_window::ResultTone::Plain,
         }

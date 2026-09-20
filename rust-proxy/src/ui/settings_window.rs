@@ -1,5 +1,5 @@
-//! 设置小窗（P7 I1 改造）：**行表布局（`plan()` 纯函数）** + 自绘分段控件 / 复选框 / 按钮 +
-//! 三态结果行 + 失败提示条。
+//! 设置小窗（P7 I1 改造 + **P8-UI2 布局轮**）：**行表布局（`plan()`）** + 自绘互斥选项组
+//! （**托盘 + 选中胶囊**）/ 复选框 / 按钮 / **窗口内覆盖层下拉** + 三态结果行 + 失败提示条。
 //!
 //! 口径（P6-S4 去配置文件后的新语义，方案 §3.2）：
 //! - **[应用]** = 校验 → **仅内存生效**（`Controller::apply`）→ 结果行提示；**不写任何文件**
@@ -9,14 +9,18 @@
 //! - **没有"以文件为准"**：FR-38 的打开时读盘热生效随去配置文件一并删除；
 //! - `[测试上游]` 是**唯一**的主动探测（由用户触发，FR-8）：GET `{upstream}/v1/models`，显示状态码与耗时。
 //!
-//! I1 的四个结构要点（判据都钉在它们上）：
-//! 1. **布局唯一真源 = [`plan()`]**（纯函数：`scale × advanced × notice × 可用高度` → 客户区 + 控件表）；
-//!    创建、重排（高级展开 / DPI 变化 / 提示条显隐）与单测（A-3）读同一份；
+//! 结构要点（判据都钉在它们上）：
+//! 1. **布局唯一真源 = [`plan()`]**（`主题 × 高级展开 × 提示条 × 可用高度` → 客户区 + 控件表 + 托盘表）；
+//!    创建、重排（高级展开 / DPI 变化 / 提示条显隐）与单测（A-3/A-3b）读同一份；
 //! 2. **裁切修复**：所有单行 `STATIC` 带局部 `const SS_LEFTNOWORDWRAP`（横裁而非折行）；日志读数行
 //!    独立满行 + 文案走 [`crate::ui::log_stat_text`]（与 I2 的日志窗共用）+ `fit_text` 量宽收口；
-//! 3. **分段控件 / 复选框 / 按钮全部自绘**（`BS_OWNERDRAW` + 父窗 `WM_DRAWITEM`；状态自持 ——
-//!    **不读 `BM_GETCHECK` / `CB_GETCURSEL`**）；EDIT 补 `WS_TABSTOP`（既有缺陷：键盘 Tab 进不去输入框）；
-//! 4. **结果行三态 + 失败提示条**归 A 组行为面：文本来自 `Status.apply_message`，墨色读
+//! 3. **互斥选项组 = 托盘 + 选中胶囊**（P8-UI2）：组内含 N 个自绘段，**段宽按文字实测**（`measure_text`，
+//!    不再写死/撑满列槽）、**段间距 `SEG_ITEM_GAP`**；选中态 = 托盘上的白色胶囊（1 DIP 极淡描边 +
+//!    柔和投影），**不再用粉色描边**；托盘由父窗画（`WM_PAINT`），段由父窗 `WM_DRAWITEM` 画；
+//! 4. **日志级别 = 窗口内覆盖层下拉**（P8-UI2）：字段是自绘 `BUTTON`（井 + chevron），列表是
+//!    **子窗口覆盖层**（`STATIC`+`SS_OWNERDRAW`，展开时 `HWND_TOP`）—— 不新开 `WS_POPUP` 顶层窗、
+//!    不抢焦点；点项即选中并收起、点其它处 / `Esc` / 失焦收起；hover 走 60 ms 节拍器（见 [`DROPDOWN_HOVER_MS`]）；
+//! 5. **结果行三态 + 失败提示条**归 A 组行为面：文本来自 `Status.apply_message`，墨色读
 //!    `Status.apply_stage`（`Failed` ⇒ `✗` + 红 + 3 DIP 竖条与顶部提示条）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,36 +28,44 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    InvalidateRect, ReleaseDC, SetBkColor, SetBkMode, SetTextColor, DT_CENTER, DT_LEFT,
-    DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    InvalidateRect, ReleaseDC, ScreenToClient, SetBkColor, SetBkMode, SetTextColor, DT_CENTER,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, ODT_BUTTON, ODT_STATIC,
 };
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetDlgItem,
-    GetSystemMetrics, GetWindowLongPtrW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, BS_OWNERDRAW, CREATESTRUCTW,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER, GWLP_USERDATA, HMENU, SM_CYCAPTION, SM_CYSIZEFRAME,
-    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+    GetCursorPos, GetDlgItem, GetParent, GetSystemMetrics, GetWindowLongPtrW, KillTimer,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, SystemParametersInfoW, BS_OWNERDRAW, CREATESTRUCTW, CW_USEDEFAULT, ES_AUTOHSCROLL,
+    ES_NUMBER, GWLP_USERDATA, HMENU, HWND_TOP, SM_CYCAPTION, SM_CYSIZEFRAME, SPI_GETWORKAREA,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
     WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_DRAWITEM, WM_ERASEBKGND, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSW,
-    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 use azusa_local_proxy::logging::{Logger, LOG_RING_CAPACITY};
 use azusa_local_proxy::service::{ApplyStage, APPLY_START_TEXT};
 
+use windows::Win32::Graphics::GdiPlus::PointF;
+
 use super::theme::{
-    fit_text, gdi_color, measure_text, wide, Gfx, BTN_H, COLOR_ACCENT_DEEP, COLOR_ACCENT_PRESSED,
-    COLOR_ACCENT_RING, COLOR_ACCENT_SOFT, COLOR_BG, COLOR_CARD, COLOR_CARD_BORDER,
-    COLOR_DANGER_INK, COLOR_INK, COLOR_INK_DISABLED, COLOR_INK_SOFT, COLOR_NOTICE_BG,
-    COLOR_NOTICE_BORDER, COLOR_NOTICE_INK, COLOR_PRESS_ON_CARD, RADIUS_BUTTON, RADIUS_CARD,
-    RADIUS_FIELD, ROW_H, ROW_STEP, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SPACE_XXL,
+    fit_text, gdi_color, measure_text, wide, Gfx, Theme, BTN_H, COLOR_ACCENT_DEEP,
+    COLOR_ACCENT_PRESSED, COLOR_ACCENT_RING, COLOR_BG, COLOR_BORDER_STRONG, COLOR_CARD,
+    COLOR_CARD_BORDER, COLOR_DANGER_INK, COLOR_HOVER_ON_CARD, COLOR_INK, COLOR_INK_DISABLED,
+    COLOR_INK_SOFT, COLOR_NOTICE_BG, COLOR_NOTICE_BORDER, COLOR_NOTICE_INK, COLOR_PRESS_ON_CARD,
+    COLOR_SEG_CAPSULE, COLOR_SEG_CAPSULE_EDGE, COLOR_SEG_TRAY, COLOR_SEG_TRAY_EDGE, RADIUS_BUTTON,
+    RADIUS_CARD, RADIUS_FIELD, ROW_H, ROW_STEP, SEG_CAPSULE_INSET, SEG_CAPSULE_RADIUS,
+    SEG_ITEM_GAP, SEG_ITEM_PAD_H, SEG_TRAY_PAD, SEG_TRAY_RADIUS, SPACE_L, SPACE_M, SPACE_S,
+    SPACE_XL, SPACE_XS,
 };
 use super::{log_stat_text, UiState, SETTINGS_WINDOW_CLASS, WM_APP_TEST_RESULT};
 
@@ -86,9 +98,13 @@ const IDC_APPLY: usize = 3018;
 const IDC_COPY_LOGS: usize = 3019;
 /// 「响应头超时(ms)」新字段（P7 §2.6.1 行 5；单位 = ms，与 `--help`/config 同单位）。
 const IDC_FIELD_RESPONSE_HEAD: usize = 3020;
-/// 分段控件（3 组；**每组一段一个控件 ID**，状态自持在 `UiState.draft_*`）。
+/// 分段控件（**2 组互斥选项**；每组一段一个控件 ID，状态自持在 `UiState.draft_*`）。
 const IDC_SEG_CORS: [usize; 2] = [3021, 3022];
-const IDC_SEG_LOG_LEVEL: [usize; 4] = [3023, 3024, 3025, 3026];
+/// 「日志级别」下拉字段（P8-UI2：4 段分段控件 → **窗口内覆盖层下拉**；见 [`IDC_LOG_LEVEL_LIST`]）。
+const IDC_FIELD_LOG_LEVEL: usize = 3023;
+/// 下拉列表覆盖层（**子窗口**，展开时才可见；`STATIC` + `SS_OWNERDRAW`，由父窗 `WM_DRAWITEM` 画、
+/// 由子类化收鼠标）。它**不是行表项**：位置由字段矩形 + 夹取规则算出（见 [`dropdown_list_rect`]）。
+const IDC_LOG_LEVEL_LIST: usize = 3024;
 const IDC_SEG_CLOSE: [usize; 2] = [3027, 3028];
 /// 「重新载入」（把当前内存配置重新填进字段，丢弃未提交的编辑）。
 const IDC_RELOAD: usize = 3029;
@@ -98,6 +114,35 @@ const IDC_NOTICE_LOGS: usize = 3031;
 /// 连接池两项（P7 §2.6.1 行 8；**仅高级展开**可见）。
 const IDC_FIELD_POOL_MAX: usize = 3032;
 const IDC_FIELD_POOL_IDLE: usize = 3033;
+
+/// 下拉的窗口内状态机：字段按钮的子类化 id / 列表子类化 id / hover 节拍器 id。
+const FIELD_SUBCLASS_ID: usize = 1;
+const LIST_SUBCLASS_ID: usize = 2;
+const DROPDOWN_TIMER_ID: usize = 1;
+/// hover 跟踪节拍（ms；**只在展开期跑** ⇒ 收起即 `KillTimer`）。
+///
+/// 为什么用定时器而不是 `WM_MOUSELEAVE`：`TrackMouseEvent` 属
+/// `Win32::UI::Input::KeyboardAndMouse`（**该 feature 未启用**，D4 零依赖替代）；定时器
+/// （`SetTimer` ∈ `Win32_UI_WindowsAndMessaging`，主窗已有 1 s 刷新定时器的先例）用
+/// `GetCursorPos` + `ScreenToClient` 取同一份事实，且不新增 feature 面。
+const DROPDOWN_HOVER_MS: u32 = 60;
+/// `VK_ESCAPE`（值现取 Win32 头文件；`VK_*` 在未启用的 `Win32_UI_Input_KeyboardAndMouse` 里
+/// ⇒ 与 `SS_LEFTNOWORDWRAP` 同一条"局部常量"先例）。
+const VK_ESCAPE: u16 = 0x1B;
+/// 日志级别取值（**顺序 = 下拉列表顺序**；索引 ↔ 配置字符串的唯一映射面，见 [`log_level_name`]）。
+const LOG_LEVELS: [&str; 4] = ["error", "warn", "info", "debug"];
+/// 下拉列表的排版量（DIP）：项高 / 面板内边距（项与面板边之间）/ 面板与控件边的投影余量 /
+/// 字段文字左留白 / chevron 宽与右留白 / 面板与字段的纵向间隙。
+const DROPDOWN_ITEM_H: f32 = 26.0;
+const DROPDOWN_PANEL_PAD: f32 = 2.0;
+const DROPDOWN_SHADOW_MARGIN: f32 = 2.0;
+const DROPDOWN_TEXT_PAD: f32 = SPACE_S;
+const DROPDOWN_CHEVRON_W: f32 = 8.0;
+const DROPDOWN_CHEVRON_PAD: f32 = SPACE_S + 1.0;
+const DROPDOWN_GAP: f32 = 2.0;
+
+/// 对话框管理器的取消通知（`Esc` 经 `IsDialogMessageW` 会发 `WM_COMMAND` + 本值；Win32 头文件同值）。
+const IDCANCEL: usize = 2;
 
 /// 标签类 `STATIC` 的 ID（2901–2915；**不属于** 3001+ 的动作区间 ⇒ 不会进 `WM_COMMAND` 分支）。
 const IDC_LABEL_UPSTREAM: usize = 2901;
@@ -166,9 +211,10 @@ const BTN_W: f32 = 120.0;
 const BTN_GAP: f32 = SPACE_S;
 /// 屏幕放不下的退化行步（§2.6.1：「行步 30→26」）。
 const STEP_COMPACT_DIP: f32 = 26.0;
-/// 内容起点与底部余量（结构判据：**内容底余量恒 24 DIP**）。
+/// 内容起点与底部余量（结构判据：**内容底余量恒 `BOTTOM_PAD_DIP`**）。
+/// P8-UI2：`SPACE_XXL`(24) → `SPACE_L`(16) —— 用户诉求「收紧底部空白」（结果行 + 组距已自带留白）。
 const TOP_DIP: f32 = SPACE_M;
-const BOTTOM_PAD_DIP: f32 = SPACE_XXL;
+const BOTTOM_PAD_DIP: f32 = SPACE_L;
 /// 结果行高（**两行**，P2-2 容量）与失败提示条高。
 const RESULT_H_DIP: f32 = 36.0;
 const NOTICE_H_DIP: f32 = 28.0;
@@ -223,8 +269,10 @@ pub enum PlanKind {
     NumberEdit,
     /// 自绘复选框。
     Checkbox,
-    /// 自绘分段控件成员。
+    /// 自绘互斥选项组的成员（托盘 + 选中胶囊；**段宽按文字实测**）。
     Segment,
+    /// 自绘下拉字段（日志级别；井 + 右侧 chevron；列表 = 覆盖层 [`IDC_LOG_LEVEL_LIST`]）。
+    Dropdown,
     /// 自绘主按钮（樱花底 + 白字）。
     ButtonPrimary,
     /// 自绘次按钮（卡片底 + 描边）。
@@ -248,7 +296,16 @@ pub struct PlanItem {
     pub visible: bool,
 }
 
-/// 一次布局的完整结果（客户区 + 控件表 + 档位读数）。
+/// 互斥选项组的**托盘**矩形（P8-UI2；覆盖层，不是控件 ⇒ 不进 `items`、不参与"控件矩形互不重叠"）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayPlan {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// 一次布局的完整结果（客户区 + 控件表 + 托盘表 + 档位读数）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingsPlan {
     pub scale: f32,
@@ -260,6 +317,8 @@ pub struct SettingsPlan {
     /// 最后一个可见行的底（客户区高 − 它 = 底部余量，结构判据用）。
     pub content_bottom: i32,
     pub items: Vec<PlanItem>,
+    /// 互斥选项组的托盘（每组一条；由父窗 `WM_PAINT` 画，段控件在其上 ⇒ 可视部分 = 两端余量 + 段间距）。
+    pub trays: Vec<TrayPlan>,
 }
 
 /// 行表原始项（DIP；`plan()` 的输入表）。
@@ -370,17 +429,16 @@ const SPECS: &[Spec] = &[
         Column::FullRow,
         ROW_H,
     ),
-    // 行 1：高级选项（自绘复选框；L5：标签不再提"剥离前缀"）
+    // 行 1：高级选项（自绘复选框）—— P8-UI2：从右列（`Column::LabelB`）挪到**页边距左轴**
+    //（`Column::LabelA`，x = 20 DIP）。理由：它决定「剥离前缀 / 连接池」两行的显隐 ⇒ 是**区段级开关**，
+    // 应该贴着左侧标签轴站在「上游」组里；旧位置（x = 364）孤零零漂在右列首行、与 URL 行毫无关联，
+    // 是用户「布局还是不行」的可见来源之一。
     spec(
         IDC_FIELD_ADVANCED,
         PlanKind::Checkbox,
         "高级选项",
         ROW_ADVANCED,
-        // P3-②（最终验收）：原 `Column::CtrlA` —— 复选框挤在 URL 输入框正下方、同一条左对齐轴上，
-        // 读起来像「URL 行的子项」。改到**右列起点**（`Column::LabelB`，x = 第二列的左缘）：
-        // ① 只动列、不动行表 ⇒ 级联为零（不触碰 I1 已定的 620×398 / "内容底余量 24 DIP"等数字）；
-        // ② 视觉上离开 URL 输入框的左轴 ⇒ 归属一眼明确；③ 仍在自己的一行上 ⇒ A-3b 三条全绿。
-        Column::LabelB,
+        Column::LabelA,
         ROW_H,
     ),
     // 行 2：剥离前缀（整行字段，仅高级展开）
@@ -468,13 +526,22 @@ const SPECS: &[Spec] = &[
         Column::CtrlB,
         ROW_H,
     ),
-    // 行 5：日志级别（分段在列 A）/ 首字节(0=不限)
+    // 行 5：日志级别（下拉在列 A；P8-UI2 取代 4 段分段控件）/ 首字节(0=不限)
     spec(
         IDC_LABEL_LOG_LEVEL,
         PlanKind::Label,
         "日志级别",
         ROW_FIRST_BYTE_LEVEL,
         Column::LabelA,
+        ROW_H,
+    ),
+    spec_w(
+        IDC_FIELD_LOG_LEVEL,
+        PlanKind::Dropdown,
+        "",
+        ROW_FIRST_BYTE_LEVEL,
+        Column::CtrlA,
+        NUM_A_W,
         ROW_H,
     ),
     spec(
@@ -639,7 +706,8 @@ const SPECS: &[Spec] = &[
     ),
 ];
 
-/// 分段控件组（**统一策略：全部占所在列的槽宽，组内均分 + 1 DIP 间隙**；L2）。
+/// 互斥选项组（**统一策略：段宽按文字实测（粗体）+ 2 × `SEG_ITEM_PAD_H`；段间距 `SEG_ITEM_GAP`；
+/// 整组漂在一层 `SEG_TRAY_PAD` 余量的托盘上**；P8-UI2）。
 struct SegmentGroup {
     row: usize,
     ids: &'static [usize],
@@ -647,11 +715,6 @@ struct SegmentGroup {
 }
 
 const SEGMENT_GROUPS: &[SegmentGroup] = &[
-    SegmentGroup {
-        row: ROW_FIRST_BYTE_LEVEL,
-        ids: &IDC_SEG_LOG_LEVEL,
-        texts: &["error", "warn", "info", "debug"],
-    },
     SegmentGroup {
         row: ROW_CORS,
         ids: &IDC_SEG_CORS,
@@ -742,16 +805,23 @@ fn column_layout(column: Column, w_override: Option<f32>) -> (f32, f32) {
     }
 }
 
-/// 分段成员矩形（组内第 `index` 段；槽宽均分，余数给末段；间隙 1 DIP）。
-fn segment_widths(slot_w: f32, count: usize) -> Vec<f32> {
-    let total = count as f32;
-    let base = ((slot_w - (total - 1.0)) / total).floor().max(1.0);
-    let extra = (slot_w - (total - 1.0) - base * total).max(0.0);
-    let mut widths = vec![base; count];
-    if let Some(last) = widths.last_mut() {
-        *last += extra;
-    }
-    widths
+/// 段宽（**px**；P8-UI2）：`measure_text(粗体)` + 两侧 `SEG_ITEM_PAD_H`。
+///
+/// 用**粗体**量宽：选中态的文字是 `font_ui_bold`（最坏情形）⇒ 未选中（常规字重）必然放得下。
+/// ⚠ 实测值随字号非线性（GDI 提示化）：同一串在 96 DPI 比 192 DPI 的 **DIP 宽**更大
+/// ⇒ **必须在当前 DPI 现测**（`plan()` 每次都由当时主题的字体量），不能跨 DPI 缓存。
+fn segment_item_widths(theme: &Theme, hdc: HDC, group: &SegmentGroup) -> Vec<i32> {
+    let pad = theme.px(SEG_ITEM_PAD_H);
+    group
+        .texts
+        .iter()
+        .map(|text| measure_text(hdc, theme.font_ui_bold, text) + pad * 2)
+        .collect()
+}
+
+/// 托盘矩形的纵向定位：托盘与段同高、同 y（段矩形本身就在行步格上 ⇒ 托盘也落在同一行）。
+fn tray_height(theme: &Theme) -> i32 {
+    theme.px(ROW_H)
 }
 
 /// 底部动作行的分组起点（右对齐 `PAD_RIGHT`；等宽 + 等间隙 ⇒ 与列常量同源，不链式推导）。
@@ -767,27 +837,45 @@ fn action_row_origin(count: usize) -> f32 {
 /// **栅格（布局修复轮）**：行 y = `TOP_DIP + 行步格 × 行步`（同一条等差格；隐藏行不占格；
 /// 结果行之后跳过 `ACTION_GROUP_SKIP` 格 = 动作区组距）；横向定位只读列常量表 + 组内下标
 /// ⇒ A-3b 可机械断言"同列同 x / 同类同宽 / y 在格上"。
-pub fn plan(scale: f32, advanced: bool, notice: bool, available_client_dip: f32) -> SettingsPlan {
-    let normal = layout_with(scale, advanced, notice, ROW_STEP, false);
-    if available_client_dip.is_infinite() || normal.client_h as f32 / scale <= available_client_dip
+/// **布局唯一真源**：`主题（字号/DPI）× 高级展开 × 提示条 × 可用客户区高` ⇒ 客户区 + 控件表 + 托盘表。
+///
+/// 退化链（§2.6.1）：正常（行步 30）→ 屏幕放不下 ⇒ 行步 26 → 仍放不下 ⇒ **连接池组强制折叠**；
+/// 三者都不放得下 ⇒ 返回最退化档（调用方按 `client_h` 放弃精确余量，见 I1-7 的钳制分支单测）。
+///
+/// **栅格（布局修复轮）**：行 y = `TOP_DIP + 行步格 × 行步`（同一条等差格；隐藏行不占格；
+/// 结果行之后跳过 `ACTION_GROUP_SKIP` 格 = 动作区组距）；横向定位只读列常量表 + 组内下标
+/// ⇒ A-3b 可机械断言"同列同 x / 同类同宽 / y 在格上"。
+///
+/// **确定性**：同一 `theme`（同一字体、同一 DPI）下输出确定 —— 互斥选项组的段宽走 GDI 量宽
+/// （[`segment_item_widths`]），需要一张临时 DC（`GetDC(None)`；量完即还）。
+pub fn plan(
+    theme: &Theme,
+    advanced: bool,
+    notice: bool,
+    available_client_dip: f32,
+) -> SettingsPlan {
+    let normal = layout_with(theme, advanced, notice, ROW_STEP, false);
+    if available_client_dip.is_infinite()
+        || normal.client_h as f32 / theme.scale <= available_client_dip
     {
         return normal;
     }
-    let compact = layout_with(scale, advanced, notice, STEP_COMPACT_DIP, false);
-    if compact.client_h as f32 / scale <= available_client_dip {
+    let compact = layout_with(theme, advanced, notice, STEP_COMPACT_DIP, false);
+    if compact.client_h as f32 / theme.scale <= available_client_dip {
         return compact;
     }
     // 第三档：仍放不下 ⇒ 连接池组强制折叠（`advanced == false` 时该行本就不可见 ⇒ 折叠语义取 `advanced`）
-    layout_with(scale, advanced, notice, STEP_COMPACT_DIP, advanced)
+    layout_with(theme, advanced, notice, STEP_COMPACT_DIP, advanced)
 }
 
 fn layout_with(
-    scale: f32,
+    theme: &Theme,
     advanced: bool,
     notice: bool,
     step: f32,
     pool_folded: bool,
 ) -> SettingsPlan {
+    let scale = theme.scale;
     let px = |value: f32| (value * scale).round() as i32;
     let row_visible_at = |row: usize| {
         if row == ROW_NOTICE {
@@ -849,25 +937,43 @@ fn layout_with(
             visible: row_visible_at(entry.row),
         });
     }
-    // 分段成员（组表生成；统一槽宽 + 均分）
-    for group in SEGMENT_GROUPS {
-        let widths = segment_widths(COL_CTRL_A_W, group.ids.len());
-        let mut cursor = COL_CTRL_A_X;
-        for (index, id) in group.ids.iter().enumerate() {
-            let width = widths.get(index).copied().unwrap_or(COL_CTRL_A_W);
-            items.push(PlanItem {
-                id: *id,
-                kind: PlanKind::Segment,
-                text: group.texts.get(index).copied().unwrap_or(""),
-                column: Column::CtrlA,
-                x: px(cursor),
-                y: px(row_y(group.row)),
-                w: px(width),
-                h: px(ROW_H),
-                visible: row_visible_at(group.row),
-            });
-            cursor += width + 1.0;
+    // 互斥选项组（P8-UI2）：段宽**按文字实测**、段间距 `SEG_ITEM_GAP`、整组漂在托盘上。
+    // 量宽需要 DC ⇒ 用一次 `GetDC(None)`（与单测/`update_log_stat` 同一口径）。
+    let mut trays: Vec<TrayPlan> = Vec::with_capacity(SEGMENT_GROUPS.len());
+    {
+        let hdc = unsafe { GetDC(None) };
+        let tray_pad = px(SEG_TRAY_PAD);
+        let gap = px(SEG_ITEM_GAP);
+        for group in SEGMENT_GROUPS {
+            let widths = segment_item_widths(theme, hdc, group);
+            let mut cursor = px(COL_CTRL_A_X) + tray_pad;
+            let group_left = cursor;
+            for (index, id) in group.ids.iter().enumerate() {
+                let width = widths.get(index).copied().unwrap_or(0);
+                items.push(PlanItem {
+                    id: *id,
+                    kind: PlanKind::Segment,
+                    text: group.texts.get(index).copied().unwrap_or(""),
+                    column: Column::CtrlA,
+                    x: cursor,
+                    y: px(row_y(group.row)),
+                    w: width,
+                    h: px(ROW_H),
+                    visible: row_visible_at(group.row),
+                });
+                cursor += width + gap;
+            }
+            let group_right = cursor - gap;
+            if row_visible_at(group.row) {
+                trays.push(TrayPlan {
+                    x: group_left - tray_pad,
+                    y: px(row_y(group.row)),
+                    w: group_right - group_left + tray_pad * 2,
+                    h: tray_height(theme),
+                });
+            }
         }
+        unsafe { ReleaseDC(None, hdc) };
     }
     for entry in NOTICE_SPECS {
         let (x, w) = column_layout(entry.column, entry.w_override);
@@ -897,22 +1003,21 @@ fn layout_with(
         client_h: px(content_bottom + BOTTOM_PAD_DIP),
         content_bottom: px(content_bottom),
         items,
+        trays,
     }
 }
 
-/// 分段控件组（状态各自持在 `UiState.draft_*`）。
+/// 互斥选项组（状态各自持在 `UiState.draft_*`；P8-UI2 只剩两组 —— 日志级别改下拉）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SegGroup {
     Cors,
-    LogLevel,
     Close,
 }
 
-/// 分段控件的成员判定（CtlID ⇒ (组, 下标)）；非分段控件返回 `None`。
+/// 互斥选项组的成员判定（CtlID ⇒ (组, 下标)）；非组内控件返回 `None`。
 fn segment_member(id: usize) -> Option<(SegGroup, usize)> {
-    let groups: [(SegGroup, &[usize]); 3] = [
+    let groups: [(SegGroup, &[usize]); 2] = [
         (SegGroup::Cors, &IDC_SEG_CORS),
-        (SegGroup::LogLevel, &IDC_SEG_LOG_LEVEL),
         (SegGroup::Close, &IDC_SEG_CLOSE),
     ];
     for (group, ids) in groups {
@@ -926,9 +1031,20 @@ fn segment_member(id: usize) -> Option<(SegGroup, usize)> {
 fn segment_selected(ui: &UiState, group: SegGroup, index: usize) -> bool {
     match group {
         SegGroup::Cors => ui.draft_cors == index,
-        SegGroup::LogLevel => ui.draft_log_level == index,
         SegGroup::Close => ui.draft_close_action == index,
     }
+}
+
+/// 日志级别的**索引 ↔ 配置字符串**唯一映射（P8-UI2：下拉取代分段，两份重复 match 收口到这里）。
+fn log_level_name(index: usize) -> &'static str {
+    LOG_LEVELS.get(index).copied().unwrap_or(LOG_LEVELS[2]) // 越界 ⇒ `info`（与 `log_level_index` 同一兜底档）
+}
+
+fn log_level_index(level: &str) -> usize {
+    LOG_LEVELS
+        .iter()
+        .position(|candidate| *candidate == level)
+        .unwrap_or(2) // 未知值 ⇒ `info`（与旧实现的 `_ => 2` 同义）
 }
 
 /// 设置窗的全部控件句柄（创建后挂到 `UiState::settings_controls`）。
@@ -951,6 +1067,11 @@ pub struct SettingsControls {
     pub pool_idle: HWND,
     /// 只读读数行（`共 N / 上限 2000 条（已挤出 M）`）。
     pub log_stat: HWND,
+    /// 「日志级别」下拉字段（自绘 `BUTTON`；文本 = 当前级别名）。
+    pub log_level: HWND,
+    /// 下拉列表覆盖层（`STATIC` + `SS_OWNERDRAW`；**常驻但默认隐藏** —— 每次展开只做
+    /// `SetWindowPos` + `ShowWindow`，不反复创建/销毁）。
+    pub log_level_list: HWND,
     pub result: HWND,
     pub notice: HWND,
     pub all: [HWND; PLAN_ITEM_COUNT],
@@ -1003,7 +1124,7 @@ fn window_style() -> WINDOW_STYLE {
 fn current_plan(ui: &UiState) -> SettingsPlan {
     let notice = ui.status.apply_stage == ApplyStage::Failed;
     plan(
-        ui.theme.scale,
+        &ui.theme,
         ui.advanced_open,
         notice,
         available_client_dip(ui),
@@ -1141,17 +1262,13 @@ fn invalidate_control(parent: HWND, id: usize) {
     }
 }
 
-/// 分段控件 + 复选框的选中态重绘（状态自持 ⇒ 改完必须自己失效）。
+/// 互斥选项组 + 复选框的选中态重绘（状态自持 ⇒ 改完必须自己失效）。
 fn invalidate_selection(parent: HWND) {
-    for id in IDC_SEG_CORS
-        .iter()
-        .chain(IDC_SEG_LOG_LEVEL.iter())
-        .chain(IDC_SEG_CLOSE.iter())
-        .copied()
-    {
+    for id in IDC_SEG_CORS.iter().chain(IDC_SEG_CLOSE.iter()).copied() {
         invalidate_control(parent, id);
     }
     invalidate_control(parent, IDC_FIELD_ADVANCED);
+    invalidate_control(parent, IDC_FIELD_LOG_LEVEL);
 }
 
 fn find(parent: HWND, id: usize) -> HWND {
@@ -1197,17 +1314,27 @@ fn fill_fields(ui: &mut UiState, controls: &SettingsControls) {
         &(config.pool.idle_timeout_ms / 1000).to_string(),
     );
     ui.draft_cors = if config.cors.mode == "echo" { 1 } else { 0 };
-    ui.draft_log_level = match config.logging.level.as_str() {
-        "error" => 0,
-        "warn" => 1,
-        "debug" => 3,
-        _ => 2,
-    };
+    ui.draft_log_level = log_level_index(&config.logging.level);
     ui.draft_close_action = if config.ui.close_action == "exit" {
         1
     } else {
         0
     };
+    if !controls.log_level.is_invalid() {
+        set_text(controls.log_level, log_level_name(ui.draft_log_level));
+        // `BS_OWNERDRAW` 的按钮不会因 `SetWindowTextW` 自己重绘 ⇒ 手动失效
+        unsafe {
+            let _ = InvalidateRect(Some(controls.log_level), None, true);
+        }
+    }
+    // 重填字段 = 回到"未展开"的干净态（否则会出现"值变了、列表还开着"的错位）
+    ui.dropdown_open = false;
+    ui.dropdown_hover = None;
+    if !controls.log_level_list.is_invalid() {
+        unsafe {
+            let _ = ShowWindow(controls.log_level_list, SW_HIDE);
+        }
+    }
     update_log_stat(ui, controls);
     invalidate_selection(controls.parent);
 }
@@ -1350,12 +1477,7 @@ fn apply_fields(ui: &mut UiState) {
         config.pool.max_idle_per_host = parse_usize(&pool_max, "池最大空闲/主机")?;
         config.pool.idle_timeout_ms =
             seconds_to_ms(parse_u64(&pool_idle, "池空闲超时（秒）")?, "池空闲超时")?;
-        config.logging.level = match draft_log_level {
-            0 => "error".to_string(),
-            1 => "warn".to_string(),
-            3 => "debug".to_string(),
-            _ => "info".to_string(),
-        };
+        config.logging.level = log_level_name(draft_log_level).to_string();
         config.ui.close_action = if draft_close_action == 1 {
             "exit".to_string()
         } else {
@@ -1490,14 +1612,13 @@ fn toggle_advanced(ui: &mut UiState, hwnd: HWND) {
     apply_layout(ui, hwnd);
 }
 
-/// 分段控件的点击（状态自持：改草稿态 + 失效重绘；**不读 `BM_GETCHECK`**）。
+/// 互斥选项组的点击（状态自持：改草稿态 + 失效重绘；**不读 `BM_GETCHECK`**）。
 fn select_segment(ui: &mut UiState, id: usize) {
     let Some((group, index)) = segment_member(id) else {
         return;
     };
     match group {
         SegGroup::Cors => ui.draft_cors = index,
-        SegGroup::LogLevel => ui.draft_log_level = index,
         SegGroup::Close => ui.draft_close_action = index,
     }
     if let Some(controls) = ui.settings_controls.as_ref() {
@@ -1505,15 +1626,260 @@ fn select_segment(ui: &mut UiState, id: usize) {
     }
 }
 
+// ── 日志级别下拉（P8-UI2：窗口内覆盖层）────────────────────────────────────────────────────────
+
+/// 下拉列表矩形（**纯函数**）：字段正下方、与字段同宽；**夹取在客户区内**。
+///
+/// 夹取规则（用户可见的正确性面）：
+/// ① 优先向下展开（`字段底 + DROPDOWN_GAP`）；
+/// ② 下方放不下 ⇒ **向上翻**（`字段顶 − 间隙 − 列表高`）；
+/// ③ 上下都放不下（极小屏）⇒ 贴客户区底、高度裁到至少一行 —— 任何情况下**不出客户区**。
+fn dropdown_list_rect(scale: f32, field: &PlanItem, count: usize, client_h: i32) -> TrayPlan {
+    let px = |dip: f32| (dip * scale).round() as i32;
+    let item_h = px(DROPDOWN_ITEM_H);
+    let chrome = px(DROPDOWN_PANEL_PAD) * 2 + px(DROPDOWN_SHADOW_MARGIN) * 2;
+    let full_h = count as i32 * item_h + chrome;
+    let below = field.y + field.h + px(DROPDOWN_GAP);
+    let above = field.y - px(DROPDOWN_GAP) - full_h;
+    let (y, h) = if below + full_h <= client_h {
+        (below, full_h)
+    } else if above >= 0 {
+        (above, full_h)
+    } else {
+        let available = (client_h - below).max(item_h + chrome);
+        (below, available.min(full_h))
+    };
+    TrayPlan {
+        x: field.x,
+        y,
+        w: field.w,
+        h,
+    }
+}
+
+/// 字段矩形（覆盖层定位的输入；取不到 ⇒ `None`）。
+fn dropdown_field_item(plan: &SettingsPlan) -> Option<PlanItem> {
+    plan.items
+        .iter()
+        .find(|item| item.id == IDC_FIELD_LOG_LEVEL)
+        .copied()
+}
+
+/// 展开下拉（幂等）：覆盖层置顶 + 起 hover 节拍。
+fn open_dropdown(ui: &mut UiState, hwnd: HWND) {
+    let Some(controls) = ui.settings_controls.as_ref().copied() else {
+        return;
+    };
+    let settings = current_plan(ui);
+    let Some(field) = dropdown_field_item(&settings) else {
+        return;
+    };
+    let rect = dropdown_list_rect(ui.theme.scale, &field, LOG_LEVELS.len(), settings.client_h);
+    ui.dropdown_open = true;
+    ui.dropdown_hover = None;
+    unsafe {
+        let _ = SetWindowPos(
+            controls.log_level_list,
+            Some(HWND_TOP),
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+        SetTimer(Some(hwnd), DROPDOWN_TIMER_ID, DROPDOWN_HOVER_MS, None);
+    }
+    invalidate_control(controls.parent, IDC_LOG_LEVEL_LIST);
+    invalidate_control(controls.parent, IDC_FIELD_LOG_LEVEL);
+}
+
+/// 收起下拉（幂等）：覆盖层藏起来 + 停 hover 节拍。
+fn close_dropdown(ui: &mut UiState, hwnd: HWND) {
+    let Some(controls) = ui.settings_controls.as_ref().copied() else {
+        return;
+    };
+    if ui.dropdown_open {
+        ui.dropdown_open = false;
+        ui.dropdown_hover = None;
+        unsafe {
+            let _ = KillTimer(Some(hwnd), DROPDOWN_TIMER_ID);
+            let _ = ShowWindow(controls.log_level_list, SW_HIDE);
+        }
+        invalidate_control(controls.parent, IDC_LOG_LEVEL_LIST);
+        invalidate_control(controls.parent, IDC_FIELD_LOG_LEVEL);
+    }
+}
+
+/// 字段点击（`WM_COMMAND` / `BN_CLICKED`）：开/关切换。
+fn toggle_dropdown(ui: &mut UiState, hwnd: HWND) {
+    if ui.dropdown_open {
+        close_dropdown(ui, hwnd);
+    } else {
+        open_dropdown(ui, hwnd);
+    }
+}
+
+/// 列表内点击：把点击的项落进草稿态 + 刷字段文本 + 收起。
+///
+/// `y` = 列表客户区内的纵坐标（**负值/越界 ⇒ 收起但不选中**：等价"点其它处"）。
+/// 命中算法与 [`draw_dropdown_list`] 同源（面板顶 = `margin`，项自 `panel.top + pad` 起）。
+fn select_dropdown_item(ui: &mut UiState, hwnd: HWND, y: i32) {
+    let top = ui.theme.px(DROPDOWN_SHADOW_MARGIN + DROPDOWN_PANEL_PAD);
+    let item_h = ui.theme.px(DROPDOWN_ITEM_H).max(1);
+    let local = y - top;
+    let index = (local.max(0) / item_h) as usize;
+    if local >= 0 && index < LOG_LEVELS.len() {
+        ui.draft_log_level = index;
+        if let Some(controls) = ui.settings_controls.as_ref().copied() {
+            set_text(controls.log_level, log_level_name(index));
+            invalidate_control(controls.parent, IDC_FIELD_LOG_LEVEL);
+        }
+    }
+    close_dropdown(ui, hwnd);
+}
+
+/// hover 节拍：把光标下的项记进 `dropdown_hover`（变动才失效重绘）。
+///
+/// 用 `GetCursorPos` + `ScreenToClient`（而不是 `WM_MOUSELEAVE` —— 见 [`DROPDOWN_HOVER_MS`]）：
+/// 光标移出列表时**同样**能清掉高亮（否则会留下"粘住"的假高亮）。
+fn update_dropdown_hover(ui: &mut UiState) {
+    let Some(controls) = ui.settings_controls.as_ref().copied() else {
+        return;
+    };
+    if !ui.dropdown_open {
+        return;
+    }
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_err() {
+        return;
+    }
+    unsafe {
+        let _ = ScreenToClient(controls.log_level_list, &mut point);
+    }
+    let top = ui.theme.px(DROPDOWN_SHADOW_MARGIN + DROPDOWN_PANEL_PAD);
+    let item_h = ui.theme.px(DROPDOWN_ITEM_H).max(1);
+    let local = point.y - top;
+    let index = (local / item_h) as usize;
+    let hover = if local >= 0 && index < LOG_LEVELS.len() {
+        Some(index)
+    } else {
+        None
+    };
+    if hover != ui.dropdown_hover {
+        ui.dropdown_hover = hover;
+        invalidate_control(controls.parent, IDC_LOG_LEVEL_LIST);
+    }
+}
+
+/// 下拉列表覆盖层：`STATIC` + `SS_OWNERDRAW`（**子窗口**，展开时 `HWND_TOP`）。
+///
+/// 为什么是子窗口而不是 `WS_POPUP`：子窗口天然盖住同级控件（覆盖层语义）、跟着父窗一起移动/销毁、
+/// 不抢焦点、不进任务栏、不需要第二条消息循环；`WS_POPUP` 还要处理"点外面 ⇒ 收起"的全局键鼠钩子
+/// （本仓**不引入**钩子类 API，见 README「不挂钩」）。
+fn create_overlay(hinst: HINSTANCE, parent: HWND) -> HWND {
+    let class = wide("STATIC");
+    let empty = wide("");
+    let control = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(empty.as_ptr()),
+            WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0 | SS_OWNERDRAW),
+            0,
+            0,
+            0,
+            0,
+            Some(parent),
+            Some(HMENU(IDC_LOG_LEVEL_LIST as *mut core::ffi::c_void)),
+            Some(hinst),
+            None,
+        )
+    }
+    .unwrap_or_default();
+    if !control.is_invalid() {
+        unsafe {
+            let _ = SetWindowSubclass(control, Some(list_subclass), LIST_SUBCLASS_ID, 0);
+        }
+    }
+    control
+}
+
+fn point_y(lparam: LPARAM) -> i32 {
+    ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32
+}
+
+/// 列表覆盖层的子类过程：左键 ⇒ 命中项（坐标在**列表客户区**坐标系里）。
+unsafe extern "system" fn list_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if message == WM_LBUTTONDOWN {
+        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+        let y = point_y(lparam);
+        with_ui(parent, |ui| select_dropdown_item(ui, parent, y));
+        return LRESULT(0); // 吞掉：不让 STATIC 的默认处理再做事
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+/// 字段按钮的子类过程：`Esc` 收起；失焦收起（点其它控件 ⇒ 焦点跑掉）。
+unsafe extern "system" fn field_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+    match message {
+        WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE => {
+            let open = with_ui(parent, |ui| {
+                let open = ui.dropdown_open;
+                close_dropdown(ui, parent);
+                open
+            });
+            if open == Some(true) {
+                return LRESULT(0); // 收起过 ⇒ 吃掉（不惊动别处）
+            }
+        }
+        WM_KILLFOCUS => {
+            with_ui(parent, |ui| close_dropdown(ui, parent));
+        }
+        _ => {}
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
 /// 重排（**唯一入口**：高级展开 / 提示条显隐 / DPI 变化 / 窗口创建后收口都走它）。
 ///
 /// 一步一图（§2.6.1 的退化链由 `plan()` 决定）：窗口尺寸（保持位置）→ 逐控件 `SetWindowPos` +
 /// 显隐 → 父窗整幅失效（重画"输入井"）。
-fn apply_layout(ui: &UiState, hwnd: HWND) {
+fn apply_layout(ui: &mut UiState, hwnd: HWND) {
+    let Some(list) = ui
+        .settings_controls
+        .as_ref()
+        .map(|controls| controls.log_level_list)
+    else {
+        return;
+    };
+    // 重排 ⇒ 下拉覆盖层的位置/尺寸前提已变：先收起（避免"列表停在与字段无关的旧位置"）
+    if ui.dropdown_open {
+        ui.dropdown_open = false;
+        ui.dropdown_hover = None;
+        unsafe {
+            let _ = KillTimer(Some(hwnd), DROPDOWN_TIMER_ID);
+            let _ = ShowWindow(list, SW_HIDE);
+        }
+    }
+    let settings = current_plan(ui);
     let Some(controls) = ui.settings_controls.as_ref() else {
         return;
     };
-    let settings = current_plan(ui);
     let mut rect = RECT {
         left: 0,
         top: 0,
@@ -1691,15 +2057,80 @@ fn draw_button(ui: &UiState, item: &DRAWITEMSTRUCT) {
     }
 
     if let Some((group, index)) = segment_member(id) {
+        // **托盘 + 选中胶囊**（P8-UI2）：段自身只负责"铺托盘色 / 画胶囊 / 写字"；
+        // 两端的托盘余量与段间距由父窗的托盘矩形提供（`paint_canvas`）—— 子窗只覆盖自己的矩形。
         let selected = segment_selected(ui, group, index);
-        let (fill, border, ink) = if disabled {
-            (COLOR_CARD, COLOR_CARD_BORDER, COLOR_INK_DISABLED)
-        } else if selected {
-            (COLOR_ACCENT_SOFT, COLOR_ACCENT_DEEP, COLOR_INK)
+        let scale = ui.theme.scale;
+        let base = if disabled {
+            COLOR_SEG_TRAY
         } else if pressed {
-            (COLOR_PRESS_ON_CARD, COLOR_CARD_BORDER, COLOR_INK)
+            COLOR_PRESS_ON_CARD
         } else {
-            (COLOR_CARD, COLOR_CARD_BORDER, COLOR_INK)
+            COLOR_SEG_TRAY
+        };
+        fill_rect_color(item.hDC, &rect, base);
+        if let Some(gfx) = gfx.as_ref() {
+            if selected {
+                // 胶囊 = 段矩形**纵向内缩** `SEG_CAPSULE_INSET`（横向占满 ⇒ 段宽已按文字实测收紧）
+                let inset = (SEG_CAPSULE_INSET * scale).round();
+                let x = rect.left as f32;
+                let y = rect.top as f32 + inset;
+                let w = (rect.right - rect.left) as f32;
+                let h = (rect.bottom - rect.top) as f32 - inset * 2.0;
+                let capsule_radius = SEG_CAPSULE_RADIUS * scale;
+                // 柔和投影（2 层递减 alpha；只能外扩到段矩形以内 ⇒ 纵向留白足够）
+                gfx.fill_soft_shadow(x, y, w, h, capsule_radius, scale);
+                gfx.fill_round_rect(x, y, w, h, capsule_radius, COLOR_SEG_CAPSULE);
+                gfx.stroke_round_rect(
+                    x,
+                    y,
+                    w,
+                    h,
+                    capsule_radius,
+                    COLOR_SEG_CAPSULE_EDGE,
+                    scale.max(1.0),
+                );
+            }
+            if focused {
+                // 焦点环 = alpha 令牌之一，只走 GDI+
+                gfx.stroke_round_rect(
+                    rect.left as f32 + 1.0,
+                    rect.top as f32 + 1.0,
+                    (rect.right - rect.left) as f32 - 2.0,
+                    (rect.bottom - rect.top) as f32 - 2.0,
+                    SEG_TRAY_RADIUS * scale,
+                    COLOR_ACCENT_RING,
+                    scale * 2.0,
+                );
+            }
+        }
+        let font = if selected {
+            ui.theme.font_ui_bold
+        } else {
+            ui.theme.font_ui
+        };
+        let ink = if disabled {
+            COLOR_INK_DISABLED
+        } else if selected {
+            COLOR_INK
+        } else {
+            COLOR_INK_SOFT
+        };
+        draw_text_line(item.hDC, font, &text, &rect, ink, DT_CENTER);
+        return;
+    }
+
+    if id == IDC_FIELD_LOG_LEVEL {
+        // 下拉字段：与「输入井」同一套语言（白底 + 1 DIP 描边，圆角 `RADIUS_FIELD`）
+        // + 右侧自绘 chevron；展开/聚焦时描边加深（`COLOR_BORDER_STRONG`）。
+        let scale = ui.theme.scale;
+        let open = ui.dropdown_open;
+        let (fill, border) = if disabled {
+            (COLOR_CARD, COLOR_CARD_BORDER)
+        } else if open || focused {
+            (COLOR_CARD, COLOR_BORDER_STRONG)
+        } else {
+            (COLOR_CARD, COLOR_CARD_BORDER)
         };
         if let Some(gfx) = gfx.as_ref() {
             gfx.fill_round_rect(
@@ -1707,7 +2138,7 @@ fn draw_button(ui: &UiState, item: &DRAWITEMSTRUCT) {
                 rect.top as f32,
                 (rect.right - rect.left) as f32,
                 (rect.bottom - rect.top) as f32,
-                radius,
+                RADIUS_FIELD * scale,
                 fill,
             );
             gfx.stroke_round_rect(
@@ -1715,31 +2146,51 @@ fn draw_button(ui: &UiState, item: &DRAWITEMSTRUCT) {
                 rect.top as f32,
                 (rect.right - rect.left) as f32,
                 (rect.bottom - rect.top) as f32,
-                radius,
+                RADIUS_FIELD * scale,
                 border,
-                if selected { ui.theme.scale } else { 1.0 },
+                scale.max(1.0),
             );
-            if focused {
-                // 焦点环 = 全仓唯一 alpha 令牌，只走 GDI+
-                gfx.stroke_round_rect(
-                    rect.left as f32 + 1.0,
-                    rect.top as f32 + 1.0,
-                    (rect.right - rect.left) as f32 - 2.0,
-                    (rect.bottom - rect.top) as f32 - 2.0,
-                    radius,
-                    COLOR_ACCENT_RING,
-                    ui.theme.scale * 2.0,
-                );
-            }
+            // chevron：一条两段折线（`v`）；圆头圆角连接
+            let cx = rect.right as f32 - (DROPDOWN_CHEVRON_PAD + DROPDOWN_CHEVRON_W / 2.0) * scale;
+            let cy = (rect.top + rect.bottom) as f32 / 2.0;
+            let half = DROPDOWN_CHEVRON_W / 2.0 * scale;
+            let drop = half * 0.55;
+            let points = [
+                PointF {
+                    X: cx - half,
+                    Y: cy - drop,
+                },
+                PointF {
+                    X: cx,
+                    Y: cy + drop,
+                },
+                PointF {
+                    X: cx + half,
+                    Y: cy - drop,
+                },
+            ];
+            gfx.polyline(&points, COLOR_INK_SOFT, scale * 1.5, true);
         } else {
             fill_rect_color(item.hDC, &rect, fill);
         }
-        let font = if selected {
-            ui.theme.font_ui_bold
-        } else {
-            ui.theme.font_ui
+        let text_rect = RECT {
+            left: rect.left + ui.theme.px(DROPDOWN_TEXT_PAD),
+            top: rect.top,
+            right: rect.right - ui.theme.px(DROPDOWN_CHEVRON_PAD + DROPDOWN_CHEVRON_W),
+            bottom: rect.bottom,
         };
-        draw_text_line(item.hDC, font, &text, &rect, ink, DT_CENTER);
+        draw_text_line(
+            item.hDC,
+            ui.theme.font_ui,
+            &text,
+            &text_rect,
+            if disabled {
+                COLOR_INK_DISABLED
+            } else {
+                COLOR_INK
+            },
+            DT_LEFT,
+        );
         return;
     }
 
@@ -1808,6 +2259,10 @@ fn draw_owner_static(ui: &UiState, item: &DRAWITEMSTRUCT) {
     let id = item.CtlID as usize;
     let rect = item.rcItem;
     let text = get_text(item.hwndItem);
+    if id == IDC_LOG_LEVEL_LIST {
+        draw_dropdown_list(ui, item, &rect);
+        return;
+    }
     if id == IDC_RESULT {
         fill_rect_color(item.hDC, &rect, COLOR_BG);
         let (ink, bar) = match ui.result_tone {
@@ -1914,6 +2369,118 @@ fn draw_owner_static(ui: &UiState, item: &DRAWITEMSTRUCT) {
     }
 }
 
+/// 下拉列表覆盖层的自绘（P8-UI2）：白色面板 + 1 DIP 极淡描边 + 柔和投影；列表项 hover / 选中态。
+///
+/// 面板四周留出 `DROPDOWN_SHADOW_MARGIN` 给投影（`fill_soft_shadow` 从内边界向外扩）；
+/// 列表项矩形与 [`select_dropdown_item`] / [`update_dropdown_hover`] 的命中算法**同源**
+/// （面板内缩 `margin + pad`、项高 `item_h` —— 改一处必须同改三处，判据见单测）。
+fn draw_dropdown_list(ui: &UiState, item: &DRAWITEMSTRUCT, rect: &RECT) {
+    let scale = ui.theme.scale;
+    let margin = ui.theme.px(DROPDOWN_SHADOW_MARGIN);
+    let pad = ui.theme.px(DROPDOWN_PANEL_PAD);
+    let item_h = ui.theme.px(DROPDOWN_ITEM_H).max(1);
+    let panel = RECT {
+        left: rect.left + margin,
+        top: rect.top + margin,
+        right: rect.right - margin,
+        bottom: rect.bottom - margin,
+    };
+    if panel.right <= panel.left || panel.bottom <= panel.top {
+        return;
+    }
+    let gfx = if ui.gdiplus_ok {
+        Gfx::from_hdc(item.hDC)
+    } else {
+        None
+    };
+    let radius = RADIUS_FIELD * scale;
+    let width = (panel.right - panel.left) as f32;
+    let height = (panel.bottom - panel.top) as f32;
+    if let Some(gfx) = gfx.as_ref() {
+        gfx.fill_soft_shadow(
+            panel.left as f32,
+            panel.top as f32,
+            width,
+            height,
+            radius,
+            scale,
+        );
+        gfx.fill_round_rect(
+            panel.left as f32,
+            panel.top as f32,
+            width,
+            height,
+            radius,
+            COLOR_CARD,
+        );
+        gfx.stroke_round_rect(
+            panel.left as f32,
+            panel.top as f32,
+            width,
+            height,
+            radius,
+            COLOR_CARD_BORDER,
+            scale.max(1.0),
+        );
+    } else {
+        fill_rect_color(item.hDC, &panel, COLOR_CARD);
+    }
+    let hover_radius = 4.0 * scale;
+    for (index, name) in LOG_LEVELS.iter().enumerate() {
+        let top = panel.top + pad + index as i32 * item_h;
+        let row = RECT {
+            left: panel.left + pad,
+            top,
+            right: panel.right - pad,
+            bottom: top + item_h,
+        };
+        if row.bottom > panel.bottom - pad {
+            break; // 极小屏的夹取档：放不下的项不画（也不算命中）
+        }
+        let selected = ui.draft_log_level == index;
+        let hovered = ui.dropdown_hover == Some(index);
+        if let Some(gfx) = gfx.as_ref() {
+            if hovered {
+                gfx.fill_round_rect(
+                    row.left as f32 + 1.0,
+                    row.top as f32 + 1.0,
+                    (row.right - row.left) as f32 - 2.0,
+                    (row.bottom - row.top) as f32 - 2.0,
+                    hover_radius,
+                    COLOR_HOVER_ON_CARD,
+                );
+            }
+            if selected {
+                // 选中 = **文字加粗 + 右端主色圆点**（不再用粉色描边/粉底表达选中）
+                gfx.fill_circle(
+                    row.right as f32 - ui.theme.px(DROPDOWN_TEXT_PAD) as f32 / 2.0,
+                    (row.top + row.bottom) as f32 / 2.0,
+                    2.5 * scale,
+                    COLOR_ACCENT_DEEP,
+                );
+            }
+        }
+        let text_rect = RECT {
+            left: row.left + ui.theme.px(DROPDOWN_TEXT_PAD),
+            top: row.top,
+            right: row.right - ui.theme.px(DROPDOWN_TEXT_PAD) * 2,
+            bottom: row.bottom,
+        };
+        draw_text_line(
+            item.hDC,
+            if selected {
+                ui.theme.font_ui_bold
+            } else {
+                ui.theme.font_ui
+            },
+            name,
+            &text_rect,
+            COLOR_INK,
+            DT_LEFT,
+        );
+    }
+}
+
 /// 纯色填充（GDI；仅不透明令牌 —— 分通道口径见 `theme` 模块注释）。
 fn fill_rect_color(hdc: HDC, rect: &RECT, color: u32) {
     unsafe {
@@ -2002,12 +2569,25 @@ fn build_controls(ui: &mut UiState, hwnd: HWND) {
         pool_max: find(hwnd, IDC_FIELD_POOL_MAX),
         pool_idle: find(hwnd, IDC_FIELD_POOL_IDLE),
         log_stat: find(hwnd, IDC_FIELD_LOG_STAT),
+        log_level: find(hwnd, IDC_FIELD_LOG_LEVEL),
+        log_level_list: create_overlay(hinst, hwnd),
         result: find(hwnd, IDC_RESULT),
         notice: find(hwnd, IDC_NOTICE),
         all: [HWND::default(); PLAN_ITEM_COUNT],
     };
     for (slot, control) in controls.all.iter_mut().zip(all.iter()) {
         *slot = *control;
+    }
+    // 下拉的两个窗口都子类化：字段收 `Esc` / 失焦；列表收左键（命中项 ⇒ 选中 + 收起）。
+    if !controls.log_level.is_invalid() {
+        unsafe {
+            let _ = SetWindowSubclass(
+                controls.log_level,
+                Some(field_subclass),
+                FIELD_SUBCLASS_ID,
+                0,
+            );
+        }
     }
     fill_fields(ui, &controls);
     ui.settings_controls = Some(controls);
@@ -2017,7 +2597,10 @@ fn build_controls(ui: &mut UiState, hwnd: HWND) {
 
 /// 按 [`PlanItem`] 创建控件。
 fn create_from_plan(hinst: HINSTANCE, parent: HWND, item: &PlanItem, font: HFONT) -> HWND {
-    let base = (WS_CHILD | WS_VISIBLE).0;
+    // `WS_CLIPSIBLINGS`（P8-UI2）：同级控件**不得画到排在它前面的兄弟身上** —— 下拉覆盖层
+    // 展开时排在 z 序最前；没有这一位，一次"全子窗重绘"（DPI 变化 / `RDW_ALLCHILDREN`）
+    // 会让下方控件把覆盖层盖掉（真机实测：PrintWindow 与屏幕抓图都复现过）。
+    let base = (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS).0;
     let (class, style) = match item.kind {
         PlanKind::Label | PlanKind::LogStat => ("STATIC", base | SS_LEFTNOWORDWRAP),
         PlanKind::Result | PlanKind::Notice => ("STATIC", base | SS_OWNERDRAW),
@@ -2029,6 +2612,7 @@ fn create_from_plan(hinst: HINSTANCE, parent: HWND, item: &PlanItem, font: HFONT
         ),
         PlanKind::Checkbox
         | PlanKind::Segment
+        | PlanKind::Dropdown
         | PlanKind::ButtonPrimary
         | PlanKind::ButtonSecondary => ("BUTTON", base | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
     };
@@ -2064,8 +2648,11 @@ fn create_from_plan(hinst: HINSTANCE, parent: HWND, item: &PlanItem, font: HFONT
     control
 }
 
-/// 画"输入井"（父窗 `WM_PAINT`）：圆角 6 + 卡片底 + 1 DIP 描边；EDIT 子控件内缩 2 DIP 坐在里面。
-fn paint_wells(ui: &UiState, hdc: HDC) {
+/// 父窗 `WM_PAINT` 的全部自绘底：**互斥选项组的托盘** + **输入井**（顺序无关 —— 两者不相交）。
+///
+/// 托盘的可见部分只有"段与段之间 + 两端余量"（段控件是子窗口，覆盖自己的矩形并在其中铺托盘色）
+/// ⇒ 视觉上仍是**一条连续的浅灰托盘**。
+fn paint_canvas(ui: &UiState, hdc: HDC) {
     if !ui.gdiplus_ok {
         return;
     }
@@ -2073,6 +2660,27 @@ fn paint_wells(ui: &UiState, hdc: HDC) {
         return;
     };
     let settings = current_plan(ui);
+    let scale = ui.theme.scale;
+    let tray_radius = SEG_TRAY_RADIUS * scale;
+    for tray in &settings.trays {
+        gfx.fill_round_rect(
+            tray.x as f32,
+            tray.y as f32,
+            tray.w as f32,
+            tray.h as f32,
+            tray_radius,
+            COLOR_SEG_TRAY,
+        );
+        gfx.stroke_round_rect(
+            tray.x as f32,
+            tray.y as f32,
+            tray.w as f32,
+            tray.h as f32,
+            tray_radius,
+            COLOR_SEG_TRAY_EDGE,
+            scale.max(1.0),
+        );
+    }
     let radius = RADIUS_FIELD * ui.theme.scale;
     for item in &settings.items {
         if !item.visible {
@@ -2135,6 +2743,10 @@ pub unsafe extern "system" fn wndproc(
                         return;
                     }
                     match id {
+                        // `Esc` 在对话框管理器（`IsDialogMessageW`）手里会变成 `WM_COMMAND IDCANCEL`
+                        // ⇒ 在这里把下拉收起（另一条路是字段子类化的 `WM_KEYDOWN VK_ESCAPE`，两者都留）
+                        IDCANCEL if ui.dropdown_open => close_dropdown(ui, hwnd),
+                        IDC_FIELD_LOG_LEVEL => toggle_dropdown(ui, hwnd),
                         IDC_APPLY => apply_fields(ui),
                         IDC_TEST => test_upstream(ui),
                         IDC_RELOAD => {
@@ -2170,10 +2782,19 @@ pub unsafe extern "system" fn wndproc(
                 let mut paint = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut paint);
                 if !pointer.is_null() {
-                    paint_wells(&*pointer, hdc);
+                    paint_canvas(&*pointer, hdc);
                 }
                 let _ = EndPaint(hwnd, &paint);
                 LRESULT(0)
+            }
+            WM_TIMER => {
+                with_ui(hwnd, update_dropdown_hover);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                // 点父窗空白处（子控件有自己的鼠标消息）⇒ 收起下拉；点击本身照旧交给默认处理
+                with_ui(hwnd, |ui| close_dropdown(ui, hwnd));
+                DefWindowProcW(hwnd, message, wparam, lparam)
             }
             WM_APP_TEST_RESULT => {
                 let text = TEST_RESULT.lock().ok().and_then(|slot| slot.clone());
@@ -2250,6 +2871,8 @@ pub unsafe extern "system" fn wndproc(
                 with_ui(hwnd, |ui| {
                     ui.settings_hwnd = None;
                     ui.settings_controls = None;
+                    ui.dropdown_open = false;
+                    ui.dropdown_hover = None;
                 });
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 LRESULT(0)
@@ -2275,8 +2898,16 @@ mod tests {
         settings.items.iter().filter(|item| item.visible).collect()
     }
 
-    /// **A-3b 的检查体**（正负例共用）：同列同 x · 同列同类同宽 · y 在行步等差格上 · 整行字段同宽同左缘。
-    fn column_checks(settings: &SettingsPlan, step_dip: f32) -> Result<(), String> {
+    /// **A-3b 的检查体**（正负例共用）：同列同 x · 同列同类同宽 · y 在行步等差格上 · 整行字段同宽同左缘 ·
+    /// 互斥选项组（**段宽 = 文字实测 + 2×留白** / 段间距 / 托盘不出槽）。
+    ///
+    /// 需要 `theme` + `hdc`：P8-UI2 起段宽**由 `measure_text` 现测**（"用实测而不是写死"的机械面）。
+    fn column_checks(
+        settings: &SettingsPlan,
+        step_dip: f32,
+        theme: &Theme,
+        hdc: HDC,
+    ) -> Result<(), String> {
         let items = visible_items(settings);
         // ① 同列同 x（列 A 标签 / 列 A 控件 / 列 B 标签 / 列 B 控件；**分段与动作行是"组"**，见 ⑤）
         for column in [Column::LabelA, Column::CtrlA, Column::LabelB, Column::CtrlB] {
@@ -2375,8 +3006,15 @@ mod tests {
                 }
             }
         }
+        // ⑤b 互斥选项组（P8-UI2）—— 四条机械面：
+        //   ① 起点 = 列 A 控件位 + 托盘余量   ② 段宽 = `measure_text(粗体) + 2×SEG_ITEM_PAD_H`
+        //   ③ 段间距 = `SEG_ITEM_GAP`（用户诉求"间距不要那么近"）   ④ 整组（含托盘）放得进列槽
+        let tray_pad = (SEG_TRAY_PAD * settings.scale).round() as i32;
+        let item_pad = (SEG_ITEM_PAD_H * settings.scale).round() as i32;
+        let expect_gap = (SEG_ITEM_GAP * settings.scale).round() as i32;
+        let slot = (COL_CTRL_A_W * settings.scale).round() as i32;
         for group in SEGMENT_GROUPS {
-            let members: Vec<&PlanItem> = items
+            let mut members: Vec<&PlanItem> = items
                 .iter()
                 .filter(|item| group.ids.contains(&item.id))
                 .copied()
@@ -2384,20 +3022,59 @@ mod tests {
             if members.len() != group.ids.len() {
                 continue; // 该组本状态下不可见（与 row 可见性同源，下一轮循环覆盖）
             }
-            let first = members.iter().map(|item| item.x).min().unwrap_or(0);
-            let expect_first = (COL_CTRL_A_X * settings.scale).round() as i32;
-            if first != expect_first {
+            members.sort_by_key(|item| item.x);
+            let expect_first = (COL_CTRL_A_X * settings.scale).round() as i32 + tray_pad;
+            if members[0].x != expect_first {
                 return Err(format!(
-                    "分段组起点不在列 A 控件位：{first} ≠ {expect_first}"
+                    "互斥选项组起点不在托盘内位：{} != {expect_first}",
+                    members[0].x
                 ));
             }
-            let total: i32 = members.iter().map(|item| item.w).sum::<i32>()
-                + (members.len() as i32 - 1) * (1.0 * settings.scale).round() as i32;
-            let expect_total = (COL_CTRL_A_W * settings.scale).round() as i32;
-            // 段宽按 DIP 均分后逐段取整 ⇒ 允许每段 ±1 px 的累积（组起点与槽宽都由列常量决定）
-            if (total - expect_total).abs() > members.len() as i32 {
+            for (index, item) in members.iter().enumerate() {
+                let want = measure_text(hdc, theme.font_ui_bold, group.texts[index]) + item_pad * 2;
+                if item.w != want {
+                    return Err(format!(
+                        "段宽 != 文字实测 + 2xSEG_ITEM_PAD_H：id={} w={} != {want}",
+                        item.id, item.w
+                    ));
+                }
+            }
+            for pair in members.windows(2) {
+                let gap = pair[1].x - (pair[0].x + pair[0].w);
+                if (gap - expect_gap).abs() > 1 {
+                    return Err(format!(
+                        "段间距 != SEG_ITEM_GAP：{} != {expect_gap}（id={}/{}）",
+                        gap, pair[0].id, pair[1].id
+                    ));
+                }
+            }
+            let last = members[members.len() - 1];
+            let tray_w = (last.x + last.w + tray_pad) - (members[0].x - tray_pad);
+            if tray_w > slot + 1 {
+                return Err(format!("互斥选项组（含托盘）超出行槽：{tray_w} > {slot}"));
+            }
+        }
+        // ⑤c 托盘表：与组矩形同源（左缘 = 首段 − 托盘余量；右缘 = 末段 + 托盘余量；同 y）
+        for tray in &settings.trays {
+            let members: Vec<&PlanItem> = items
+                .iter()
+                .filter(|item| item.kind == PlanKind::Segment && item.y == tray.y)
+                .copied()
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let left = members.iter().map(|item| item.x).min().unwrap_or(0);
+            let right = members
+                .iter()
+                .map(|item| item.x + item.w)
+                .max()
+                .unwrap_or(0);
+            if tray.x != left - tray_pad || tray.x + tray.w != right + tray_pad {
                 return Err(format!(
-                    "分段组总宽 ≠ 列槽宽（超 ±1px/段）：{total} ≠ {expect_total}"
+                    "托盘矩形与组不同源：tray={}..{} 组={left}..{right}",
+                    tray.x,
+                    tray.x + tray.w
                 ));
             }
         }
@@ -2466,22 +3143,27 @@ mod tests {
     fn plan_columns_are_aligned() {
         for dpi in [96_u32, 120, 144, 192] {
             let theme = Theme::new(dpi);
+            let hdc = unsafe { GetDC(None) };
             for advanced in [false, true] {
                 for notice in [false, true] {
-                    let settings = plan(theme.scale, advanced, notice, f32::INFINITY);
+                    let settings = plan(&theme, advanced, notice, f32::INFINITY);
                     let step = if settings.compact {
                         STEP_COMPACT_DIP
                     } else {
                         ROW_STEP
                     };
-                    column_checks(&settings, step).unwrap_or_else(|err| {
+                    let checked = column_checks(&settings, step, &theme, hdc);
+                    checked.unwrap_or_else(|err| {
                         panic!("dpi={dpi} advanced={advanced} notice={notice} A-3b 失败：{err}")
                     });
                 }
             }
+            unsafe { ReleaseDC(None, hdc) };
         }
         // 负例：x 偏 8 px ⇒ 必须被咬住（同列同 x 项）
-        let mut broken = plan(2.0, false, false, f32::INFINITY);
+        let theme = Theme::new(192);
+        let hdc = unsafe { GetDC(None) };
+        let mut broken = plan(&theme, false, false, f32::INFINITY);
         let target = broken
             .items
             .iter_mut()
@@ -2494,11 +3176,11 @@ mod tests {
             ROW_STEP
         };
         assert!(
-            column_checks(&broken, step).is_err(),
+            column_checks(&broken, step, &theme, hdc).is_err(),
             "负例：某一行 x 偏 8 px 必须被 A-3b 咬住"
         );
         // 负例 2：y 偏一格半 ⇒ 必须被咬住（等差格项）
-        let mut broken_y = plan(2.0, false, false, f32::INFINITY);
+        let mut broken_y = plan(&theme, false, false, f32::INFINITY);
         let target = broken_y
             .items
             .iter_mut()
@@ -2506,31 +3188,58 @@ mod tests {
             .expect("列 A 控件必须存在");
         target.y += 8;
         assert!(
-            column_checks(&broken_y, step).is_err(),
+            column_checks(&broken_y, step, &theme, hdc).is_err(),
             "负例：某一行 y 偏 8 px 必须被 A-3b 咬住"
         );
         // 负例 3（**A-3b ⑥ 的强制负例**，I1b 登记项）：把提示条宽改成 `COL_FULL_W`
         //（不再减按钮宽与间隙）⇒ ⑥（提示条列位）必须报错。
-        let mut broken_strip = plan(2.0, false, true, f32::INFINITY);
+        let mut broken_strip = plan(&theme, false, true, f32::INFINITY);
         let strip = broken_strip
             .items
             .iter_mut()
             .find(|item| item.column == Column::NoticeStrip)
             .expect("提示条必须存在（notice = true）");
-        strip.w = (COL_FULL_W * 2.0).round() as i32; // 2.0 = 本 plan 的 scale（= 192 DPI）
+        strip.w = theme.px(COL_FULL_W); // 不减按钮宽与间隙 ⇒ 与常量式不符
         assert!(
-            column_checks(&broken_strip, ROW_STEP).is_err(),
+            column_checks(&broken_strip, ROW_STEP, &theme, hdc).is_err(),
             "负例：提示条宽 = COL_FULL_W（未减按钮宽与间隙）必须被 A-3b ⑥ 咬住"
         );
+        // 负例 4（**P8-UI2 新增**）：互斥组第二段右移 4 px ⇒ 段间距判据必须报错
+        //（"间距不要那么近"是用户诉求 ⇒ 它必须有咬得住的负例）
+        let mut broken_gap = plan(&theme, false, false, f32::INFINITY);
+        let second = broken_gap
+            .items
+            .iter_mut()
+            .find(|item| item.id == IDC_SEG_CORS[1])
+            .expect("互斥组第二段必须存在");
+        second.x += 4;
+        assert!(
+            column_checks(&broken_gap, ROW_STEP, &theme, hdc).is_err(),
+            "负例：段间距被挤（第二段右移 4 px）必须被 A-3b ⑤b 咬住"
+        );
+        // 负例 5（P8-UI2）：某段宽度 +8 px ⇒ "段宽 = 文字实测 + 2×留白" 必须报错
+        let mut broken_w = plan(&theme, false, false, f32::INFINITY);
+        let wide = broken_w
+            .items
+            .iter_mut()
+            .find(|item| item.id == IDC_SEG_CLOSE[0])
+            .expect("互斥组首段必须存在");
+        wide.w += 8;
+        assert!(
+            column_checks(&broken_w, ROW_STEP, &theme, hdc).is_err(),
+            "负例：段宽偏离文字实测（+8 px）必须被 A-3b ⑤b 咬住"
+        );
+        unsafe { ReleaseDC(None, hdc) };
     }
 
     /// `plan()` 的项数 == [`PLAN_ITEM_COUNT`]（`SettingsControls::all` 的定长依据）。
     /// 负例注入面 = 往 `SPECS` 加一行但忘了它 ⇒ 本断言必红（会表现为"停不掉的提示条"）。
     #[test]
     fn plan_item_count_matches_control_table() {
+        let theme = Theme::new(192);
         for advanced in [false, true] {
             for notice in [false, true] {
-                let settings = plan(2.0, advanced, notice, f32::INFINITY);
+                let settings = plan(&theme, advanced, notice, f32::INFINITY);
                 assert_eq!(settings.items.len(), PLAN_ITEM_COUNT);
                 // 每个控件 id 只出现一次（zip 对齐的前提）
                 let mut ids: Vec<usize> = settings.items.iter().map(|item| item.id).collect();
@@ -2550,8 +3259,34 @@ mod tests {
         assert_eq!(COL_CTRL_B_X, COL_LABEL_B_X + COL_LABEL_B_W + COL_GAP);
         assert_eq!(CLIENT_W_DIP, COL_CTRL_B_X + COL_CTRL_B_W + PAD_RIGHT);
         assert_eq!(COL_FULL_W, CLIENT_W_DIP - COL_CTRL_A_X - PAD_RIGHT);
-        // 分段槽宽必须容得下最宽的段标签（`debug` 实测 43 DIP + 余量）
-        assert!(segment_widths(COL_CTRL_A_W, 4).iter().all(|w| *w >= 47.0));
+        // 互斥选项组必须**放得进列槽**（段宽走文字实测 + 两条余量 ⇒ 与语言/字体无关地成立）
+        let theme = Theme::new(96);
+        let hdc = unsafe { GetDC(None) };
+        let pad = theme.px(SEG_ITEM_PAD_H);
+        let tray_pad = theme.px(SEG_TRAY_PAD);
+        let gap = theme.px(SEG_ITEM_GAP);
+        let slot = theme.px(COL_CTRL_A_W);
+        for group in SEGMENT_GROUPS {
+            let widths = segment_item_widths(&theme, hdc, group);
+            let total: i32 =
+                widths.iter().sum::<i32>() + gap * (widths.len() as i32 - 1) + tray_pad * 2;
+            assert!(
+                total <= slot,
+                "互斥选项组（{}）含托盘 {total} px 放不进列槽 {slot} px",
+                group.texts.join("/")
+            );
+            for (index, width) in widths.iter().enumerate() {
+                let text = group.texts[index];
+                let measured = measure_text(hdc, theme.font_ui_bold, text);
+                assert_eq!(
+                    *width,
+                    measured + pad * 2,
+                    "段宽必须是文字实测 {measured} + 2×{pad}"
+                );
+                assert!(measured > 0);
+            }
+        }
+        unsafe { ReleaseDC(None, hdc) };
     }
 
     fn overlaps(first: &PlanItem, second: &PlanItem) -> bool {
@@ -2571,7 +3306,7 @@ mod tests {
             let hdc = unsafe { GetDC(None) };
             for advanced in [false, true] {
                 for notice in [false, true] {
-                    let settings = plan(theme.scale, advanced, notice, f32::INFINITY);
+                    let settings = plan(&theme, advanced, notice, f32::INFINITY);
                     let items = visible_items(&settings);
                     for item in &items {
                         assert!(item.x >= 0 && item.y >= 0, "dpi={dpi} 负坐标：{item:?}");
@@ -2627,8 +3362,8 @@ mod tests {
             let theme = Theme::new(dpi);
             let scale = theme.scale;
             for notice in [false, true] {
-                let public = plan(scale, false, notice, f32::INFINITY);
-                let advanced = plan(scale, true, notice, f32::INFINITY);
+                let public = plan(&theme, false, notice, f32::INFINITY);
+                let advanced = plan(&theme, true, notice, f32::INFINITY);
                 assert!(!public.compact && !advanced.compact && !public.pool_folded);
                 let diff = (advanced.client_h - public.client_h) as f32;
                 let expected = 2.0 * ROW_STEP * scale;
@@ -2650,12 +3385,13 @@ mod tests {
     /// **`plan()` 的钳制分支**（I1-7）：屏幕放不下 ⇒ 行步 26 ⇒ 仍放不下 ⇒ 连接池组强制折叠。
     #[test]
     fn plan_degrades_when_work_area_is_small() {
-        let scale = 2.0;
-        let tall = plan(scale, true, false, f32::INFINITY);
+        let theme = Theme::new(192);
+        let scale = theme.scale;
+        let tall = plan(&theme, true, false, f32::INFINITY);
         assert!(!tall.compact && !tall.pool_folded);
 
         // 只差一点点：正常档放不下、降档放得下 ⇒ 只降行步，不折叠
-        let smaller = plan(scale, true, false, tall.client_h as f32 / scale - 1.0);
+        let smaller = plan(&theme, true, false, tall.client_h as f32 / scale - 1.0);
         assert!(smaller.compact, "放不下 ⇒ 行步必须降档");
         assert!(smaller.client_h < tall.client_h);
         assert!(!smaller.pool_folded, "降档后放得下 ⇒ 不该折叠连接池");
@@ -2675,7 +3411,7 @@ mod tests {
         );
 
         // 极小屏：两档都放不下 ⇒ 连接池组强制折叠（其余行照旧）
-        let tiny = plan(scale, true, false, 200.0);
+        let tiny = plan(&theme, true, false, 200.0);
         assert!(tiny.compact && tiny.pool_folded);
         assert!(
             !tiny
@@ -2690,7 +3426,7 @@ mod tests {
             .any(|item| item.id == IDC_FIELD_STRIP && item.visible));
 
         // 公开态在极小屏下没有可折叠的行（不 panic、不产生负尺寸）
-        let tiny_public = plan(scale, false, false, 100.0);
+        let tiny_public = plan(&theme, false, false, 100.0);
         assert!(tiny_public.compact && !tiny_public.pool_folded);
         assert!(tiny_public.client_h > 0);
     }
@@ -2700,7 +3436,7 @@ mod tests {
     #[test]
     fn result_row_and_log_stat_hold_their_strings() {
         let theme = Theme::new(96);
-        let settings = plan(1.0, false, false, f32::INFINITY); // scale = 1 ⇒ px == DIP
+        let settings = plan(&theme, false, false, f32::INFINITY); // scale = 1 ⇒ px == DIP
         let result_w = settings
             .items
             .iter()
@@ -2811,12 +3547,115 @@ mod tests {
     fn segment_membership_is_complete() {
         assert_eq!(segment_member(IDC_SEG_CORS[0]), Some((SegGroup::Cors, 0)));
         assert_eq!(segment_member(IDC_SEG_CORS[1]), Some((SegGroup::Cors, 1)));
-        assert_eq!(
-            segment_member(IDC_SEG_LOG_LEVEL[3]),
-            Some((SegGroup::LogLevel, 3))
-        );
+        assert_eq!(segment_member(IDC_SEG_CLOSE[0]), Some((SegGroup::Close, 0)));
         assert_eq!(segment_member(IDC_SEG_CLOSE[1]), Some((SegGroup::Close, 1)));
         assert_eq!(segment_member(IDC_APPLY), None);
         assert_eq!(segment_member(IDC_FIELD_ADVANCED), None);
+        // P8-UI2：日志级别不再是分段成员（它是下拉字段）+ 覆盖层列表也不得误判成段
+        assert_eq!(segment_member(IDC_FIELD_LOG_LEVEL), None);
+        assert_eq!(segment_member(IDC_LOG_LEVEL_LIST), None);
+    }
+
+    /// **P8-UI2 下拉（纯函数面）**：列表矩形夹取在客户区内（下展开 / 上翻 / 极矮窗裁剪三档）。
+    #[test]
+    fn dropdown_list_rect_is_clamped_inside_client() {
+        let theme = Theme::new(192);
+        let scale = theme.scale;
+        let settings = plan(&theme, false, false, f32::INFINITY);
+        let field = dropdown_field_item(&settings).expect("下拉字段必须在行表里");
+        let count = LOG_LEVELS.len();
+
+        // ① 常规：字段下方放得下 ⇒ 紧贴字段下缘、与字段同宽同 x
+        let rect = dropdown_list_rect(scale, &field, count, settings.client_h);
+        assert_eq!(rect.x, field.x);
+        assert_eq!(rect.w, field.w);
+        assert_eq!(rect.y, field.y + field.h + theme.px(DROPDOWN_GAP));
+        assert!(rect.y + rect.h <= settings.client_h, "列表越出客户区下缘");
+
+        // ② 下方放不下 ⇒ 向上翻（仍在客户区内）
+        let tight = field.y + field.h + theme.px(DROPDOWN_GAP) + 1;
+        let flipped = dropdown_list_rect(scale, &field, count, tight);
+        assert!(flipped.y >= 0 && flipped.y + flipped.h <= tight.max(flipped.y + flipped.h));
+        assert!(flipped.y < field.y, "放不下时必须翻到字段上方");
+        assert_eq!(
+            flipped.h,
+            count as i32 * theme.px(DROPDOWN_ITEM_H)
+                + theme.px(DROPDOWN_PANEL_PAD) * 2
+                + theme.px(DROPDOWN_SHADOW_MARGIN) * 2
+        );
+
+        // ③ 上下都放不下（极矮窗）⇒ 贴下缘、高度被裁但仍 ≥ 一行
+        let squeezed = dropdown_list_rect(scale, &field, count, field.y + field.h + 4);
+        assert!(squeezed.y + squeezed.h <= field.y + field.h + 4);
+        assert!(squeezed.h >= theme.px(DROPDOWN_ITEM_H));
+    }
+
+    /// **P8-UI2 下拉（容量面）**：4 个级别名 + chevron 必须放进字段宽（96 DIP 的数字井位）。
+    #[test]
+    fn dropdown_field_holds_every_level_name() {
+        let theme = Theme::new(96);
+        let settings = plan(&theme, false, false, f32::INFINITY);
+        let field = dropdown_field_item(&settings).expect("下拉字段必须在行表里");
+        let hdc = unsafe { GetDC(None) };
+        let chrome = theme.px(DROPDOWN_TEXT_PAD)
+            + theme.px(DROPDOWN_CHEVRON_PAD)
+            + theme.px(DROPDOWN_CHEVRON_W);
+        for name in LOG_LEVELS {
+            let width = measure_text(hdc, theme.font_ui_bold, name);
+            assert!(
+                width + chrome <= field.w,
+                "级别名放不下：{name}（{width} + {chrome} > {}）",
+                field.w
+            );
+        }
+        // 列表项文字（左留白 8 DIP × 2 + 右侧圆点余量）也必须放得进列表宽（= 字段宽）
+        for name in LOG_LEVELS {
+            let width = measure_text(hdc, theme.font_ui_bold, name);
+            assert!(width + theme.px(DROPDOWN_TEXT_PAD) * 3 <= field.w);
+        }
+        unsafe { ReleaseDC(None, hdc) };
+    }
+
+    /// **P8-UI2 下拉（映射面）**：索引 ↔ 配置字符串的往返（`fill_fields` / `apply_fields` 共用）。
+    #[test]
+    fn log_level_mapping_round_trips() {
+        for (index, name) in LOG_LEVELS.iter().enumerate() {
+            assert_eq!(log_level_index(name), index);
+            assert_eq!(log_level_name(index), *name);
+        }
+        // 未知 / 越界值：必须落在 info（旧实现的 `_ => 2` 语义）且不 panic
+        assert_eq!(log_level_index("verbose"), 2);
+        assert_eq!(log_level_name(99), "info");
+    }
+
+    /// **P8-UI2 托盘面**：托盘表 = 两组（CORS / 关闭行为），且**不与任何可见控件混淆**（它是覆盖层）。
+    #[test]
+    fn trays_cover_both_segment_groups() {
+        let theme = Theme::new(192);
+        let settings = plan(&theme, false, false, f32::INFINITY);
+        assert_eq!(settings.trays.len(), SEGMENT_GROUPS.len());
+        for (tray, group) in settings.trays.iter().zip(SEGMENT_GROUPS.iter()) {
+            let members: Vec<&PlanItem> = settings
+                .items
+                .iter()
+                .filter(|item| group.ids.contains(&item.id))
+                .collect();
+            assert_eq!(members.len(), group.ids.len());
+            let left = members.iter().map(|item| item.x).min().unwrap_or(0);
+            let right = members
+                .iter()
+                .map(|item| item.x + item.w)
+                .max()
+                .unwrap_or(0);
+            let pad = theme.px(SEG_TRAY_PAD);
+            assert_eq!(tray.x, left - pad);
+            assert_eq!(tray.x + tray.w, right + pad);
+            assert_eq!(tray.h, theme.px(ROW_H));
+            // 托盘不得越出客户区
+            assert!(tray.x >= 0 && tray.x + tray.w <= settings.client_w);
+        }
+        // 提示条状态不影响托盘（两组都在公开行上）
+        let failed = plan(&theme, true, true, f32::INFINITY);
+        assert_eq!(failed.trays.len(), SEGMENT_GROUPS.len());
     }
 }
